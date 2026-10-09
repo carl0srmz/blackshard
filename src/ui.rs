@@ -15,18 +15,26 @@ use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-const BG: Color32 = Color32::from_rgb(8, 11, 9);
-const PANEL: Color32 = Color32::from_rgb(13, 17, 14);
-const SURFACE: Color32 = Color32::from_rgb(18, 24, 20);
-const SURFACE_HOVER: Color32 = Color32::from_rgb(23, 32, 26);
-const BORDER: Color32 = Color32::from_rgb(42, 57, 47);
-const TEXT: Color32 = Color32::from_rgb(230, 239, 233);
-const MUTED: Color32 = Color32::from_rgb(139, 157, 146);
-const GREEN: Color32 = Color32::from_rgb(0, 242, 97);
-const GREEN_DARK: Color32 = Color32::from_rgb(0, 78, 34);
-const AMBER: Color32 = Color32::from_rgb(255, 190, 74);
-const RED: Color32 = Color32::from_rgb(255, 82, 98);
-const BLUE: Color32 = Color32::from_rgb(85, 175, 255);
+// blackshard.dev's palette: black, white and one yellow, set in JetBrains Mono.
+const BG: Color32 = Color32::BLACK;
+/// The site's nav bar, one step up from black; also input wells and hover.
+const BAR: Color32 = Color32::from_rgb(17, 17, 17);
+const RULE: Color32 = Color32::from_rgb(46, 46, 46);
+const TEXT: Color32 = Color32::WHITE;
+const MUTED: Color32 = Color32::from_rgb(140, 140, 140);
+/// The site's yellow: where to look and what to press.
+const SIGNAL: Color32 = Color32::from_rgb(255, 255, 0);
+/// Kept for threats and failures only, so red always means something is wrong.
+const ALARM: Color32 = Color32::from_rgb(255, 64, 64);
+// Status roles. A healthy machine reads quiet and monochrome; yellow speaks up; red alarms.
+const OK: Color32 = TEXT;
+const ATTENTION: Color32 = SIGNAL;
+const PENDING: Color32 = MUTED;
+
+const REGULAR_FONT: &str = "jetbrains-mono";
+const BOLD_FONT: &str = "jetbrains-mono-bold";
+/// The site tracks its type in by 0.089em; slightly less keeps small sizes legible on screen.
+const TRACKING: f32 = -0.06;
 
 const ACTIVITY_LIMIT: usize = 500;
 const REFRESH_INTERVAL: Duration = Duration::from_secs(15);
@@ -185,11 +193,11 @@ pub enum Page {
 impl Page {
     fn title(self) -> &'static str {
         match self {
-            Self::Dashboard => "Dashboard",
-            Self::Scan => "Scan",
-            Self::Quarantine => "Quarantine",
-            Self::Activity => "Activity",
-            Self::Settings => "Settings",
+            Self::Dashboard => "status",
+            Self::Scan => "scan",
+            Self::Quarantine => "quarantine",
+            Self::Activity => "activity",
+            Self::Settings => "settings",
         }
     }
 }
@@ -269,23 +277,23 @@ impl BlackshardApp {
             None => (
                 Settings::default(),
                 Some(
-                    "Settings will load once the protection service is running; until then \
-                     defaults are shown and changes cannot be saved."
+                    "settings will load once the protection service is running. until then \
+                     you're seeing defaults, and changes can't be saved."
                         .to_owned(),
                 ),
             ),
             Some(Err(error)) if error.is_service_unavailable() => (
                 Settings::default(),
                 Some(
-                    "Settings will load once the protection service is running; until then \
-                     defaults are shown and changes cannot be saved."
+                    "settings will load once the protection service is running. until then \
+                     you're seeing defaults, and changes can't be saved."
                         .to_owned(),
                 ),
             ),
             Some(Err(error)) => (
                 Settings::default(),
                 Some(format!(
-                    "The protection service could not provide settings, so defaults are shown and \
+                    "the protection service could not provide settings, so you're seeing defaults and \
                      changes cannot be saved: {error}"
                 )),
             ),
@@ -370,7 +378,7 @@ impl BlackshardApp {
                 self.settings_save_at = None;
                 self.notice = Some(Notice {
                     level: NoticeLevel::Success,
-                    message: "Connected to the protection service; settings loaded.".to_owned(),
+                    message: "connected to the protection service. settings loaded.".to_owned(),
                     created: Instant::now(),
                 });
             }
@@ -402,7 +410,7 @@ impl BlackshardApp {
             self.notice = Some(match outcome.result {
                 Ok(detail) => Notice {
                     level: NoticeLevel::Success,
-                    message: format!("{action} completed. {detail}"),
+                    message: format!("{action} done. {detail}"),
                     created: Instant::now(),
                 },
                 Err(error) => Notice {
@@ -455,7 +463,7 @@ impl BlackshardApp {
         if already_running {
             self.notice = Some(Notice {
                 level: NoticeLevel::Warning,
-                message: "A scan is already running. Cancel it before starting another.".to_owned(),
+                message: "a scan is already running. stop it before starting another.".to_owned(),
                 created: Instant::now(),
             });
             return;
@@ -467,7 +475,7 @@ impl BlackshardApp {
             Err(error) => {
                 self.notice = Some(Notice {
                     level: NoticeLevel::Error,
-                    message: format!("Scan could not start: {error}"),
+                    message: format!("the scan could not start: {error}"),
                     created: Instant::now(),
                 });
                 return;
@@ -476,8 +484,7 @@ impl BlackshardApp {
         self.page = Page::Scan;
         self.notice = Some(Notice {
             level: NoticeLevel::Information,
-            message: "Scan started. blackshard will continue while you view other pages."
-                .to_owned(),
+            message: "scan started. it keeps going while you look at other pages.".to_owned(),
             created: Instant::now(),
         });
     }
@@ -487,7 +494,7 @@ impl BlackshardApp {
         if value.is_empty() {
             self.notice = Some(Notice {
                 level: NoticeLevel::Warning,
-                message: "Enter a file or folder path for the custom scan.".to_owned(),
+                message: "type the path of a file or folder to scan.".to_owned(),
                 created: Instant::now(),
             });
             return;
@@ -496,7 +503,7 @@ impl BlackshardApp {
         if !path.exists() {
             self.notice = Some(Notice {
                 level: NoticeLevel::Error,
-                message: format!("The custom scan target does not exist: {}", path.display()),
+                message: format!("nothing exists at {}", path.display()),
                 created: Instant::now(),
             });
             return;
@@ -526,7 +533,7 @@ impl BlackshardApp {
                 }
                 self.notice = Some(Notice {
                     level: NoticeLevel::Success,
-                    message: "Settings saved.".to_owned(),
+                    message: "settings saved.".to_owned(),
                     created: Instant::now(),
                 });
             }
@@ -535,12 +542,14 @@ impl BlackshardApp {
                 self.notice = Some(match elevation::request_save_settings(&self.settings) {
                     Ok(()) => Notice {
                         level: NoticeLevel::Information,
-                        message: "Approve the Windows administrator prompt to apply these machine protection settings.".to_owned(),
+                        message:
+                            "approve the windows administrator prompt to apply these settings."
+                                .to_owned(),
                         created: Instant::now(),
                     },
                     Err(error) => Notice {
                         level: NoticeLevel::Error,
-                        message: format!("Administrator approval could not be requested: {error}"),
+                        message: format!("administrator approval could not be requested: {error}"),
                         created: Instant::now(),
                     },
                 });
@@ -548,7 +557,7 @@ impl BlackshardApp {
             Err(error) => {
                 self.notice = Some(Notice {
                     level: NoticeLevel::Error,
-                    message: format!("Settings could not be saved: {error}"),
+                    message: format!("settings could not be saved: {error}"),
                     created: Instant::now(),
                 });
             }
@@ -599,126 +608,111 @@ impl BlackshardApp {
     /// Installs blackshard's look. Called once, before the first frame: the root `Ui` of a frame
     /// is styled before the app runs, so a style set during a frame never reaches it.
     pub fn apply_theme(ctx: &egui::Context) {
+        install_fonts(ctx);
         let mut visuals = egui::Visuals::dark();
         visuals.override_text_color = Some(TEXT);
         visuals.panel_fill = BG;
-        visuals.window_fill = PANEL;
-        visuals.extreme_bg_color = Color32::from_rgb(7, 9, 8);
-        visuals.faint_bg_color = SURFACE;
-        visuals.selection.bg_fill = GREEN_DARK;
-        visuals.selection.stroke = Stroke::new(1.0_f32, GREEN);
-        visuals.hyperlink_color = GREEN;
-        visuals.warn_fg_color = AMBER;
-        visuals.error_fg_color = RED;
-        visuals.widgets.noninteractive.bg_fill = SURFACE;
-        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER);
-        visuals.widgets.inactive.bg_fill = SURFACE;
-        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER);
-        visuals.widgets.hovered.bg_fill = SURFACE_HOVER;
-        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, GREEN_DARK);
-        visuals.widgets.active.bg_fill = GREEN_DARK;
-        visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, GREEN);
-        visuals.widgets.open.bg_fill = SURFACE_HOVER;
-        visuals.widgets.open.bg_stroke = Stroke::new(1.0_f32, GREEN);
+        visuals.window_fill = BG;
+        visuals.window_stroke = Stroke::new(1.0_f32, TEXT);
+        visuals.window_corner_radius = egui::CornerRadius::ZERO;
+        visuals.window_shadow = egui::Shadow::NONE;
+        visuals.popup_shadow = egui::Shadow::NONE;
+        visuals.menu_corner_radius = egui::CornerRadius::ZERO;
+        visuals.extreme_bg_color = BAR;
+        visuals.faint_bg_color = BAR;
+        visuals.code_bg_color = BAR;
+        visuals.selection.bg_fill = SIGNAL.gamma_multiply(0.35);
+        visuals.selection.stroke = Stroke::new(1.0_f32, SIGNAL);
+        visuals.hyperlink_color = SIGNAL;
+        visuals.warn_fg_color = SIGNAL;
+        visuals.error_fg_color = ALARM;
+        visuals.text_cursor.stroke = Stroke::new(2.0_f32, SIGNAL);
+        let widgets = &mut visuals.widgets;
+        for (state, fill, stroke, foreground) in [
+            (&mut widgets.noninteractive, BG, RULE, TEXT),
+            (&mut widgets.inactive, BG, MUTED, TEXT),
+            (&mut widgets.hovered, BAR, TEXT, TEXT),
+            (&mut widgets.active, BAR, SIGNAL, SIGNAL),
+            (&mut widgets.open, BAR, SIGNAL, TEXT),
+        ] {
+            state.bg_fill = fill;
+            state.weak_bg_fill = fill;
+            state.bg_stroke = Stroke::new(1.0_f32, stroke);
+            state.fg_stroke = Stroke::new(1.0_f32, foreground);
+            state.corner_radius = egui::CornerRadius::ZERO;
+            state.expansion = 0.0;
+        }
 
         // Both the dark and light style slots, so the theme holds whichever one egui selects.
         ctx.all_styles_mut(|style| {
+            use egui::TextStyle;
             style.visuals = visuals.clone();
-            style.spacing.item_spacing = egui::vec2(10.0, 9.0);
-            style.spacing.button_padding = egui::vec2(14.0, 8.0);
-            style.spacing.interact_size.y = 34.0;
-            style.text_styles.insert(
-                egui::TextStyle::Heading,
-                FontId::new(26.0, FontFamily::Monospace),
-            );
-            style.text_styles.insert(
-                egui::TextStyle::Button,
-                FontId::new(14.0, FontFamily::Monospace),
-            );
+            style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+            style.spacing.button_padding = egui::vec2(14.0, 7.0);
+            style.spacing.interact_size.y = 32.0;
+            style.text_styles = [
+                (
+                    TextStyle::Small,
+                    FontId::new(11.5, FontFamily::Proportional),
+                ),
+                (TextStyle::Body, FontId::new(14.0, FontFamily::Proportional)),
+                (
+                    TextStyle::Button,
+                    FontId::new(14.0, FontFamily::Proportional),
+                ),
+                (
+                    TextStyle::Monospace,
+                    FontId::new(13.0, FontFamily::Monospace),
+                ),
+                (TextStyle::Heading, FontId::new(30.0, bold_family())),
+            ]
+            .into();
         });
     }
 
+    /// The site's nav bar: the mark and name, then each page as a plain lowercase word, the
+    /// current one in yellow.
     fn render_top_bar(&mut self, ui: &mut egui::Ui, runtime: &UiRuntimeState) {
-        ui.add_space(9.0);
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("blackshard")
-                    .family(FontFamily::Monospace)
-                    .size(21.0)
-                    .strong()
-                    .color(GREEN),
-            );
-            ui.label(
-                RichText::new("// WINDOWS SECURITY")
-                    .family(FontFamily::Monospace)
-                    .size(13.0)
-                    .color(MUTED),
-            );
+        ui.horizontal_centered(|ui| {
+            shard_mark(ui, 26.0, TEXT);
+            ui.add_space(2.0);
+            ui.label(display("blackshard", 20.0));
+            ui.add_space(30.0);
+            for page in [
+                Page::Dashboard,
+                Page::Scan,
+                Page::Quarantine,
+                Page::Activity,
+                Page::Settings,
+            ] {
+                let selected = self.page == page;
+                let response = ui
+                    .add(
+                        egui::Button::new(
+                            RichText::new(page.title())
+                                .size(17.0)
+                                .extra_letter_spacing(17.0 * TRACKING)
+                                .color(if selected { SIGNAL } else { TEXT }),
+                        )
+                        .frame(false),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                if response.has_focus() {
+                    ui.painter().hline(
+                        response.rect.x_range(),
+                        response.rect.bottom(),
+                        Stroke::new(1.0_f32, SIGNAL),
+                    );
+                }
+                if response.clicked() {
+                    self.page = page;
+                }
+                ui.add_space(8.0);
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let (label, color) = compact_health(runtime);
-                status_pill(ui, &label, color);
-                ui.label(
-                    RichText::new(format!("ENGINE {}", runtime.engine_version))
-                        .family(FontFamily::Monospace)
-                        .size(11.0)
-                        .color(MUTED),
-                );
+                status_mark(ui, &label, color);
             });
-        });
-        ui.add_space(8.0);
-    }
-
-    fn render_sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(18.0);
-        ui.label(
-            RichText::new("CONTROL CENTER")
-                .family(FontFamily::Monospace)
-                .size(11.0)
-                .color(MUTED),
-        );
-        ui.add_space(10.0);
-        for (page, glyph) in [
-            (Page::Dashboard, "//"),
-            (Page::Scan, ">>"),
-            (Page::Quarantine, "[]"),
-            (Page::Activity, "::"),
-            (Page::Settings, "=="),
-        ] {
-            let selected = self.page == page;
-            let text = RichText::new(format!("{glyph}  {}", page.title()))
-                .family(FontFamily::Monospace)
-                .color(if selected { GREEN } else { TEXT });
-            let button = egui::Button::new(text)
-                .fill(if selected {
-                    GREEN_DARK
-                } else {
-                    Color32::TRANSPARENT
-                })
-                .stroke(if selected {
-                    Stroke::new(1.0_f32, GREEN)
-                } else {
-                    Stroke::NONE
-                })
-                .min_size(egui::vec2(ui.available_width(), 40.0));
-            if ui.add(button).clicked() {
-                self.page = page;
-            }
-        }
-
-        ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
-            ui.add_space(14.0);
-            ui.label(
-                RichText::new("OPEN-SOURCE ENDPOINT DEFENSE")
-                    .family(FontFamily::Monospace)
-                    .size(9.5)
-                    .color(MUTED),
-            );
-            ui.label(
-                RichText::new("PHASE 1 // WINDOWS CLIENT")
-                    .family(FontFamily::Monospace)
-                    .size(10.0)
-                    .color(GREEN),
-            );
         });
     }
 
@@ -726,38 +720,16 @@ impl BlackshardApp {
         let Some(notice) = &self.notice else {
             return;
         };
-        let (label, color) = match notice.level {
-            NoticeLevel::Information => ("INFO", BLUE),
-            NoticeLevel::Success => ("OK", GREEN),
-            NoticeLevel::Warning => ("ATTENTION", AMBER),
-            NoticeLevel::Error => ("ERROR", RED),
+        let color = match notice.level {
+            NoticeLevel::Information | NoticeLevel::Success => TEXT,
+            NoticeLevel::Warning => ATTENTION,
+            NoticeLevel::Error => ALARM,
         };
-        egui::Frame::NONE
-            .fill(color.gamma_multiply(0.10))
-            .stroke(Stroke::new(1.0_f32, color.gamma_multiply(0.65)))
-            .corner_radius(egui::CornerRadius::same(6))
-            .inner_margin(egui::Margin::symmetric(12, 9))
-            .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        RichText::new(label)
-                            .family(FontFamily::Monospace)
-                            .strong()
-                            .color(color),
-                    );
-                    ui.label(&notice.message);
-                });
-            });
-        ui.add_space(8.0);
+        let message = notice.message.clone();
+        banner(ui, color, &message);
     }
 
     fn render_dashboard(&mut self, ui: &mut egui::Ui, runtime: &UiRuntimeState) {
-        page_heading(
-            ui,
-            "Security overview",
-            "Verified runtime state, recent activity, and fast actions.",
-        );
-
         let (health, detail, color) = overall_health(runtime);
         // The userland self-test exercises the detection engine rather than kernel enforcement,
         // so it is just as runnable without a driver.
@@ -770,200 +742,223 @@ impl BlackshardApp {
             runtime.protection_test,
             ProtectionTestStatus::Requested | ProtectionTestStatus::Running
         );
-        let mut protection_test_requested = false;
-        card(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(&health)
-                        .family(FontFamily::Monospace)
-                        .size(23.0)
-                        .strong()
-                        .color(color),
-                );
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(
-                        RichText::new("[+]")
-                            .family(FontFamily::Monospace)
-                            .size(42.0)
-                            .color(color),
-                    );
-                });
-            });
-            // Below the heading row rather than beside the glyph, so a long reason wraps across
-            // the whole card instead of running underneath it.
-            ui.label(RichText::new(&detail).color(TEXT));
-            // The attention line often repeats the reason already in the detail.
-            if let Some(attention) = runtime
-                .attention
-                .as_ref()
-                .filter(|attention| !detail.contains(attention.as_str()))
-            {
-                ui.add_space(8.0);
-                ui.colored_label(AMBER, attention);
+
+        // blackshard.dev's opening spread: a statement on the left, the shard on the right, one
+        // white hairline between them. The shard takes the colour of the machine's state, so the
+        // answer to "am I protected?" is visible from across the room.
+        let (spread, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), 340.0),
+            egui::Sense::hover(),
+        );
+        let middle = spread.center().x.round() + 0.5;
+        ui.painter()
+            .vline(middle, spread.y_range(), Stroke::new(1.0_f32, TEXT));
+        let gutter = 36.0;
+        let mut left = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(egui::Rect::from_min_max(
+                    spread.min,
+                    egui::pos2(middle - gutter, spread.max.y),
+                ))
+                .layout(Layout::top_down(Align::Center)),
+        );
+        let mut right = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(egui::Rect::from_min_max(
+                    egui::pos2(middle + gutter, spread.min.y),
+                    spread.max,
+                ))
+                .layout(Layout::top_down(Align::Center)),
+        );
+
+        left.add_space(56.0);
+        left.label(display(&health, 34.0).color(color));
+        left.add_space(12.0);
+        left.add(
+            egui::Label::new(RichText::new(&detail).size(15.0).color(TEXT)).halign(Align::Center),
+        );
+        // The attention line often repeats the reason already in the detail.
+        if let Some(attention) = runtime
+            .attention
+            .as_ref()
+            .filter(|attention| !detail.contains(attention.as_str()))
+        {
+            left.add_space(6.0);
+            left.add(
+                egui::Label::new(RichText::new(attention).size(13.0).color(ATTENTION))
+                    .halign(Align::Center),
+            );
+        }
+        left.add_space(28.0);
+        // The site's yellow italic line, here the one thing worth doing from this page.
+        let test = left
+            .add_enabled(
+                test_available && !test_busy,
+                egui::Button::new(
+                    RichText::new("run the harmless protection test")
+                        .italics()
+                        .size(17.0)
+                        .color(SIGNAL),
+                )
+                .frame(false),
+            )
+            .on_hover_text("Checks detection and blocking end to end with a harmless file")
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        if test.has_focus() {
+            left.painter().hline(
+                test.rect.x_range(),
+                test.rect.bottom(),
+                Stroke::new(1.0_f32, SIGNAL),
+            );
+        }
+        let (test_status, test_color) = match &runtime.protection_test {
+            ProtectionTestStatus::Idle if !test_available => {
+                ("available once protection is active".to_owned(), MUTED)
             }
-            ui.add_space(8.0);
-            ui.separator();
-            ui.horizontal_wrapped(|ui| {
-                if ui
-                    .add_enabled(
-                        test_available && !test_busy,
-                        egui::Button::new(button_text("RUN HARMLESS PROTECTION TEST")),
-                    )
-                    .on_hover_text("Checks detection and blocking end to end with a harmless file")
-                    .clicked()
-                {
-                    protection_test_requested = true;
-                }
-                match &runtime.protection_test {
-                    ProtectionTestStatus::Idle if !test_available => {
-                        ui.colored_label(MUTED, "Available once protection is active");
-                    }
-                    ProtectionTestStatus::Idle => {
-                        ui.colored_label(MUTED, "Not run this session");
-                    }
-                    ProtectionTestStatus::Requested => {
-                        ui.spinner();
-                        ui.colored_label(BLUE, "Test queued");
-                    }
-                    ProtectionTestStatus::Running => {
-                        ui.spinner();
-                        ui.colored_label(BLUE, "Testing the protection path");
-                    }
-                    ProtectionTestStatus::Passed(detail) => {
-                        ui.colored_label(GREEN, format!("PASSED - {detail}"));
-                    }
-                    ProtectionTestStatus::Failed(error) => {
-                        ui.colored_label(RED, format!("FAILED - {error}"));
-                    }
-                }
-            });
+            ProtectionTestStatus::Idle => ("not run yet".to_owned(), MUTED),
+            ProtectionTestStatus::Requested => ("queued".to_owned(), MUTED),
+            ProtectionTestStatus::Running => ("testing the protection path".to_owned(), MUTED),
+            ProtectionTestStatus::Passed(detail) => (format!("passed. {detail}"), OK),
+            ProtectionTestStatus::Failed(error) => (format!("failed. {error}"), ALARM),
+        };
+        left.horizontal(|ui| {
+            if test_busy {
+                ui.spinner();
+            }
         });
-        if protection_test_requested {
+        left.add(
+            egui::Label::new(RichText::new(test_status).size(13.0).color(test_color))
+                .halign(Align::Center),
+        );
+        if test.clicked() {
             if let Ok(mut state) = self.runtime.lock() {
                 state.protection_test = ProtectionTestStatus::Requested;
             }
         }
-        ui.add_space(12.0);
 
-        ui.columns(4, |columns| {
-            stat_card(
-                &mut columns[0],
-                "REAL-TIME SCANNED",
-                &runtime.realtime_scanned_files.to_string(),
-                MUTED,
+        right.add_space(40.0);
+        shard_mark(&mut right, 150.0, color);
+        right.add_space(26.0);
+        fact(
+            &mut right,
+            runtime.realtime_scanned_files,
+            "files checked as they opened",
+            TEXT,
+        );
+        fact(
+            &mut right,
+            runtime.realtime_blocked_files,
+            "threats blocked",
+            if runtime.realtime_blocked_files > 0 {
+                ALARM
+            } else {
+                TEXT
+            },
+        );
+        fact(
+            &mut right,
+            self.quarantine_records.len() as u64,
+            "files in quarantine",
+            TEXT,
+        );
+        if runtime.realtime_bypassed_requests > 0 {
+            fact(
+                &mut right,
+                runtime.realtime_bypassed_requests,
+                "checks skipped under load",
+                ATTENTION,
             );
-            stat_card(
-                &mut columns[1],
-                "THREATS BLOCKED",
-                &runtime.realtime_blocked_files.to_string(),
-                if runtime.realtime_blocked_files > 0 {
-                    RED
-                } else {
-                    GREEN
-                },
-            );
-            stat_card(
-                &mut columns[2],
-                "DEGRADED EVENTS",
-                &runtime.realtime_bypassed_requests.to_string(),
-                if runtime.realtime_bypassed_requests > 0 {
-                    AMBER
-                } else {
-                    GREEN
-                },
-            );
-            stat_card(
-                &mut columns[3],
-                "IN QUARANTINE",
-                &self.quarantine_records.len().to_string(),
-                if self.quarantine_records.is_empty() {
-                    GREEN
-                } else {
-                    AMBER
-                },
-            );
-        });
-        ui.add_space(12.0);
+        }
 
         let mut scan_request = None;
-        card(ui, |ui| {
+        section(ui, |ui| {
             section_title(
                 ui,
-                "RUN A SCAN",
-                "Select a scope. Scans run at low priority by default.",
+                "scan now",
+                "scans run at low priority, so you can keep working.",
             );
-            ui.add_space(6.0);
-            ui.columns(3, |columns| {
-                if action_tile(
-                    &mut columns[0],
-                    "QUICK SCAN",
-                    "Startup, downloads, desktop, and temporary locations",
-                    GREEN,
-                ) {
-                    scan_request = Some(ScanRequestKind::Quick);
-                }
-                if action_tile(
-                    &mut columns[1],
-                    "FULL SCAN",
-                    "Every accessible local volume",
-                    BLUE,
-                ) {
-                    scan_request = Some(ScanRequestKind::Full);
-                }
-                if action_tile(
-                    &mut columns[2],
-                    "CUSTOM SCAN",
-                    "Choose an exact file or folder",
-                    MUTED,
-                ) {
-                    self.page = Page::Scan;
-                }
-            });
+            let choices = [
+                (
+                    "quick scan",
+                    "where malware lands, and every program that is running",
+                    Some(ScanRequestKind::Quick),
+                ),
+                (
+                    "full scan",
+                    "every local drive. this one takes a while",
+                    Some(ScanRequestKind::Full),
+                ),
+                ("choose what to scan", "one file or folder", None),
+            ];
+            egui::Grid::new("dashboard_scans")
+                .spacing(egui::vec2(18.0, 8.0))
+                .show(ui, |ui| {
+                    for (label, detail, kind) in choices {
+                        if bracket_button(ui, label, TEXT, true).clicked() {
+                            match kind {
+                                Some(kind) => scan_request = Some(kind),
+                                None => self.page = Page::Scan,
+                            }
+                        }
+                        ui.label(RichText::new(detail).color(MUTED));
+                        ui.end_row();
+                    }
+                });
         });
         if let Some(kind) = scan_request {
             self.start_scan(kind);
         }
-        ui.add_space(12.0);
 
         ui.columns(2, |columns| {
-            card(&mut columns[0], |ui| {
-                section_title(ui, "PROTECTION LAYERS", "Actual subsystem state");
-                health_row(ui, "Real-time engine", protection_label(&runtime.protection));
-                health_row(ui, "Kernel minifilter", driver_label(&runtime.driver));
-                if let (Some(version), Some(age)) = (&runtime.freshclam_version, runtime.freshclam_age_hours) {
-                    health_row(ui, "FreshClam DB", (format!("v{} ({}h old)", version, age), GREEN));
+            section(&mut columns[0], |ui| {
+                section_title(ui, "protection", "what is actually running right now");
+                health_row(
+                    ui,
+                    "real-time engine",
+                    protection_label(&runtime.protection),
+                );
+                health_row(ui, "kernel filter", driver_label(&runtime.driver));
+                if let (Some(version), Some(age)) =
+                    (&runtime.freshclam_version, runtime.freshclam_age_hours)
+                {
+                    health_row(
+                        ui,
+                        "clamav signatures",
+                        (format!("version {version}, {age}h old"), OK),
+                    );
                 } else {
-                    health_row(ui, "Definitions", definition_label(&runtime.definitions));
+                    health_row(ui, "definitions", definition_label(&runtime.definitions));
                 }
             });
-            card(&mut columns[1], |ui| {
-                section_title(ui, "RELEASE ASSURANCE", "Identity and independent evaluation");
-                health_row(ui, "Package trust", trust_label(&runtime.build_trust));
-                health_row(ui, "AV certification", certification_label(&runtime.certification));
-                ui.add_space(4.0);
+            section(&mut columns[1], |ui| {
+                section_title(ui, "this build", "who made it, and who has checked it");
+                health_row(ui, "package", trust_label(&runtime.build_trust));
+                health_row(
+                    ui,
+                    "independent testing",
+                    certification_label(&runtime.certification),
+                );
                 ui.label(
                     RichText::new(
-                        "A valid signature protects package identity; it does not imply independent antivirus certification.",
+                        "a signature proves who built this copy. it says nothing about how well \
+                         it detects malware.",
                     )
-                    .size(11.0)
+                    .size(12.0)
                     .color(MUTED),
                 );
             });
         });
-        ui.add_space(12.0);
 
-        card(ui, |ui| {
-            section_title(ui, "RECENT ACTIVITY", "Newest security events");
+        section(ui, |ui| {
+            section_title(ui, "recent activity", "newest first");
             if self.activity.is_empty() {
-                empty_state(ui, "No security events have been recorded yet.");
+                empty_state(ui, "nothing has happened yet. blackshard writes every detection, scan and change here.");
             } else {
                 for event in self.activity.iter().take(5) {
                     activity_row(ui, event);
                 }
                 if self.activity.len() > 5
-                    && ui
-                        .button(RichText::new("VIEW ALL ACTIVITY ->").color(GREEN))
-                        .clicked()
+                    && bracket_button(ui, "all activity", TEXT, true).clicked()
                 {
                     self.page = Page::Activity;
                 }
@@ -974,8 +969,8 @@ impl BlackshardApp {
     fn render_scan(&mut self, ui: &mut egui::Ui) {
         page_heading(
             ui,
-            "Scan center",
-            "Inspect common attack locations, every drive, or an exact target.",
+            "scan",
+            "check where malware usually lands, every drive, or one exact file.",
         );
 
         let running = self
@@ -983,56 +978,39 @@ impl BlackshardApp {
             .as_ref()
             .is_some_and(|job| !job.snapshot().is_finished());
         let mut requested = None;
-        card(ui, |ui| {
-            ui.columns(3, |columns| {
-                scan_option(
-                    &mut columns[0],
-                    "QUICK",
-                    "High-risk user and startup locations",
-                    "Usually a few minutes",
-                    GREEN,
-                    !running,
-                    &mut requested,
+        section(ui, |ui| {
+            let choices = [
+                (
+                    "quick scan",
+                    "where malware lands, plus every running program. a few minutes",
                     ScanRequestKind::Quick,
-                );
-                scan_option(
-                    &mut columns[1],
-                    "FULL",
-                    "All accessible local volumes",
-                    "May take significant time",
-                    BLUE,
-                    !running,
-                    &mut requested,
+                ),
+                (
+                    "full scan",
+                    "every local drive. this can take a long time",
                     ScanRequestKind::Full,
-                );
-                scan_option(
-                    &mut columns[2],
-                    "CUSTOM",
-                    "One file or directory tree",
-                    "Exact scope",
-                    MUTED,
-                    false,
-                    &mut requested,
-                    ScanRequestKind::Custom { roots: Vec::new() },
-                );
-            });
-            ui.add_space(12.0);
-            ui.label(
-                RichText::new("CUSTOM TARGET")
-                    .family(FontFamily::Monospace)
-                    .size(11.0)
-                    .color(MUTED),
-            );
+                ),
+            ];
+            egui::Grid::new("scan_choices")
+                .spacing(egui::vec2(18.0, 8.0))
+                .show(ui, |ui| {
+                    for (label, detail, kind) in choices {
+                        if bracket_button(ui, label, TEXT, !running).clicked() {
+                            requested = Some(kind);
+                        }
+                        ui.label(RichText::new(detail).color(MUTED));
+                        ui.end_row();
+                    }
+                });
+            ui.add_space(14.0);
+            ui.label(RichText::new("or one file or folder").color(TEXT));
             ui.horizontal(|ui| {
                 ui.add_sized(
-                    [ui.available_width() - 145.0, 36.0],
+                    [ui.available_width() - 120.0, 34.0],
                     egui::TextEdit::singleline(&mut self.custom_scan_path)
-                        .hint_text(r"C:\Users\you\Downloads or C:\path\sample.exe"),
+                        .hint_text(r"C:\Users\you\Downloads\sample.exe"),
                 );
-                if ui
-                    .add_enabled(!running, egui::Button::new(button_text("SCAN TARGET")))
-                    .clicked()
-                {
+                if bracket_button(ui, "scan it", TEXT, !running).clicked() {
                     requested = Some(ScanRequestKind::Custom { roots: Vec::new() });
                 }
             });
@@ -1045,28 +1023,29 @@ impl BlackshardApp {
             }
         }
 
-        ui.add_space(12.0);
         let snapshot = self.scan_job.as_ref().map(ServiceScanJob::snapshot);
         let mut cancel_requested = false;
-        card(ui, |ui| {
-            section_title(ui, "SCAN STATUS", "Live engine progress and results");
+        section(ui, |ui| {
             let Some(progress) = snapshot.as_ref() else {
-                empty_state(ui, "No scan has run in this session.");
+                section_title(ui, "progress", "");
+                empty_state(
+                    ui,
+                    "no scan has run since blackshard opened. start one above.",
+                );
                 return;
             };
 
             let (phase, phase_color) = scan_phase_label(progress.phase);
             ui.horizontal(|ui| {
-                status_pill(ui, phase, phase_color);
-                ui.label(
-                    RichText::new(progress.kind.display_name().to_uppercase())
-                        .family(FontFamily::Monospace)
-                        .color(TEXT),
-                );
+                ui.label(display(progress.kind.display_name().to_lowercase(), 20.0));
+                status_mark(ui, phase, phase_color);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(format_duration(Duration::from_millis(
-                        progress.elapsed_millis,
-                    )));
+                    ui.label(
+                        RichText::new(format_duration(Duration::from_millis(
+                            progress.elapsed_millis,
+                        )))
+                        .color(MUTED),
+                    );
                 });
             });
             ui.add_space(8.0);
@@ -1079,30 +1058,31 @@ impl BlackshardApp {
             ui.add(
                 egui::ProgressBar::new(fraction)
                     .desired_width(ui.available_width())
-                    .fill(GREEN)
-                    .text(format!(
-                        "{} / {} files",
-                        progress.scanned_files, progress.discovered_files
-                    )),
+                    .desired_height(6.0)
+                    .corner_radius(egui::CornerRadius::ZERO)
+                    .fill(SIGNAL),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "{} of {} files",
+                    group_digits(progress.scanned_files),
+                    group_digits(progress.discovered_files)
+                ))
+                .color(TEXT),
             );
             if let Some(path) = &progress.current_path {
-                ui.label(
-                    RichText::new(format!("Current: {path}"))
-                        .family(FontFamily::Monospace)
-                        .size(11.0)
-                        .color(MUTED),
-                );
+                ui.add(egui::Label::new(RichText::new(path).size(12.0).color(MUTED)).truncate());
             }
-            ui.add_space(6.0);
+            ui.add_space(10.0);
             ui.horizontal_wrapped(|ui| {
-                metric(ui, "Clean", progress.clean_files, GREEN);
-                metric(ui, "Suspicious", progress.suspicious_files, AMBER);
-                metric(ui, "Malicious", progress.malicious_files, RED);
-                metric(ui, "Quarantined", progress.quarantined_files, BLUE);
-                metric(ui, "Errors", progress.errors, MUTED);
+                metric(ui, "clean", progress.clean_files, TEXT);
+                metric(ui, "suspicious", progress.suspicious_files, ATTENTION);
+                metric(ui, "malicious", progress.malicious_files, ALARM);
+                metric(ui, "quarantined", progress.quarantined_files, TEXT);
+                metric(ui, "unreadable", progress.errors, MUTED);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if !progress.is_finished()
-                        && ui.button(RichText::new("CANCEL SCAN").color(RED)).clicked()
+                        && bracket_button(ui, "stop scan", ALARM, true).clicked()
                     {
                         cancel_requested = true;
                     }
@@ -1110,7 +1090,7 @@ impl BlackshardApp {
             });
             if let Some(failure) = &progress.failure {
                 ui.add_space(6.0);
-                ui.colored_label(RED, failure);
+                ui.colored_label(ALARM, failure);
             }
         });
         if cancel_requested {
@@ -1121,13 +1101,8 @@ impl BlackshardApp {
 
         if let Some(progress) = snapshot {
             if !progress.findings.is_empty() {
-                ui.add_space(12.0);
-                card(ui, |ui| {
-                    section_title(
-                        ui,
-                        "FINDINGS",
-                        "Suspicious and malicious files, newest engine decisions last",
-                    );
+                section(ui, |ui| {
+                    section_title(ui, "findings", "newest first");
                     for finding in progress.findings.iter().rev() {
                         finding_row(ui, finding);
                     }
@@ -1139,92 +1114,72 @@ impl BlackshardApp {
     fn render_quarantine(&mut self, ui: &mut egui::Ui) {
         page_heading(
             ui,
-            "Quarantine",
-            "Neutralized files are encrypted and cannot execute from the vault.",
+            "quarantine",
+            "isolated files are encrypted here and cannot run. restore only what you trust.",
         );
         ui.horizontal(|ui| {
-            if ui.button(button_text("REFRESH")).clicked() {
+            if bracket_button(ui, "refresh", TEXT, true).clicked() {
                 self.refresh_persistent_views();
             }
             ui.label(
-                RichText::new(
-                    "Restore only when you trust the file. Real-time protection may isolate it again.",
-                )
-                .color(AMBER),
+                RichText::new(format!(
+                    "{} {}",
+                    self.quarantine_records.len(),
+                    if self.quarantine_records.len() == 1 {
+                        "file"
+                    } else {
+                        "files"
+                    }
+                ))
+                .color(MUTED),
             );
         });
-        ui.add_space(10.0);
 
         if self.quarantine_records.is_empty() {
-            card(ui, |ui| empty_state(ui, "Quarantine is empty."));
+            section(ui, |ui| {
+                empty_state(
+                    ui,
+                    "nothing is in quarantine. files blackshard isolates will wait here.",
+                )
+            });
             return;
         }
 
         let mut confirmation = None;
         for record in &self.quarantine_records {
             let busy = self.busy_quarantine.contains(&record.id);
-            card(ui, |ui| {
+            section(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
+                        ui.label(bold(&record.threat_name).size(16.0).color(ALARM));
+                        ui.label(RichText::new(&record.original_path).color(TEXT));
                         ui.label(
-                            RichText::new(&record.threat_name)
-                                .family(FontFamily::Monospace)
-                                .strong()
-                                .color(RED),
+                            RichText::new(format!(
+                                "isolated {}, {}, risk {}",
+                                record
+                                    .quarantined_at
+                                    .with_timezone(&Local)
+                                    .format("%Y-%m-%d %H:%M"),
+                                format_bytes(record.size),
+                                record.risk_score
+                            ))
+                            .size(12.0)
+                            .color(MUTED),
                         );
-                        ui.label(RichText::new(&record.original_path).size(12.0).color(TEXT));
-                        ui.horizontal_wrapped(|ui| {
-                            ui.label(
-                                RichText::new(format!(
-                                    "{}  |  {}  |  risk {}",
-                                    record
-                                        .quarantined_at
-                                        .with_timezone(&Local)
-                                        .format("%Y-%m-%d %H:%M"),
-                                    format_bytes(record.size),
-                                    record.risk_score
-                                ))
-                                .size(11.0)
-                                .color(MUTED),
-                            );
-                            let state = match record.state {
-                                IsolationState::Isolated => "ISOLATED",
-                                IsolationState::SourceStillPresent => "SOURCE STILL PRESENT",
-                            };
-                            status_pill(
-                                ui,
-                                state,
-                                if record.state == IsolationState::Isolated {
-                                    GREEN
-                                } else {
-                                    RED
-                                },
-                            );
-                        });
+                        if record.state == IsolationState::SourceStillPresent {
+                            status_mark(ui, "the original file is still on disk", ALARM);
+                        }
                         ui.label(
-                            RichText::new(format!("SHA-256 {}", record.sha256))
-                                .family(FontFamily::Monospace)
-                                .size(10.0)
+                            RichText::new(format!("sha-256 {}", record.sha256))
+                                .size(11.0)
                                 .color(MUTED),
                         );
                     });
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .add_enabled(
-                                !busy,
-                                egui::Button::new(RichText::new("DELETE").color(RED)),
-                            )
-                            .clicked()
-                        {
+                        if bracket_button(ui, "delete", ALARM, !busy).clicked() {
                             confirmation = Some(Confirmation::Delete(record.clone()));
                         }
-                        if ui
-                            .add_enabled(
-                                !busy,
-                                egui::Button::new(RichText::new("RESTORE").color(AMBER)),
-                            )
-                            .clicked()
-                        {
+                        if bracket_button(ui, "restore", TEXT, !busy).clicked() {
                             confirmation = Some(Confirmation::Restore(record.clone()));
                         }
                         if busy {
@@ -1233,7 +1188,6 @@ impl BlackshardApp {
                     });
                 });
             });
-            ui.add_space(8.0);
         }
         if confirmation.is_some() {
             self.confirmation = confirmation;
@@ -1243,108 +1197,108 @@ impl BlackshardApp {
     fn render_activity(&mut self, ui: &mut egui::Ui) {
         page_heading(
             ui,
-            "Activity",
-            "Local, append-only security events. Newest entries appear first.",
+            "activity",
+            "everything blackshard did on this machine, newest first.",
         );
         ui.horizontal(|ui| {
-            if ui.button(button_text("REFRESH")).clicked() {
+            if bracket_button(ui, "refresh", TEXT, true).clicked() {
                 self.refresh_persistent_views();
             }
-            if ui
-                .add_enabled(
-                    !self.activity.is_empty(),
-                    egui::Button::new(RichText::new("CLEAR HISTORY").color(RED)),
-                )
-                .clicked()
-            {
+            if bracket_button(ui, "clear history", ALARM, !self.activity.is_empty()).clicked() {
                 self.confirmation = Some(Confirmation::ClearActivity);
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(
-                    RichText::new(format!("{} EVENTS SHOWN", self.activity.len()))
-                        .family(FontFamily::Monospace)
-                        .size(11.0)
-                        .color(MUTED),
-                );
+                ui.label(RichText::new(format!("{} events", self.activity.len())).color(MUTED));
             });
         });
-        ui.add_space(10.0);
-        if self.activity.is_empty() {
-            card(ui, |ui| empty_state(ui, "No activity has been recorded."));
-        } else {
-            card(ui, |ui| {
+        section(ui, |ui| {
+            if self.activity.is_empty() {
+                empty_state(
+                    ui,
+                    "nothing has happened yet. detections, scans and changes appear here.",
+                );
+            } else {
                 for event in &self.activity {
                     activity_row(ui, event);
                 }
-            });
-        }
+            }
+        });
     }
 
     fn render_settings(&mut self, ui: &mut egui::Ui, runtime: &UiRuntimeState) {
         page_heading(
             ui,
-            "Settings",
-            "Resource policy, response behavior, updates, and exclusions.",
+            "settings",
+            "how blackshard watches, responds and updates.",
         );
         let mut changed = false;
         let mut update_requested = false;
 
-        card(ui, |ui| {
+        section(ui, |ui| {
             section_title(
                 ui,
-                "PROTECTION",
-                "Configured policy; see the header for actual health",
+                "protection",
+                "what you choose here; the top bar shows what is running",
             );
             changed |= ui
                 .checkbox(
                     &mut self.settings.real_time_protection,
-                    "Enable real-time protection at startup",
+                    "check files as they are opened and run",
                 )
                 .changed();
             changed |= ui
                 .checkbox(
                     &mut self.settings.automatic_quarantine,
-                    "Automatically quarantine confirmed malicious files",
+                    "move confirmed malware to quarantine automatically",
                 )
                 .changed();
             changed |= ui
                 .checkbox(
+                    &mut self.settings.ransomware_protection,
+                    "watch for programs encrypting your documents",
+                )
+                .changed();
+            ui.add_enabled_ui(self.settings.ransomware_protection, |ui| {
+                ui.horizontal(|ui| {
+                    ui.add_space(24.0);
+                    changed |= ui
+                        .checkbox(
+                            &mut self.settings.ransomware_block_mode,
+                            "stop them, and quarantine unsigned ones (needs the kernel filter)",
+                        )
+                        .changed();
+                });
+            });
+            changed |= ui
+                .checkbox(
                     &mut self.settings.notify_on_detection,
-                    "Show Windows notifications for detections",
+                    "show a windows notification when a threat is stopped",
                 )
                 .changed();
             changed |= ui
                 .checkbox(
                     &mut self.settings.scan_archives,
-                    "Scan archive container files",
+                    "look inside zip and office files",
                 )
                 .changed();
-            ui.label(
-                RichText::new(
-                    "Archive containers are analyzed as files; nested extraction is not enabled in this release.",
-                )
-                .size(11.0)
-                .color(MUTED),
-            );
             changed |= ui
                 .checkbox(
                     &mut self.settings.scan_network_drives,
-                    "Include network drives in scans",
+                    "include network drives in full scans",
                 )
                 .changed();
         });
-        ui.add_space(10.0);
 
-        card(ui, |ui| {
-            section_title(ui, "PERFORMANCE", "Bounded work for low foreground impact");
+        section(ui, |ui| {
+            section_title(ui, "performance", "keep scans out of your way");
             changed |= ui
                 .checkbox(
                     &mut self.settings.low_resource_mode,
-                    "Low-resource mode (recommended)",
+                    "low-resource mode (recommended)",
                 )
                 .changed();
             ui.horizontal(|ui| {
-                ui.label("Scan workers");
+                ui.label("scan workers");
                 changed |= ui
                     .add(
                         egui::DragValue::new(&mut self.settings.worker_count)
@@ -1354,7 +1308,7 @@ impl BlackshardApp {
                     .changed();
             });
             ui.horizontal(|ui| {
-                ui.label("Maximum file size");
+                ui.label("skip files larger than");
                 changed |= ui
                     .add(
                         egui::DragValue::new(&mut self.settings.max_file_size_mb)
@@ -1364,16 +1318,15 @@ impl BlackshardApp {
                     .changed();
             });
         });
-        ui.add_space(10.0);
 
-        card(ui, |ui| {
+        section(ui, |ui| {
             section_title(
                 ui,
-                "SECURITY UPDATES",
-                "Signed definitions with rollback protection",
+                "updates",
+                "only signed, unexpired definitions newer than the installed ones are accepted",
             );
             ui.horizontal(|ui| {
-                ui.label("Check interval");
+                ui.label("check every");
                 changed |= ui
                     .add(
                         egui::DragValue::new(&mut self.settings.definition_update_interval_hours)
@@ -1381,35 +1334,27 @@ impl BlackshardApp {
                             .suffix(" hours"),
                     )
                     .changed();
-                if ui.button(button_text("CHECK NOW")).clicked() {
+                if bracket_button(ui, "check now", TEXT, true).clicked() {
                     update_requested = true;
                 }
             });
             let (definition, color) = definition_label(&runtime.definitions);
             ui.colored_label(color, definition);
-            ui.label(
-                RichText::new(
-                    "Only authenticated, non-expired updates newer than the installed sequence are accepted.",
-                )
-                .size(11.0)
-                .color(MUTED),
-            );
         });
-        ui.add_space(10.0);
 
-        card(ui, |ui| {
+        section(ui, |ui| {
             section_title(
                 ui,
-                "EXCLUSIONS",
-                "Excluded files are not inspected. Add only paths you fully trust.",
+                "exclusions",
+                "blackshard never looks inside these. add only paths you fully trust.",
             );
             ui.horizontal(|ui| {
                 ui.add_sized(
-                    [ui.available_width() - 105.0, 34.0],
+                    [ui.available_width() - 90.0, 34.0],
                     egui::TextEdit::singleline(&mut self.exclusion_input)
                         .hint_text(r"C:\trusted\path"),
                 );
-                if ui.button(button_text("ADD")).clicked() {
+                if bracket_button(ui, "add", TEXT, true).clicked() {
                     let value = self.exclusion_input.trim().trim_matches('"');
                     if !value.is_empty() {
                         self.settings.add_exclusion(PathBuf::from(value));
@@ -1421,16 +1366,9 @@ impl BlackshardApp {
             let mut remove_index = None;
             for (index, exclusion) in self.settings.exclusions.iter().enumerate() {
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(exclusion.display().to_string())
-                            .family(FontFamily::Monospace)
-                            .size(11.0),
-                    );
+                    ui.label(RichText::new(exclusion.display().to_string()).size(13.0));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui
-                            .small_button(RichText::new("REMOVE").color(RED))
-                            .clicked()
-                        {
+                        if bracket_button(ui, "remove", ALARM, true).clicked() {
                             remove_index = Some(index);
                         }
                     });
@@ -1441,23 +1379,29 @@ impl BlackshardApp {
                 changed = true;
             }
         });
-        ui.add_space(10.0);
 
-        card(ui, |ui| {
-            section_title(ui, "BUILD ASSURANCE", "Transparent release health");
-            health_row(ui, "Authenticode", trust_label(&runtime.build_trust));
+        section(ui, |ui| {
+            section_title(ui, "about this build", "");
+            health_row(ui, "version", (runtime.engine_version.clone(), TEXT));
+            health_row(ui, "package", trust_label(&runtime.build_trust));
             health_row(
                 ui,
-                "Independent testing",
+                "independent testing",
                 certification_label(&runtime.certification),
             );
-            ui.add_space(4.0);
             ui.label(
                 RichText::new(
-                    "blackshard reports independent certification only when the runtime supplies a named authority. Signed development builds remain clearly identified.",
+                    "blackshard only claims independent certification when a named lab has \
+                     granted it. development builds always say so.",
                 )
-                .size(11.0)
+                .size(12.0)
                 .color(MUTED),
+            );
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("phase 1: the windows client. free, forever.")
+                    .italics()
+                    .color(SIGNAL),
             );
         });
 
@@ -1470,7 +1414,7 @@ impl BlackshardApp {
             }
             self.notice = Some(Notice {
                 level: NoticeLevel::Information,
-                message: "An update check was requested. Runtime status will report the result."
+                message: "checking for updates. the definitions line will show the result."
                     .to_owned(),
                 created: Instant::now(),
             });
@@ -1483,51 +1427,59 @@ impl BlackshardApp {
         };
         let (title, message, confirm_label, confirm_color) = match &confirmation {
             Confirmation::Restore(record) => (
-                "RESTORE QUARANTINED FILE",
+                "restore this file?",
                 format!(
                     "Restore {} to {}? The file may still be dangerous and can be isolated again by real-time protection.",
                     record.threat_name,
                     record.original_path
                 ),
-                "RESTORE FILE",
-                AMBER,
+                "restore",
+                ATTENTION,
             ),
             Confirmation::Delete(record) => (
-                "PERMANENTLY DELETE FILE",
+                "delete this file for good?",
                 format!(
                     "Permanently delete the quarantined copy of {}? This cannot be undone.",
                     record.original_path
                 ),
-                "DELETE PERMANENTLY",
-                RED,
+                "delete permanently",
+                ALARM,
             ),
             Confirmation::ClearActivity => (
-                "CLEAR ACTIVITY HISTORY",
+                "clear activity history?",
                 "Delete the local activity history? This does not change quarantine or protection settings."
                     .to_owned(),
-                "CLEAR HISTORY",
-                RED,
+                "clear history",
+                ALARM,
             ),
         };
 
         let mut accepted = false;
         let mut cancelled = false;
         egui::Window::new(title)
+            .title_bar(false)
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-            .fixed_size(egui::vec2(460.0, 170.0))
+            .fixed_size(egui::vec2(480.0, 0.0))
+            .frame(
+                egui::Frame::NONE
+                    .fill(BG)
+                    .stroke(Stroke::new(1.0_f32, TEXT))
+                    .inner_margin(egui::Margin::same(24)),
+            )
             .show(ctx, |ui| {
+                ui.label(display(title, 22.0));
+                ui.add_space(8.0);
                 ui.label(message);
-                ui.add_space(14.0);
+                ui.add_space(18.0);
                 ui.horizontal(|ui| {
-                    if ui
-                        .button(RichText::new(confirm_label).color(confirm_color))
-                        .clicked()
-                    {
+                    if bracket_button(ui, confirm_label, confirm_color, true).clicked() {
                         accepted = true;
                     }
-                    if ui.button(button_text("CANCEL")).clicked() {
+                    if bracket_button(ui, "cancel", TEXT, true).clicked()
+                        || ui.input(|input| input.key_pressed(egui::Key::Escape))
+                    {
                         cancelled = true;
                     }
                 });
@@ -1546,7 +1498,7 @@ impl BlackshardApp {
                         self.activity.clear();
                         self.notice = Some(Notice {
                             level: NoticeLevel::Success,
-                            message: "Activity history cleared.".to_owned(),
+                            message: "activity history cleared.".to_owned(),
                             created: Instant::now(),
                         });
                     }
@@ -1554,12 +1506,12 @@ impl BlackshardApp {
                         self.notice = Some(match elevation::request_clear_activity() {
                             Ok(()) => Notice {
                                 level: NoticeLevel::Information,
-                                message: "Approve the Windows administrator prompt to clear machine activity history.".to_owned(),
+                                message: "approve the windows administrator prompt to clear the activity history.".to_owned(),
                                 created: Instant::now(),
                             },
                             Err(error) => Notice {
                                 level: NoticeLevel::Error,
-                                message: format!("Administrator approval could not be requested: {error}"),
+                                message: format!("administrator approval could not be requested: {error}"),
                                 created: Instant::now(),
                             },
                         });
@@ -1567,7 +1519,7 @@ impl BlackshardApp {
                     Err(error) => {
                         self.notice = Some(Notice {
                             level: NoticeLevel::Error,
-                            message: format!("Activity history could not be cleared: {error}"),
+                            message: format!("activity history could not be cleared: {error}"),
                             created: Instant::now(),
                         });
                     }
@@ -1596,45 +1548,37 @@ impl eframe::App for BlackshardApp {
 
         if should_show_loading_screen(&runtime) {
             egui::CentralPanel::default()
-                .frame(
-                    egui::Frame::NONE
-                        .fill(BG)
-                        .inner_margin(egui::Margin::same(22)),
-                )
+                .frame(egui::Frame::NONE.fill(BG))
                 .show(ui, |ui| {
-                    ui.centered_and_justified(|ui| {
-                        ui.vertical_centered(|ui| {
-                            ui.spinner();
-                            ui.add_space(16.0);
-                            let status_text = match &runtime.readiness {
-                                Some(crate::readiness::ReadinessState::Starting) => "Starting...",
-                                Some(crate::readiness::ReadinessState::LoadingSettings) => {
-                                    "Loading settings..."
-                                }
-                                Some(crate::readiness::ReadinessState::LoadingDefinitions) => {
-                                    "Loading definitions..."
-                                }
-                                Some(crate::readiness::ReadinessState::LoadingFreshClam) => {
-                                    "Loading definitions..."
-                                }
-                                Some(
-                                    crate::readiness::ReadinessState::StartingDetectionWorkers,
-                                ) => "Starting detection workers...",
-                                Some(crate::readiness::ReadinessState::ConnectingDriver) => {
-                                    "Connecting to driver..."
-                                }
-                                Some(crate::readiness::ReadinessState::ValidatingProtocol) => {
-                                    "Validating protocol..."
-                                }
-                                _ => "Starting service...",
-                            };
-                            ui.label(
-                                RichText::new(status_text)
-                                    .family(FontFamily::Monospace)
-                                    .size(16.0)
-                                    .color(MUTED),
-                            );
-                        });
+                    ui.vertical_centered(|ui| {
+                        ui.add_space((ui.available_height() / 2.0 - 110.0).max(0.0));
+                        shard_mark(ui, 120.0, TEXT);
+                        ui.add_space(22.0);
+                        let status_text = match &runtime.readiness {
+                            Some(crate::readiness::ReadinessState::LoadingSettings) => {
+                                "loading settings"
+                            }
+                            Some(
+                                crate::readiness::ReadinessState::LoadingDefinitions
+                                | crate::readiness::ReadinessState::LoadingFreshClam,
+                            ) => "loading definitions",
+                            Some(crate::readiness::ReadinessState::StartingDetectionWorkers) => {
+                                "starting detection"
+                            }
+                            Some(crate::readiness::ReadinessState::ConnectingDriver) => {
+                                "connecting to the kernel filter"
+                            }
+                            Some(crate::readiness::ReadinessState::ValidatingProtocol) => {
+                                "checking the protection channel"
+                            }
+                            _ => "starting blackshard",
+                        };
+                        ui.label(
+                            RichText::new(status_text)
+                                .italics()
+                                .size(17.0)
+                                .color(SIGNAL),
+                        );
                     });
                 });
             ctx.request_repaint_after(Duration::from_millis(150));
@@ -1642,68 +1586,47 @@ impl eframe::App for BlackshardApp {
         }
 
         egui::Panel::top("blackshard_top")
-            .exact_size(61.0)
+            .exact_size(64.0)
             .frame(
                 egui::Frame::NONE
-                    .fill(PANEL)
-                    .stroke(Stroke::new(1.0_f32, BORDER))
-                    .inner_margin(egui::Margin::symmetric(18, 0)),
+                    .fill(BAR)
+                    .inner_margin(egui::Margin::symmetric(24, 0)),
             )
             .show(ui, |ui| self.render_top_bar(ui, &runtime));
 
-        egui::Panel::left("blackshard_navigation")
-            .exact_size(190.0)
-            .resizable(false)
-            .frame(
-                egui::Frame::NONE
-                    .fill(PANEL)
-                    .stroke(Stroke::new(1.0_f32, BORDER))
-                    .inner_margin(egui::Margin::symmetric(12, 0)),
-            )
-            .show(ui, |ui| self.render_sidebar(ui));
-
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::NONE
-                    .fill(BG)
-                    .inner_margin(egui::Margin::same(22)),
-            )
+            .frame(egui::Frame::NONE.fill(BG))
             .show(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        self.render_notice(ui);
-                        // With the service down every read fails the same way, and the
-                        // dashboard already says so in plain words.
-                        if let Some(error) = self.persistent_error.as_ref().filter(|_| {
-                            !matches!(runtime.protection, ProtectionStatus::Unavailable(_))
-                        }) {
-                            egui::Frame::NONE
-                                .fill(RED.gamma_multiply(0.10))
-                                .stroke(Stroke::new(1.0_f32, RED.gamma_multiply(0.65)))
-                                .corner_radius(egui::CornerRadius::same(6))
-                                .inner_margin(egui::Margin::symmetric(12, 9))
-                                .show(ui, |ui| {
-                                    ui.horizontal_wrapped(|ui| {
-                                        ui.label(
-                                            RichText::new("ERROR")
-                                                .family(FontFamily::Monospace)
-                                                .strong()
-                                                .color(RED),
-                                        );
-                                        ui.label(error);
-                                    });
-                                });
-                            ui.add_space(8.0);
-                        }
-                        match self.page {
-                            Page::Dashboard => self.render_dashboard(ui, &runtime),
-                            Page::Scan => self.render_scan(ui),
-                            Page::Quarantine => self.render_quarantine(ui),
-                            Page::Activity => self.render_activity(ui),
-                            Page::Settings => self.render_settings(ui, &runtime),
-                        }
-                        ui.add_space(24.0);
+                        // A centred measure, as the site's columns are; wide windows gain margin
+                        // rather than line length.
+                        let width = ui.available_width().min(980.0);
+                        let margin = ((ui.available_width() - width) / 2.0).max(0.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(margin);
+                            ui.vertical(|ui| {
+                                ui.set_width(width - 48.0);
+                                ui.add_space(24.0);
+                                self.render_notice(ui);
+                                // With the service down every read fails the same way, and the
+                                // status page already says so in plain words.
+                                if let Some(error) = self.persistent_error.clone().filter(|_| {
+                                    !matches!(runtime.protection, ProtectionStatus::Unavailable(_))
+                                }) {
+                                    banner(ui, ALARM, &error);
+                                }
+                                match self.page {
+                                    Page::Dashboard => self.render_dashboard(ui, &runtime),
+                                    Page::Scan => self.render_scan(ui),
+                                    Page::Quarantine => self.render_quarantine(ui),
+                                    Page::Activity => self.render_activity(ui),
+                                    Page::Settings => self.render_settings(ui, &runtime),
+                                }
+                                ui.add_space(32.0);
+                            });
+                        });
                     });
             });
 
@@ -1739,141 +1662,228 @@ fn should_show_loading_screen(runtime: &UiRuntimeState) -> bool {
     }
 }
 
-/// Plain button text in the button style. egui 0.36 sets plain strings in the body font,
-/// ignoring the style's button font, so the terminal look has to be asked for.
-fn button_text(text: impl Into<String>) -> RichText {
-    RichText::new(text).text_style(egui::TextStyle::Button)
+/// Loads JetBrains Mono, the site's typeface, ahead of egui's own fonts, which stay behind as
+/// fallbacks for glyphs it lacks, such as emoji in file names.
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    for (name, bytes) in [
+        (
+            REGULAR_FONT,
+            include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf").as_slice(),
+        ),
+        (
+            BOLD_FONT,
+            include_bytes!("../assets/fonts/JetBrainsMono-Bold.ttf").as_slice(),
+        ),
+    ] {
+        fonts.font_data.insert(
+            name.to_owned(),
+            Arc::new(egui::FontData::from_static(bytes)),
+        );
+    }
+    let fallbacks = fonts
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    for family in [FontFamily::Proportional, FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .insert(0, REGULAR_FONT.to_owned());
+    }
+    fonts.families.insert(
+        bold_family(),
+        std::iter::once(BOLD_FONT.to_owned())
+            .chain(fallbacks)
+            .collect(),
+    );
+    ctx.set_fonts(fonts);
+}
+
+/// egui has no font weights, so bold is its own family.
+fn bold_family() -> FontFamily {
+    FontFamily::Name(BOLD_FONT.into())
+}
+
+fn bold(text: impl Into<String>) -> RichText {
+    RichText::new(text).family(bold_family())
+}
+
+/// Display type: bold and tracked in, like the site's headings.
+fn display(text: impl Into<String>, size: f32) -> RichText {
+    bold(text)
+        .size(size)
+        .extra_letter_spacing(size * TRACKING)
+        .color(TEXT)
+}
+
+/// The blackshard mark, drawn rather than loaded so it can take the colour of the machine's
+/// state. Bars on a 7 by 9 grid, traced from the site's logo: `(column, top row, bottom row)`.
+fn shard_mark(ui: &mut egui::Ui, height: f32, color: Color32) -> egui::Response {
+    const BARS: [(u8, u8, u8); 10] = [
+        (0, 6, 9),
+        (1, 3, 6),
+        (1, 7, 9),
+        (2, 0, 3),
+        (2, 7, 8),
+        (3, 1, 4),
+        (3, 6, 8),
+        (4, 3, 7),
+        (5, 4, 6),
+        (6, 5, 6),
+    ];
+    let row = height / 9.0;
+    let column = row * 1.01;
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(column * 7.0, height), egui::Sense::hover());
+    let gap = (column * 0.06).max(1.0);
+    for (x, top, bottom) in BARS {
+        let min = rect.min + egui::vec2(f32::from(x) * column, f32::from(top) * row);
+        let max =
+            rect.min + egui::vec2((f32::from(x) + 1.0) * column - gap, f32::from(bottom) * row);
+        ui.painter()
+            .rect_filled(egui::Rect::from_min_max(min, max), 0.0, color);
+    }
+    response
+}
+
+/// Text between two solid bars, after the roadmap boxes on blackshard.dev. Hover and keyboard
+/// focus fill it with the nav bar's grey; focus also underlines it in yellow.
+fn bracket_button(ui: &mut egui::Ui, label: &str, color: Color32, enabled: bool) -> egui::Response {
+    let text_color = if enabled { color } else { MUTED };
+    let galley = egui::WidgetText::from(RichText::new(label).size(14.0).color(text_color))
+        .into_galley(
+            ui,
+            Some(egui::TextWrapMode::Extend),
+            f32::INFINITY,
+            egui::TextStyle::Button,
+        );
+    let padding = egui::vec2(16.0, 7.0);
+    let (rect, response) = ui.allocate_exact_size(
+        galley.size() + 2.0 * padding,
+        if enabled {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        },
+    );
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        if enabled && (response.hovered() || response.has_focus()) {
+            painter.rect_filled(rect, 0.0, BAR);
+        }
+        let bar = Stroke::new(2.0_f32, if enabled { color } else { RULE });
+        painter.vline(rect.left() + 1.0, rect.y_range(), bar);
+        painter.vline(rect.right() - 1.0, rect.y_range(), bar);
+        if response.has_focus() {
+            painter.hline(rect.x_range(), rect.bottom(), Stroke::new(1.0_f32, SIGNAL));
+        }
+        painter.galley(rect.min + padding, galley, text_color);
+    }
+    if enabled {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    }
+}
+
+/// A short status, led by one bar of the shard mark in the status colour.
+fn status_mark(ui: &mut egui::Ui, label: &str, color: Color32) -> egui::Response {
+    let galley = egui::WidgetText::from(bold(label).size(13.0).color(color)).into_galley(
+        ui,
+        Some(egui::TextWrapMode::Extend),
+        f32::INFINITY,
+        egui::TextStyle::Body,
+    );
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(13.0 + galley.size().x, galley.size().y.max(16.0)),
+        egui::Sense::hover(),
+    );
+    let painter = ui.painter();
+    painter.rect_filled(
+        egui::Rect::from_center_size(
+            egui::pos2(rect.left() + 2.5, rect.center().y),
+            egui::vec2(5.0, 14.0),
+        ),
+        0.0,
+        color,
+    );
+    painter.galley(
+        egui::pos2(rect.left() + 13.0, rect.center().y - galley.size().y / 2.0),
+        galley,
+        color,
+    );
+    response
+}
+
+/// A message across the page, marked by a bar in its colour rather than boxed.
+fn banner(ui: &mut egui::Ui, color: Color32, message: &str) {
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(3.0, 22.0), egui::Sense::hover());
+        ui.painter().rect_filled(rect, 0.0, color);
+        ui.add_space(4.0);
+        ui.add(egui::Label::new(RichText::new(message).color(color)).wrap());
+    });
+    ui.add_space(14.0);
 }
 
 fn page_heading(ui: &mut egui::Ui, title: &str, subtitle: &str) {
-    ui.label(
-        RichText::new(title.to_uppercase())
-            .family(FontFamily::Monospace)
-            .size(25.0)
-            .strong()
-            .color(TEXT),
-    );
-    ui.label(RichText::new(subtitle).size(13.0).color(MUTED));
-    ui.add_space(16.0);
+    ui.label(display(title, 34.0));
+    ui.label(RichText::new(subtitle).size(15.0).color(MUTED));
+    ui.add_space(18.0);
 }
 
 fn section_title(ui: &mut egui::Ui, title: &str, subtitle: &str) {
-    ui.horizontal_wrapped(|ui| {
-        ui.label(
-            RichText::new(title)
-                .family(FontFamily::Monospace)
-                .size(13.0)
-                .strong()
-                .color(TEXT),
-        );
-        ui.label(
-            RichText::new(format!("// {subtitle}"))
-                .size(11.0)
-                .color(MUTED),
-        );
-    });
+    ui.label(display(title, 18.0));
+    if !subtitle.is_empty() {
+        ui.label(RichText::new(subtitle).size(13.0).color(MUTED));
+    }
+    ui.add_space(6.0);
 }
 
-fn card<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
+/// One block of a page. The site separates things with space and hairlines, never boxes.
+fn section<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.add_space(10.0);
+    let top = ui.cursor().top();
+    ui.painter().hline(
+        ui.available_rect_before_wrap().x_range(),
+        top,
+        Stroke::new(1.0_f32, RULE),
+    );
     egui::Frame::NONE
-        .fill(SURFACE)
-        .stroke(Stroke::new(1.0_f32, BORDER))
-        .corner_radius(egui::CornerRadius::same(8))
-        .inner_margin(egui::Margin::same(15))
+        .inner_margin(egui::Margin {
+            left: 0,
+            right: 0,
+            top: 18,
+            bottom: 8,
+        })
         .show(ui, add_contents)
         .inner
 }
 
-fn status_pill(ui: &mut egui::Ui, label: &str, color: Color32) {
-    egui::Frame::NONE
-        .fill(color.gamma_multiply(0.12))
-        .stroke(Stroke::new(1.0_f32, color.gamma_multiply(0.72)))
-        .corner_radius(egui::CornerRadius::same(10))
-        .inner_margin(egui::Margin::symmetric(9, 4))
-        .show(ui, |ui| {
-            ui.label(
-                RichText::new(format!("* {label}"))
-                    .family(FontFamily::Monospace)
-                    .size(10.5)
-                    .strong()
-                    .color(color),
-            );
-        });
-}
-
-fn stat_card(ui: &mut egui::Ui, label: &str, value: &str, color: Color32) {
-    card(ui, |ui| {
-        ui.label(
-            RichText::new(label)
-                .family(FontFamily::Monospace)
-                .size(10.0)
-                .color(MUTED),
-        );
-        ui.label(
-            RichText::new(value)
-                .family(FontFamily::Monospace)
-                .size(28.0)
-                .strong()
-                .color(color),
-        );
-    });
-}
-
-fn action_tile(ui: &mut egui::Ui, title: &str, detail: &str, color: Color32) -> bool {
-    let response = ui.add_sized(
-        [ui.available_width(), 68.0],
-        egui::Button::new(
-            RichText::new(format!("{title}\n{detail}"))
-                .family(FontFamily::Monospace)
-                .color(color),
-        )
-        .fill(Color32::from_rgb(14, 20, 16))
-        .stroke(Stroke::new(1.0_f32, color.gamma_multiply(0.45))),
+/// One line of the status page's tally: the number in bold, then what it counts.
+fn fact(ui: &mut egui::Ui, value: u64, words: &str, color: Color32) {
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        &group_digits(value),
+        0.0,
+        egui::TextFormat::simple(FontId::new(17.0, bold_family()), color),
     );
-    response.clicked()
-}
-
-#[allow(clippy::too_many_arguments)]
-fn scan_option(
-    ui: &mut egui::Ui,
-    title: &str,
-    detail: &str,
-    timing: &str,
-    color: Color32,
-    enabled: bool,
-    request: &mut Option<ScanRequestKind>,
-    kind: ScanRequestKind,
-) {
-    ui.vertical(|ui| {
-        ui.label(
-            RichText::new(title)
-                .family(FontFamily::Monospace)
-                .size(17.0)
-                .strong()
-                .color(color),
-        );
-        ui.label(RichText::new(detail).size(12.0).color(TEXT));
-        ui.label(RichText::new(timing).size(10.5).color(MUTED));
-        if !matches!(kind, ScanRequestKind::Custom { .. })
-            && ui
-                .add_enabled(
-                    enabled,
-                    egui::Button::new(button_text(format!("START {title}"))),
-                )
-                .clicked()
-        {
-            *request = Some(kind);
-        }
-    });
+    job.append(
+        words,
+        10.0,
+        egui::TextFormat::simple(FontId::new(15.0, FontFamily::Proportional), MUTED),
+    );
+    ui.label(job);
 }
 
 fn metric(ui: &mut egui::Ui, label: &str, value: u64, color: Color32) {
-    ui.label(
-        RichText::new(format!("{label} {value}"))
-            .family(FontFamily::Monospace)
-            .size(11.0)
-            .color(color),
-    );
+    ui.label(bold(group_digits(value)).color(color));
+    ui.label(RichText::new(label).color(MUTED));
+    ui.add_space(10.0);
 }
 
 fn health_row(ui: &mut egui::Ui, label: &str, value: (String, Color32)) {
@@ -1881,17 +1891,9 @@ fn health_row(ui: &mut egui::Ui, label: &str, value: (String, Color32)) {
         ui.label(RichText::new(label).color(MUTED));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             // Truncated, with the whole value on hover: a long reason laid out right to left
-            // would otherwise grow leftwards out of its card and over the sidebar.
-            ui.add(
-                egui::Label::new(
-                    RichText::new(&value.0)
-                        .family(FontFamily::Monospace)
-                        .size(10.5)
-                        .color(value.1),
-                )
-                .truncate(),
-            )
-            .on_hover_text(&value.0);
+            // would otherwise grow leftwards out of its column.
+            ui.add(egui::Label::new(RichText::new(&value.0).color(value.1)).truncate())
+                .on_hover_text(&value.0);
         });
     });
 }
@@ -1907,284 +1909,279 @@ fn activity_row(ui: &mut egui::Ui, event: &SecurityEvent) {
                     .format("%Y-%m-%d %H:%M:%S")
                     .to_string(),
             )
-            .family(FontFamily::Monospace)
-            .size(10.5)
+            .size(12.0)
             .color(MUTED),
         );
-        ui.label(
-            RichText::new(kind)
-                .family(FontFamily::Monospace)
-                .size(10.5)
-                .strong()
-                .color(color),
-        );
+        status_mark(ui, kind, color);
         ui.label(&event.summary);
     });
     if event.path.is_some() || event.threat_name.is_some() || event.details.is_some() {
         ui.horizontal_wrapped(|ui| {
-            ui.add_space(142.0);
+            ui.add_space(156.0);
             if let Some(threat) = &event.threat_name {
-                ui.colored_label(RED, threat);
+                ui.label(bold(threat).color(ALARM));
             }
             if let Some(path) = &event.path {
                 ui.label(
                     RichText::new(path.display().to_string())
-                        .size(11.0)
+                        .size(12.0)
                         .color(MUTED),
                 );
             }
             if let Some(details) = &event.details {
-                ui.label(RichText::new(details).size(11.0).color(MUTED));
+                ui.label(RichText::new(details).size(12.0).color(MUTED));
             }
         });
     }
-    ui.separator();
+    ui.add_space(4.0);
 }
 
 fn finding_row(ui: &mut egui::Ui, finding: &ScanFindingView) {
     let (verdict, color) = match finding.verdict {
-        DetectionVerdictView::Clean => ("CLEAN", GREEN),
-        DetectionVerdictView::Suspicious => ("SUSPICIOUS", AMBER),
-        DetectionVerdictView::Malicious => ("MALICIOUS", RED),
-        DetectionVerdictView::Error => ("SCAN ERROR", MUTED),
+        DetectionVerdictView::Clean => ("clean", OK),
+        DetectionVerdictView::Suspicious => ("suspicious", ATTENTION),
+        DetectionVerdictView::Malicious => ("malicious", ALARM),
+        DetectionVerdictView::Error => ("could not scan", PENDING),
     };
     ui.horizontal_wrapped(|ui| {
-        status_pill(ui, verdict, color);
+        status_mark(ui, verdict, color);
         ui.label(
-            RichText::new(
+            bold(
                 finding
                     .threat_name
                     .as_deref()
-                    .unwrap_or("Unclassified finding"),
+                    .unwrap_or("unclassified finding"),
             )
-            .strong()
             .color(color),
         );
         ui.label(
             RichText::new(format!(
-                "risk {} | confidence {}%",
+                "risk {}, confidence {}%",
                 finding.risk_score, finding.confidence
             ))
-            .size(11.0)
+            .size(12.0)
             .color(MUTED),
         );
     });
-    ui.label(
-        RichText::new(&finding.path)
-            .family(FontFamily::Monospace)
-            .size(11.0)
-            .color(TEXT),
-    );
+    ui.label(RichText::new(&finding.path).size(13.0).color(TEXT));
     if let Some(state) = finding.quarantine_state {
         ui.colored_label(
             if state == IsolationState::Isolated {
-                GREEN
+                OK
             } else {
-                RED
+                ALARM
             },
             if state == IsolationState::Isolated {
-                "Moved to quarantine"
+                "moved to quarantine"
             } else {
-                "Neutralized copy created, but the original remains"
+                "an encrypted copy is in quarantine, but the original is still on disk"
             },
         );
     }
     if let Some(error) = &finding.action_error {
-        ui.colored_label(RED, format!("Response error: {error}"));
+        ui.colored_label(ALARM, format!("could not remove it: {error}"));
     }
     if let Some(error) = &finding.analysis_error {
-        ui.colored_label(MUTED, format!("Analysis note: {error}"));
+        ui.colored_label(MUTED, format!("note: {error}"));
     }
-    ui.separator();
+    ui.add_space(10.0);
 }
 
 fn empty_state(ui: &mut egui::Ui, message: &str) {
-    ui.add_space(16.0);
-    ui.vertical_centered(|ui| {
-        ui.label(
-            RichText::new("[ ]")
-                .family(FontFamily::Monospace)
-                .size(28.0)
-                .color(GREEN_DARK),
-        );
-        ui.label(RichText::new(message).color(MUTED));
-    });
-    ui.add_space(16.0);
+    ui.add_space(10.0);
+    ui.label(RichText::new(message).italics().color(MUTED));
+    ui.add_space(10.0);
+}
+
+/// 12402 as "12,402".
+fn group_digits(value: u64) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
 }
 
 fn compact_health(runtime: &UiRuntimeState) -> (String, Color32) {
     match (&runtime.protection, &runtime.driver) {
-        (ProtectionStatus::Active, DriverStatus::Connected) => {
-            ("PROTECTION ACTIVE".to_owned(), GREEN)
+        (ProtectionStatus::Active, DriverStatus::Connected | DriverStatus::NotRequired) => {
+            ("protected".to_owned(), OK)
         }
-        (ProtectionStatus::Active, DriverStatus::NotRequired) => {
-            ("PROTECTION ACTIVE".to_owned(), GREEN)
-        }
-        (ProtectionStatus::Paused, _) => ("PROTECTION PAUSED".to_owned(), AMBER),
-        (ProtectionStatus::Unavailable(_), _) => ("NOT PROTECTED".to_owned(), RED),
+        (ProtectionStatus::Paused, _) => ("paused".to_owned(), ATTENTION),
+        (ProtectionStatus::Unavailable(_), _) => ("not protected".to_owned(), ALARM),
         (_, DriverStatus::Disconnected(_))
         | (_, DriverStatus::NotInstalled)
-        | (_, DriverStatus::Error(_)) => ("PROTECTION LIMITED".to_owned(), RED),
+        | (_, DriverStatus::Error(_)) => ("limited".to_owned(), ALARM),
         (ProtectionStatus::Starting, _) | (_, DriverStatus::Checking) => {
-            ("VERIFYING PROTECTION".to_owned(), AMBER)
+            ("checking".to_owned(), ATTENTION)
         }
-        _ => ("PROTECTION LIMITED".to_owned(), RED),
+        _ => ("limited".to_owned(), ALARM),
     }
 }
 
 fn overall_health(runtime: &UiRuntimeState) -> (String, String, Color32) {
     match (&runtime.protection, &runtime.driver) {
         (ProtectionStatus::Active, DriverStatus::Connected) => (
-            "PROTECTION ACTIVE".to_owned(),
-            "The real-time engine and kernel minifilter report a healthy connection.".to_owned(),
-            GREEN,
+            "you're protected".to_owned(),
+            "blackshard checks every file as it is opened or run, from inside the kernel."
+                .to_owned(),
+            OK,
         ),
         // Real protection, narrower than the kernel tier. The scope is stated rather than rounded
         // up, so nobody believes they have file system coverage they do not have.
         (ProtectionStatus::Active, DriverStatus::NotRequired) => (
-            "PROTECTION ACTIVE".to_owned(),
-            "Real-time protection covers scripts and macros through AMSI, with on-demand scanning and quarantine active. Installing the signed driver adds file system coverage."
+            "you're protected".to_owned(),
+            "scripts and macros are checked through AMSI as they run, and scans and quarantine work. installing the signed driver adds checks on every file."
                 .to_owned(),
-            GREEN,
+            OK,
         ),
         (ProtectionStatus::Paused, _) => (
-            "PROTECTION PAUSED".to_owned(),
-            "Real-time inspection is paused. On-demand scanning remains available.".to_owned(),
-            AMBER,
+            "protection is paused".to_owned(),
+            "files are not checked as they open. you can still scan by hand.".to_owned(),
+            ATTENTION,
         ),
         (ProtectionStatus::Unavailable(reason), _) => (
-            "NOT PROTECTED".to_owned(),
-            format!("Real-time protection is unavailable: {reason}"),
-            RED,
+            "not protected".to_owned(),
+            reason.clone(),
+            ALARM,
         ),
         (_, DriverStatus::Disconnected(reason)) | (_, DriverStatus::Error(reason)) => (
-            "LIMITED PROTECTION".to_owned(),
-            format!("The kernel minifilter is not connected: {reason}"),
-            RED,
+            "limited protection".to_owned(),
+            format!("the kernel filter is not connected, so files are not checked as they open: {reason}"),
+            ALARM,
         ),
         (_, DriverStatus::NotInstalled) => (
-            "LIMITED PROTECTION".to_owned(),
-            "The kernel minifilter is installed but could not be loaded; file system blocking is unavailable."
+            "limited protection".to_owned(),
+            "the kernel filter is installed but did not load, so files are not checked as they open."
                 .to_owned(),
-            RED,
+            ALARM,
         ),
         (ProtectionStatus::Degraded(reason), _) => (
-            "LIMITED PROTECTION".to_owned(),
-            format!("The engine reports degraded protection: {reason}"),
-            AMBER,
+            "limited protection".to_owned(),
+            format!("part of the engine is not working: {reason}"),
+            ATTENTION,
         ),
         (ProtectionStatus::Starting, _) | (_, DriverStatus::Checking) => (
-            "VERIFYING PROTECTION".to_owned(),
-            "blackshard is checking the engine and kernel enforcement channel.".to_owned(),
-            AMBER,
+            "checking protection".to_owned(),
+            "blackshard is checking the engine and the kernel filter.".to_owned(),
+            ATTENTION,
         ),
     }
 }
 
 fn protection_label(status: &ProtectionStatus) -> (String, Color32) {
     match status {
-        ProtectionStatus::Starting => ("STARTING".to_owned(), AMBER),
-        ProtectionStatus::Active => ("ACTIVE".to_owned(), GREEN),
-        ProtectionStatus::Paused => ("PAUSED".to_owned(), AMBER),
-        ProtectionStatus::Degraded(reason) => (format!("DEGRADED | {reason}"), AMBER),
-        ProtectionStatus::Unavailable(reason) => (format!("UNAVAILABLE | {reason}"), RED),
+        ProtectionStatus::Starting => ("starting".to_owned(), ATTENTION),
+        ProtectionStatus::Active => ("running".to_owned(), OK),
+        ProtectionStatus::Paused => ("paused".to_owned(), ATTENTION),
+        ProtectionStatus::Degraded(reason) => (format!("degraded: {reason}"), ATTENTION),
+        ProtectionStatus::Unavailable(reason) => (format!("stopped: {reason}"), ALARM),
     }
 }
 
 fn driver_label(status: &DriverStatus) -> (String, Color32) {
     match status {
-        DriverStatus::Checking => ("CHECKING".to_owned(), AMBER),
-        DriverStatus::Connected => ("CONNECTED".to_owned(), GREEN),
-        DriverStatus::Disconnected(reason) => (format!("DISCONNECTED | {reason}"), RED),
-        DriverStatus::NotRequired => ("NOT INSTALLED | AMSI COVERAGE ACTIVE".to_owned(), AMBER),
-        DriverStatus::NotInstalled => ("NOT INSTALLED".to_owned(), RED),
-        DriverStatus::Error(reason) => (format!("ERROR | {reason}"), RED),
+        DriverStatus::Checking => ("checking".to_owned(), ATTENTION),
+        DriverStatus::Connected => ("connected".to_owned(), OK),
+        DriverStatus::Disconnected(reason) => (format!("disconnected: {reason}"), ALARM),
+        DriverStatus::NotRequired => (
+            "not installed; scripts covered by AMSI".to_owned(),
+            ATTENTION,
+        ),
+        DriverStatus::NotInstalled => ("did not load".to_owned(), ALARM),
+        DriverStatus::Error(reason) => (format!("error: {reason}"), ALARM),
     }
 }
 
 fn trust_label(status: &BuildTrustStatus) -> (String, Color32) {
     match status {
-        BuildTrustStatus::Checking => ("CHECKING".to_owned(), AMBER),
+        BuildTrustStatus::Checking => ("checking".to_owned(), ATTENTION),
         BuildTrustStatus::AuthenticodeVerified { publisher } => {
-            (format!("SIGNED | {publisher}"), GREEN)
+            (format!("signed by {publisher}"), OK)
         }
         BuildTrustStatus::UnsignedDevelopmentBuild => {
-            ("UNSIGNED DEVELOPMENT BUILD".to_owned(), AMBER)
+            ("unsigned development build".to_owned(), ATTENTION)
         }
         BuildTrustStatus::VerificationFailed(reason) => {
-            (format!("SIGNATURE INVALID | {reason}"), RED)
+            (format!("signature invalid: {reason}"), ALARM)
         }
     }
 }
 
 fn certification_label(status: &CertificationStatus) -> (String, Color32) {
     match status {
-        CertificationStatus::NotEvaluated => ("NOT INDEPENDENTLY EVALUATED".to_owned(), AMBER),
-        CertificationStatus::EvaluationInProgress => ("EVALUATION IN PROGRESS".to_owned(), BLUE),
+        CertificationStatus::NotEvaluated => ("not evaluated yet".to_owned(), MUTED),
+        CertificationStatus::EvaluationInProgress => ("evaluation in progress".to_owned(), PENDING),
         CertificationStatus::IndependentlyCertified { authority } => {
-            (format!("CERTIFIED | {authority}"), GREEN)
+            (format!("certified by {authority}"), OK)
         }
     }
 }
 
 fn definition_label(status: &DefinitionStatus) -> (String, Color32) {
     match status {
-        DefinitionStatus::BuiltInOnly { version } => (format!("BUILT-IN RULES | {version}"), AMBER),
+        DefinitionStatus::BuiltInOnly { version } => {
+            (format!("built-in rules only ({version})"), ATTENTION)
+        }
         DefinitionStatus::Updating { current_version } => (
             format!(
-                "UPDATING | {}",
-                current_version.as_deref().unwrap_or("no installed bundle")
+                "updating from {}",
+                current_version.as_deref().unwrap_or("nothing installed")
             ),
-            BLUE,
+            PENDING,
         ),
         DefinitionStatus::Current {
             version,
             expires_at,
         } => (
             format!(
-                "CURRENT | {version} | EXPIRES {}",
+                "{version}, good until {}",
                 expires_at.with_timezone(&Local).format("%Y-%m-%d %H:%M")
             ),
-            GREEN,
+            OK,
         ),
         DefinitionStatus::Stale {
             version,
             expired_at,
         } => (
             format!(
-                "STALE | {version} | EXPIRED {}",
+                "{version} expired {}",
                 expired_at.with_timezone(&Local).format("%Y-%m-%d %H:%M")
             ),
-            AMBER,
+            ATTENTION,
         ),
-        DefinitionStatus::Failed(reason) => (format!("UPDATE FAILED | {reason}"), RED),
+        DefinitionStatus::Failed(reason) => (format!("update failed: {reason}"), ALARM),
     }
 }
 
 fn scan_phase_label(phase: ScanPhaseView) -> (&'static str, Color32) {
     match phase {
-        ScanPhaseView::Enumerating => ("ENUMERATING", BLUE),
-        ScanPhaseView::Scanning => ("SCANNING", GREEN),
-        ScanPhaseView::Cancelling => ("CANCELLING", AMBER),
-        ScanPhaseView::Completed => ("COMPLETED", GREEN),
-        ScanPhaseView::Cancelled => ("CANCELLED", AMBER),
-        ScanPhaseView::Failed => ("FAILED", RED),
+        ScanPhaseView::Enumerating => ("finding files", PENDING),
+        ScanPhaseView::Scanning => ("scanning", SIGNAL),
+        ScanPhaseView::Cancelling => ("stopping", ATTENTION),
+        ScanPhaseView::Completed => ("done", OK),
+        ScanPhaseView::Cancelled => ("stopped", ATTENTION),
+        ScanPhaseView::Failed => ("failed", ALARM),
     }
 }
 
 fn event_kind_label(kind: &EventKind) -> (&'static str, Color32) {
     match kind {
-        EventKind::ProtectionStarted => ("PROTECTION", GREEN),
-        EventKind::ProtectionStopped => ("PROTECTION", AMBER),
-        EventKind::ScanStarted => ("SCAN START", BLUE),
-        EventKind::ScanCompleted => ("SCAN END", GREEN),
-        EventKind::Detection => ("DETECTION", RED),
-        EventKind::Quarantined => ("QUARANTINE", RED),
-        EventKind::QuarantineFailed => ("ACTION FAILED", RED),
-        EventKind::Restored => ("RESTORED", AMBER),
-        EventKind::UpdateInstalled => ("UPDATE", GREEN),
-        EventKind::UpdateFailed => ("UPDATE FAILED", RED),
-        EventKind::Error => ("ERROR", RED),
+        EventKind::ProtectionStarted => ("protection", OK),
+        EventKind::ProtectionStopped => ("protection", ATTENTION),
+        EventKind::ScanStarted => ("scan", PENDING),
+        EventKind::ScanCompleted => ("scan", OK),
+        EventKind::Detection => ("detection", ALARM),
+        EventKind::Quarantined => ("quarantine", ALARM),
+        EventKind::QuarantineFailed => ("not removed", ALARM),
+        EventKind::Restored => ("restored", ATTENTION),
+        EventKind::UpdateInstalled => ("update", OK),
+        EventKind::UpdateFailed => ("update", ALARM),
+        EventKind::Error => ("error", ALARM),
     }
 }
 
@@ -2223,8 +2220,8 @@ mod tests {
     #[test]
     fn default_ui_state_never_claims_active_protection() {
         let state = UiRuntimeState::default();
-        assert_ne!(compact_health(&state).0, "PROTECTION ACTIVE");
-        assert_ne!(overall_health(&state).0, "PROTECTION ACTIVE");
+        assert_ne!(compact_health(&state).0, "protected");
+        assert_ne!(overall_health(&state).0, "you're protected");
     }
 
     #[test]
@@ -2234,10 +2231,10 @@ mod tests {
             driver: DriverStatus::Disconnected("test".to_owned()),
             ..UiRuntimeState::default()
         };
-        assert_eq!(compact_health(&state).0, "PROTECTION LIMITED");
+        assert_eq!(compact_health(&state).0, "limited");
 
         state.driver = DriverStatus::Connected;
-        assert_eq!(compact_health(&state).0, "PROTECTION ACTIVE");
+        assert_eq!(compact_health(&state).0, "protected");
     }
 
     #[test]
@@ -2246,8 +2243,8 @@ mod tests {
             driver: DriverStatus::NotInstalled,
             ..UiRuntimeState::default()
         };
-        assert_eq!(compact_health(&state).0, "PROTECTION LIMITED");
-        assert_eq!(overall_health(&state).0, "LIMITED PROTECTION");
+        assert_eq!(compact_health(&state).0, "limited");
+        assert_eq!(overall_health(&state).0, "limited protection");
     }
 
     #[test]
@@ -2259,10 +2256,10 @@ mod tests {
             ..UiRuntimeState::default()
         };
 
-        assert_eq!(compact_health(&state).0, "PROTECTION ACTIVE");
+        assert_eq!(compact_health(&state).0, "protected");
         let (headline, detail, colour) = overall_health(&state);
-        assert_eq!(headline, "PROTECTION ACTIVE");
-        assert_eq!(colour, GREEN);
+        assert_eq!(headline, "you're protected");
+        assert_eq!(colour, OK);
 
         // The scope has to be stated, not rounded up to full file system coverage.
         assert!(detail.contains("AMSI"), "{detail}");
@@ -2271,13 +2268,21 @@ mod tests {
 
     #[test]
     fn an_absent_driver_is_not_reported_in_red_when_none_is_installed() {
-        assert_eq!(driver_label(&DriverStatus::NotRequired).1, AMBER);
-        assert_eq!(driver_label(&DriverStatus::NotInstalled).1, RED);
+        assert_eq!(driver_label(&DriverStatus::NotRequired).1, ATTENTION);
+        assert_eq!(driver_label(&DriverStatus::NotInstalled).1, ALARM);
     }
 
     #[test]
     fn byte_formatting_uses_binary_units() {
         assert_eq!(format_bytes(512), "512 B");
         assert_eq!(format_bytes(1_048_576), "1.0 MiB");
+    }
+
+    #[test]
+    fn counts_are_grouped_in_thousands() {
+        assert_eq!(group_digits(0), "0");
+        assert_eq!(group_digits(999), "999");
+        assert_eq!(group_digits(12_402), "12,402");
+        assert_eq!(group_digits(1_000_000), "1,000,000");
     }
 }
