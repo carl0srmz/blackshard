@@ -687,6 +687,7 @@ pub(crate) fn realtime_worker(
                         event.path = Some(path.clone());
                         event.threat_name = Some(threat_name.to_owned());
                         event.risk_score = Some(report.risk_score);
+                        event.details = record.cleanup_summary();
                         let _ = history.append(&event);
                         quarantine_record = Some(record);
                     }
@@ -934,7 +935,7 @@ fn learn_and_quarantine(
         Ok(record) if record.state == IsolationState::Isolated => (
             EventKind::Quarantined,
             "Ransomware program stopped, learned and moved to quarantine",
-            None,
+            record.cleanup_summary(),
         ),
         Ok(_) => (
             EventKind::QuarantineFailed,

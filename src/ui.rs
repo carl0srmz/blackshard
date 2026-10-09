@@ -425,13 +425,40 @@ impl BlackshardApp {
         let completed_scan = self.scan_job.as_ref().and_then(|job| {
             let snapshot = job.snapshot();
             (snapshot.is_finished() && self.last_handled_scan != Some(snapshot.id))
-                .then_some(snapshot.id)
+                .then_some(snapshot)
         });
-        if let Some(id) = completed_scan {
+        if let Some(snapshot) = completed_scan {
             if let Some(job) = self.scan_job.as_mut() {
                 job.join_if_finished();
             }
-            self.last_handled_scan = Some(id);
+            self.last_handled_scan = Some(snapshot.id);
+            if snapshot.kind == ScanRequestKind::Turbo {
+                let removed = snapshot.quarantined_files;
+                self.notice = Some(Notice {
+                    level: if removed > 0 {
+                        NoticeLevel::Success
+                    } else {
+                        NoticeLevel::Information
+                    },
+                    message: match removed {
+                        0 if snapshot.malicious_files > 0 => format!(
+                            "hunt over in {}. found {} threats; see the scan page for what could not be removed.",
+                            format_duration(Duration::from_millis(snapshot.elapsed_millis)),
+                            snapshot.malicious_files
+                        ),
+                        0 => format!(
+                            "hunt over in {}. nothing found.",
+                            format_duration(Duration::from_millis(snapshot.elapsed_millis))
+                        ),
+                        removed => format!(
+                            "hunt over in {}. {removed} {} stopped, removed and cleaned up.",
+                            format_duration(Duration::from_millis(snapshot.elapsed_millis)),
+                            if removed == 1 { "threat" } else { "threats" }
+                        ),
+                    },
+                    created: Instant::now(),
+                });
+            }
             self.refresh_persistent_views();
         }
 
@@ -487,6 +514,31 @@ impl BlackshardApp {
             message: "scan started. it keeps going while you look at other pages.".to_owned(),
             created: Instant::now(),
         });
+    }
+
+    /// The secret turbo button: protection back on, then a full-speed hunt that stops, removes and
+    /// cleans up after whatever it convicts. Triple-click the shard on the status page, or press
+    /// Ctrl+Shift+T anywhere.
+    fn turbo(&mut self) {
+        if !self.settings.real_time_protection {
+            self.settings.real_time_protection = true;
+            self.save_settings();
+        }
+        self.start_scan(ScanRequestKind::Turbo);
+        // The hunt plays out on the status page, where the shard shows it.
+        self.page = Page::Dashboard;
+        if self
+            .scan_job
+            .as_ref()
+            .is_some_and(|job| job.snapshot().kind == ScanRequestKind::Turbo)
+        {
+            self.notice = Some(Notice {
+                level: NoticeLevel::Information,
+                message: "turbo: protection is on, and blackshard is hunting at full speed."
+                    .to_owned(),
+                created: Instant::now(),
+            });
+        }
     }
 
     fn start_custom_scan(&mut self) {
@@ -730,7 +782,29 @@ impl BlackshardApp {
     }
 
     fn render_dashboard(&mut self, ui: &mut egui::Ui, runtime: &UiRuntimeState) {
-        let (health, detail, color) = overall_health(runtime);
+        let hunt = self
+            .scan_job
+            .as_ref()
+            .map(ServiceScanJob::snapshot)
+            .filter(|progress| progress.kind == ScanRequestKind::Turbo && !progress.is_finished());
+        let (health, detail, color) = match &hunt {
+            Some(progress) => (
+                "hunting".to_owned(),
+                format!(
+                    "checked {} of {} files at full speed. {} {} stopped and removed so far.",
+                    group_digits(progress.scanned_files),
+                    group_digits(progress.discovered_files),
+                    group_digits(progress.quarantined_files),
+                    if progress.quarantined_files == 1 {
+                        "threat"
+                    } else {
+                        "threats"
+                    }
+                ),
+                SIGNAL,
+            ),
+            None => overall_health(runtime),
+        };
         // The userland self-test exercises the detection engine rather than kernel enforcement,
         // so it is just as runnable without a driver.
         let test_available = matches!(runtime.protection, ProtectionStatus::Active)
@@ -837,7 +911,10 @@ impl BlackshardApp {
         }
 
         right.add_space(40.0);
-        shard_mark(&mut right, 150.0, color);
+        // The secret turbo trigger: no cursor change, no tooltip.
+        if shard_mark(&mut right, 150.0, color).triple_clicked() {
+            self.turbo();
+        }
         right.add_space(26.0);
         fact(
             &mut right,
@@ -1585,6 +1662,12 @@ impl eframe::App for BlackshardApp {
             return;
         }
 
+        if ctx.input(|input| {
+            input.modifiers.ctrl && input.modifiers.shift && input.key_pressed(egui::Key::T)
+        }) {
+            self.turbo();
+        }
+
         egui::Panel::top("blackshard_top")
             .exact_size(64.0)
             .frame(
@@ -1737,7 +1820,7 @@ fn shard_mark(ui: &mut egui::Ui, height: f32, color: Color32) -> egui::Response 
     let row = height / 9.0;
     let column = row * 1.01;
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(column * 7.0, height), egui::Sense::hover());
+        ui.allocate_exact_size(egui::vec2(column * 7.0, height), egui::Sense::click());
     let gap = (column * 0.06).max(1.0);
     for (x, top, bottom) in BARS {
         let min = rect.min + egui::vec2(f32::from(x) * column, f32::from(top) * row);

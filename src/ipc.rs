@@ -182,14 +182,20 @@ enum RpcResponse {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ScanRequestKind {
     Quick,
+    /// A quick scan at full speed: every core, no low-resource pauses. For when a threat is
+    /// already loose and finding it now matters more than the machine staying responsive.
+    Turbo,
     Full,
-    Custom { roots: Vec<String> },
+    Custom {
+        roots: Vec<String>,
+    },
 }
 
 impl ScanRequestKind {
     pub fn display_name(&self) -> &'static str {
         match self {
             Self::Quick => "Quick scan",
+            Self::Turbo => "Turbo scan",
             Self::Full => "Full scan",
             Self::Custom { .. } => "Custom scan",
         }
@@ -1413,11 +1419,18 @@ mod windows_transport {
                     .read()
                     .map_err(|_| internal("detection engine lock"))?
                     .clone();
-                let settings = resources
+                let mut settings = resources
                     .settings
                     .read()
                     .map_err(|_| internal("settings lock"))?
                     .clone();
+                if kind == ScanRequestKind::Turbo {
+                    settings.low_resource_mode = false;
+                    settings.worker_count = std::thread::available_parallelism()
+                        .map(usize::from)
+                        .unwrap_or(4)
+                        .clamp(1, 16);
+                }
                 let job = ScanJob::start(
                     scan_kind,
                     engine,
@@ -1611,7 +1624,7 @@ mod windows_transport {
         roots: &[String],
     ) -> Result<ScanKind, RpcFailure> {
         match kind {
-            ScanRequestKind::Quick => {
+            ScanRequestKind::Quick | ScanRequestKind::Turbo => {
                 // The client names the folders in its own profile; the service adds the image of
                 // every running process, which only it can see across sessions. Malware that is
                 // already running is the first thing a quick scan should find.
@@ -1801,7 +1814,7 @@ mod windows_transport {
 
         fn start_scan(&self, kind: ScanRequestKind) -> Result<ScanProgressView, RpcFailure> {
             let roots = match &kind {
-                ScanRequestKind::Quick => quick_scan_roots(),
+                ScanRequestKind::Quick | ScanRequestKind::Turbo => quick_scan_roots(),
                 ScanRequestKind::Full => Vec::new(),
                 ScanRequestKind::Custom { roots } => roots.clone(),
             };

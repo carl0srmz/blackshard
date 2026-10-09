@@ -12,6 +12,8 @@ pub mod history;
 pub mod ipc;
 pub mod notification_agent;
 pub mod notifications;
+#[cfg(windows)]
+pub mod persistence;
 pub mod quarantine;
 pub mod readiness;
 pub mod realtime;

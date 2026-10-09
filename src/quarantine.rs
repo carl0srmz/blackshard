@@ -48,6 +48,21 @@ pub struct QuarantineRecord {
     nonce: Option<[u8; 12]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     kdf_secret: Option<[u8; 32]>,
+    /// Startup entries removed because they launched this file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_autostarts: Vec<String>,
+}
+
+impl QuarantineRecord {
+    /// What was cleaned up besides the file itself, for the activity history.
+    pub fn cleanup_summary(&self) -> Option<String> {
+        (!self.removed_autostarts.is_empty()).then(|| {
+            format!(
+                "removed startup entries: {}",
+                self.removed_autostarts.join("; ")
+            )
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -331,6 +346,7 @@ impl QuarantineStore {
             key: None,
             nonce: None,
             kdf_secret: Some(kdf_secret),
+            removed_autostarts: Vec::new(),
         };
 
         if let Err(error) = self.write_record(&record) {
@@ -352,6 +368,15 @@ impl QuarantineStore {
         drop(opened_source);
         if delete_result.is_ok() && !record.original_path.exists() {
             record.state = IsolationState::Isolated;
+        }
+        // A convicted file should not be relaunched at the next sign-in, even when its original
+        // could not be removed this time.
+        #[cfg(windows)]
+        {
+            record.removed_autostarts =
+                crate::persistence::remove_autostarts_for(&record.original_path);
+        }
+        if record.state == IsolationState::Isolated || !record.removed_autostarts.is_empty() {
             self.write_record(&record)?;
         }
 

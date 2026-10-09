@@ -450,6 +450,7 @@ fn scan_worker(
                     event.path = Some(path.clone());
                     event.threat_name = Some(threat_name.to_owned());
                     event.risk_score = Some(report.risk_score);
+                    event.details = record.cleanup_summary();
                     let _ = history.append(&event);
                     quarantine_record = Some(record);
                 }
