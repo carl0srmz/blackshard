@@ -7,5 +7,3 @@
 /installer/**/bin/
 /installer/**/obj/
 
-# Logs a failed CI run leaves for the ci-autofix workflow.
-.autofix/
