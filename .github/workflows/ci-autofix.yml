@@ -1,0 +1,178 @@
+name: ci-autofix
+
+# When security-ci or performance fails, Claude reads the failed steps' logs, reproduces the failure, fixes the
+# cause on an `autofix/<branch>` branch, verifies the fix with the commands CI runs, and opens a
+# pull request. A person still reviews and merges every fix: blackshard ships a SYSTEM service and
+# a kernel driver, and nothing reaches main unreviewed (see dependabot.yml). When code cannot fix
+# the failure, or the fix is a maintainer's call, it opens an issue with the diagnosis instead.
+#
+# Trust: workflow_run runs with this repository's secrets and checks out the failed commit, so it
+# only acts on commits already in this repository (main, its own branches, Dependabot's), never on
+# forks. claude-code-action also refuses actors without write access.
+#
+# Setup, once:
+#   1. Install the Claude GitHub app (`/install-github-app` in Claude Code). Its token opens the
+#      pull request, and a pull request opened with the workflow's own token would not run CI.
+#   2. Add an ANTHROPIC_API_KEY repository secret. To fix Dependabot pull requests too, add it as
+#      a Dependabot secret as well: runs Dependabot starts cannot read Actions secrets.
+# Until the key exists every run exits early and costs nothing.
+
+on:
+  workflow_run:
+    workflows: ["security-ci", "performance"]
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: read
+  id-token: write
+
+concurrency:
+  group: ci-autofix-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+jobs:
+  autofix:
+    if: >-
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      !startsWith(github.event.workflow_run.head_branch, 'autofix/')
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      FAILED_RUN: ${{ github.event.workflow_run.id }}
+      FAILED_BRANCH: ${{ github.event.workflow_run.head_branch }}
+      FAILED_SHA: ${{ github.event.workflow_run.head_sha }}
+
+    steps:
+      - name: Decide whether there is anything to do
+        id: gate
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HAS_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+        run: |
+          $act = 'true'
+          $fixBranch = 'autofix/' + ($env:FAILED_BRANCH -replace '[^A-Za-z0-9/_.-]', '-')
+          if ($env:HAS_KEY -ne 'true') {
+            "::notice::ANTHROPIC_API_KEY is not set; see the setup notes in ci-autofix.yml."
+            $act = 'false'
+          }
+          else {
+            # A newer commit on the branch has its own CI run; fixing an old one wastes a run.
+            $head = gh api "repos/${{ github.repository }}/branches/$env:FAILED_BRANCH" --jq .commit.sha 2>$null
+            if ($head -and $head -ne $env:FAILED_SHA) {
+              "::notice::$env:FAILED_BRANCH has moved past $env:FAILED_SHA; its newer run decides."
+              $act = 'false'
+            }
+            # The nightly run would otherwise propose the same fix every night.
+            $open = gh pr list --repo ${{ github.repository }} --state open --head $fixBranch --json number --jq '.[0].number'
+            if ($open) {
+              "::notice::Auto-fix pull request #$open is already open for $env:FAILED_BRANCH."
+              $act = 'false'
+            }
+          }
+          if ($act -eq 'true') {
+            gh label create ci-autofix --repo ${{ github.repository }} --color FFFF00 --force `
+              --description "Proposed automatically after a failed CI run" | Out-Null
+          }
+          "act=$act" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+          "fix_branch=$fixBranch" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+          exit 0
+
+      - if: steps.gate.outputs.act == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+
+      - if: steps.gate.outputs.act == 'true'
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          targets: i686-pc-windows-msvc
+          components: rustfmt, clippy
+
+      - if: steps.gate.outputs.act == 'true'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - if: steps.gate.outputs.act == 'true'
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-audit
+
+      - name: Collect what failed
+        if: steps.gate.outputs.act == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Force .autofix | Out-Null
+          gh run view $env:FAILED_RUN --repo ${{ github.repository }} --json jobs --jq '.jobs[] | select(.conclusion == "failure") | "\(.name): " + ([.steps[] | select(.conclusion == "failure") | .name] | join(", "))' |
+            Set-Content -Encoding utf8 .autofix/failed-steps.txt
+          # The tail of each failed step holds the error; whole logs would swamp the prompt.
+          gh run view $env:FAILED_RUN --repo ${{ github.repository }} --log-failed | Select-Object -Last 4000 |
+            Set-Content -Encoding utf8 .autofix/failure.log
+          git switch -c "${{ steps.gate.outputs.fix_branch }}"
+          git config user.name "claude[bot]"
+          git config user.email "claude[bot]@users.noreply.github.com"
+          Get-Content .autofix/failed-steps.txt
+
+      - name: Diagnose and fix
+        if: steps.gate.outputs.act == 'true'
+        uses: anthropics/claude-code-action@2dca132ff0e0c4094ce6048b422c6915a071210b # v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          allowed_bots: "dependabot[bot]"
+          claude_args: >-
+            --max-turns 80
+            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(cargo:*),Bash(git:*),Bash(gh pr create:*),Bash(gh issue create:*),Bash(gh issue list:*),Bash(gh run view:*)"
+          prompt: |
+            A CI run of blackshard failed and you are here to fix it. blackshard is an open-source
+            Windows antivirus in Rust: a SYSTEM service, a UI, an AMSI provider DLL, and a C
+            minifilter driver.
+
+            Failed run (${{ github.event.workflow_run.name }}): https://github.com/${{ github.repository }}/actions/runs/${{ env.FAILED_RUN }}
+            Branch `${{ env.FAILED_BRANCH }}`, commit ${{ env.FAILED_SHA }}.
+            The failed jobs and steps are in `.autofix/failed-steps.txt`, and the tail of their
+            logs is in `.autofix/failure.log`. `gh run view` can show more. Never commit `.autofix/`.
+            You are on branch `${{ steps.gate.outputs.fix_branch }}`, created from that commit.
+
+            1. Find the root cause in the logs, then reproduce it here with the command CI ran
+               before you change anything.
+            2. Fix the cause, not the symptom, with the smallest correct change. Match the
+               surrounding code, naming and comment style.
+            3. Verify with what CI runs: `cargo fmt --check`,
+               `cargo clippy --workspace --all-targets -- -D warnings`,
+               `cargo test --workspace --all-targets`, and `cargo audit` whenever dependencies or
+               `.cargo/audit.toml` are involved.
+            4. Commit in the repository's style (`area: what changed`), push the branch, and open a
+               pull request into `${{ env.FAILED_BRANCH }}` with
+               `gh pr create --label ci-autofix --base ${{ env.FAILED_BRANCH }}`. The body states
+               the root cause, the fix, and the commands you ran to verify it. Never push to
+               main, and never merge anything.
+
+            Rules:
+            - Never make a check pass by weakening it: no deleting, skipping or `#[ignore]`-ing
+              tests, no loosening assertions or thresholds, no `#[allow]` over a lint that points
+              at a real problem, no `continue-on-error`.
+            - A `performance` failure means a change made scanning slower than the commit before it.
+              Find what made the scan path slower and fix that; measure with
+              `tools/New-PerfCorpus.ps1` and `tools/Measure-Performance.ps1` as the workflow does.
+              Never raise the regression threshold or shrink the corpus.
+            - A failing test is a bug in the code or in the test. Decide which from the evidence,
+              and say which in the pull request.
+            - `cargo audit`: first look for a compatible fixed release
+              (`cargo update -p <crate> --precise <version>`). Only when none exists, establish
+              whether blackshard is exposed, for example with `cargo tree -e features -i <crate>`
+              to see whether the vulnerable feature is compiled at all. If it provably is not, add
+              the advisory to `.cargo/audit.toml` in the existing format, with that evidence and
+              the fixed versions. If exposure cannot be ruled out, do not ignore it.
+            - Leave `.github/` alone (this token cannot push workflow changes), and do not touch
+              signing, certificates or the driver INF unless the failure is in them.
+            - If code cannot fix the failure (a runner or network outage, a service outside this
+              repository), or the right fix is a maintainer's decision, commit nothing. Run
+              `gh issue list --label ci-autofix --state open` and, unless it is already reported,
+              open an issue with `gh issue create --label ci-autofix` stating the cause, the
+              evidence and the options.
