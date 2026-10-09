@@ -861,10 +861,12 @@ mod tests {
     fn a_running_program_is_stopped_so_it_can_be_quarantined() {
         let temporary = tempfile::tempdir().unwrap();
         let store = QuarantineStore::new(temporary.path().join("vault"));
-        let program = temporary.path().join("running-sample.exe");
+        let program = temporary.path().join("running-sample-program.exe");
         let system_root = std::env::var_os("SystemRoot").unwrap();
         fs::copy(Path::new(&system_root).join(r"System32\PING.EXE"), &program).unwrap();
-        let mut child = std::process::Command::new(&program)
+        // Started through its 8.3 name, as anything under C:\Users\RUNNER~1 on CI is, so the
+        // process reports a path that differs from the canonical one quarantine works with.
+        let mut child = std::process::Command::new(short_path(&program))
             .args(["-n", "30", "127.0.0.1"])
             .stdout(std::process::Stdio::null())
             .spawn()
@@ -880,5 +882,26 @@ mod tests {
             child.try_wait().unwrap().is_some(),
             "the running copy was not stopped"
         );
+    }
+
+    #[cfg(windows)]
+    fn short_path(path: &Path) -> PathBuf {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+
+        let long = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut short = vec![0u16; 32_768];
+        let length =
+            unsafe { GetShortPathNameW(long.as_ptr(), short.as_mut_ptr(), short.len() as u32) };
+        // 8.3 names can be disabled per volume; the long path is then the only one there is.
+        if length == 0 || length as usize >= short.len() {
+            return path.to_path_buf();
+        }
+        short.truncate(length as usize);
+        PathBuf::from(std::ffi::OsString::from_wide(&short))
     }
 }

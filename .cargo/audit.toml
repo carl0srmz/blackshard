@@ -21,6 +21,11 @@ ignore = [
     # component model, which this build does not compile (wasmtime features in use: cranelift,
     # runtime, std). Fixed in 48.0.3+ / 49.0.1+; yara-x 1.21.0 still pins ^45.
     "RUSTSEC-2026-0316",
+
+    # wasmtime 45: async-lifted component callbacks can overflow the native stack. Also confined to
+    # the component model, still not compiled (`cargo tree -e features -i wasmtime` lists only
+    # cranelift, runtime and std). Fixed in 48.0.4+ / 49.0.2+; yara-x 1.21.0 still pins ^45.
+    "RUSTSEC-2026-0327",
 ]
 
 [target]

@@ -1215,7 +1215,9 @@ fn terminate_ransomware_process(
 /// removed: Windows refuses to delete an image that is mapped into a process. Returns how many
 /// processes were terminated. The same policy spares critical processes and the shell.
 pub(crate) fn terminate_processes_running(image: &Path) -> usize {
-    let target = comparable_image_path(image);
+    let target = comparable_image_path(
+        &std::fs::canonicalize(image).unwrap_or_else(|_| image.to_path_buf()),
+    );
     let now = std::time::SystemTime::now();
     running_process_ids()
         .into_iter()
@@ -1302,7 +1304,12 @@ fn terminate_if_allowed(
         }
         image.truncate(length as usize);
         let image = PathBuf::from(std::ffi::OsString::from_wide(&image));
-        if expected_image.is_some_and(|expected| comparable_image_path(&image) != expected) {
+        // Canonical on both sides: a process started through an 8.3 name (C:\Users\RUNNER~1\...)
+        // reports that short form, which never equals the long canonical path.
+        if expected_image.is_some_and(|expected| {
+            comparable_image_path(&std::fs::canonicalize(&image).unwrap_or_else(|_| image.clone()))
+                != expected
+        }) {
             return close("it runs a different image");
         }
 
