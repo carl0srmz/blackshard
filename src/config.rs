@@ -39,7 +39,8 @@ impl Default for Settings {
             schema_version: SETTINGS_SCHEMA_VERSION,
             real_time_protection: true,
             ransomware_protection: true,
-            ransomware_block_mode: false,
+            // Stopping the writer is the point; audit mode only watches files get encrypted.
+            ransomware_block_mode: true,
             automatic_quarantine: true,
             notify_on_detection: true,
             scan_archives: true,

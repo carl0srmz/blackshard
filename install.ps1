@@ -325,7 +325,7 @@ if ($installDriver) {
 
     Copy-Item -LiteralPath $sourceDriver -Destination $destinationDriver -Force
 
-    $createCmd = 'sc.exe create "{0}" type= filesys start= demand error= normal binPath= "{1}" group= "FSFilter Anti-Virus" depend= FltMgr' -f $driverName, $destinationDriver
+    $createCmd = 'sc.exe create "{0}" type= filesys start= system error= normal binPath= "{1}" group= "FSFilter Anti-Virus" depend= FltMgr' -f $driverName, $destinationDriver
     $createOutput = & cmd.exe /c $createCmd 2>&1
     $createExitCode = $LASTEXITCODE
     $createOutput | Out-Host

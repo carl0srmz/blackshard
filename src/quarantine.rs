@@ -338,7 +338,17 @@ impl QuarantineStore {
             return Err(error);
         }
 
-        let delete_result = delete_open_file(&opened_source, &record.original_path);
+        let mut delete_result = delete_open_file(&opened_source, &record.original_path);
+        if delete_result.is_err() && stop_running_copies(&record.original_path) {
+            // The image section goes away shortly after its last process exits.
+            for _ in 0..10 {
+                delete_result = delete_open_file(&opened_source, &record.original_path);
+                if delete_result.is_ok() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
         drop(opened_source);
         if delete_result.is_ok() && !record.original_path.exists() {
             record.state = IsolationState::Isolated;
@@ -724,6 +734,22 @@ fn delete_open_file(file: &File, _original_path: &Path) -> io::Result<()> {
     }
 }
 
+/// Stops every process running the convicted file, since Windows will not delete a mapped image.
+/// Returns whether any was stopped.
+#[cfg(windows)]
+fn stop_running_copies(path: &Path) -> bool {
+    let stopped = crate::realtime::terminate_processes_running(path);
+    if stopped > 0 {
+        log::warn!("Stopped {stopped} process(es) running {path:?} so it could be quarantined");
+    }
+    stopped > 0
+}
+
+#[cfg(not(windows))]
+fn stop_running_copies(_path: &Path) -> bool {
+    false
+}
+
 #[cfg(not(windows))]
 fn delete_open_file(_file: &File, original_path: &Path) -> io::Result<()> {
     fs::remove_file(original_path)
@@ -828,5 +854,31 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(source.exists());
         assert!(store.list().unwrap().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_running_program_is_stopped_so_it_can_be_quarantined() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = QuarantineStore::new(temporary.path().join("vault"));
+        let program = temporary.path().join("running-sample.exe");
+        let system_root = std::env::var_os("SystemRoot").unwrap();
+        fs::copy(Path::new(&system_root).join(r"System32\PING.EXE"), &program).unwrap();
+        let mut child = std::process::Command::new(&program)
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        let record = store
+            .quarantine(&program, "Unit.Test.Running", 100)
+            .unwrap();
+        assert_eq!(record.state, IsolationState::Isolated);
+        assert!(!program.exists());
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "the running copy was not stopped"
+        );
     }
 }

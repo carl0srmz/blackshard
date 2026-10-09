@@ -10,6 +10,10 @@ const UNKNOWN_THRESHOLD: usize = 32;
 const TRUSTED_THRESHOLD: usize = 80;
 const MAX_TRACKED_PROCESSES: usize = 256;
 const MAX_EVENTS_PER_PROCESS: usize = 128;
+const UNTRUSTED_ENCRYPTED_THRESHOLD: usize = 3;
+const UNKNOWN_ENCRYPTED_THRESHOLD: usize = 5;
+const HIGH_ENTROPY_WRITE: u8 = 1;
+const RENAMED_OR_DELETED: u8 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessTrust {
@@ -46,7 +50,8 @@ pub struct BehaviorDecision {
 #[derive(Default)]
 struct ProcessActivity {
     events: VecDeque<(u64, u64)>,
-    actions: HashMap<u64, Vec<FileAction>>,
+    /// Per-file `HIGH_ENTROPY_WRITE | RENAMED_OR_DELETED` flags, for the files in `events`.
+    actions: HashMap<u64, u8>,
     last_seen_millis: u64,
     last_alert_millis: Option<u64>,
 }
@@ -137,36 +142,19 @@ impl RansomwareMonitor {
             .front()
             .is_some_and(|(timestamp, _)| now_millis.saturating_sub(*timestamp) > WINDOW_MILLIS)
         {
-            activity.events.pop_front();
+            if let Some((_, expired)) = activity.events.pop_front() {
+                activity.actions.remove(&expired);
+            }
         }
         let fingerprint = path_fingerprint(path);
-
-        if let Some(act) = action {
-            activity.actions.entry(fingerprint).or_default().push(act);
-
-            let seq = activity.actions.get(&fingerprint).unwrap();
-            let mut high_entropy_write = false;
-            let mut has_rename = false;
-            for a in seq {
-                if let FileAction::Write {
-                    entropy: EntropyObservation::High,
-                } = a
-                {
-                    high_entropy_write = true;
-                }
-                if let FileAction::Rename = a {
-                    has_rename = true;
-                }
-            }
-            if high_entropy_write && has_rename {
-                return BehaviorDecision {
-                    protected_path: true,
-                    distinct_files: 1,
-                    alert: true,
-                    block: block_mode,
-                };
-            }
-        }
+        let flag = match action {
+            Some(FileAction::Write {
+                entropy: EntropyObservation::High,
+            }) => HIGH_ENTROPY_WRITE,
+            Some(FileAction::Rename) => RENAMED_OR_DELETED,
+            _ => 0,
+        };
+        *activity.actions.entry(fingerprint).or_default() |= flag;
 
         if !activity
             .events
@@ -175,7 +163,9 @@ impl RansomwareMonitor {
         {
             activity.events.push_back((now_millis, fingerprint));
             while activity.events.len() > MAX_EVENTS_PER_PROCESS {
-                activity.events.pop_front();
+                if let Some((_, evicted)) = activity.events.pop_front() {
+                    activity.actions.remove(&evicted);
+                }
             }
         }
         let distinct_files = activity
@@ -184,12 +174,21 @@ impl RansomwareMonitor {
             .map(|(_, fingerprint)| *fingerprint)
             .collect::<HashSet<_>>()
             .len();
-        let threshold = match trust {
-            ProcessTrust::Trusted => TRUSTED_THRESHOLD,
-            ProcessTrust::Unknown => UNKNOWN_THRESHOLD,
-            ProcessTrust::Untrusted => UNTRUSTED_THRESHOLD,
+        // A file overwritten with high-entropy data and then renamed or deleted is what in-place
+        // encryption looks like, but so is saving a .png or .docx and renaming it. A handful of
+        // such files from an unsigned program is the signal; one file, or a signed program, is not.
+        let encrypted_files = activity
+            .actions
+            .values()
+            .filter(|flags| **flags == HIGH_ENTROPY_WRITE | RENAMED_OR_DELETED)
+            .count();
+        let (threshold, encrypted_threshold) = match trust {
+            ProcessTrust::Trusted => (TRUSTED_THRESHOLD, usize::MAX),
+            ProcessTrust::Unknown => (UNKNOWN_THRESHOLD, UNKNOWN_ENCRYPTED_THRESHOLD),
+            ProcessTrust::Untrusted => (UNTRUSTED_THRESHOLD, UNTRUSTED_ENCRYPTED_THRESHOLD),
         };
-        let threshold_reached = distinct_files >= threshold;
+        let threshold_reached =
+            distinct_files >= threshold || encrypted_files >= encrypted_threshold;
         let alert = threshold_reached
             && activity
                 .last_alert_millis
@@ -410,5 +409,58 @@ mod tests {
         });
         assert!(!decision.block);
         assert!(!decision.alert);
+    }
+
+    fn encrypt(
+        monitor: &mut RansomwareMonitor,
+        trust: ProcessTrust,
+        index: usize,
+    ) -> BehaviorDecision {
+        let path = document(index);
+        let observe = |monitor: &mut RansomwareMonitor, action| {
+            monitor.observe_at(BehaviorObservation {
+                process_id: 120,
+                process_start_key: 9_999,
+                path: &path,
+                trust,
+                block_mode: true,
+                now_millis: index as u64 * 10,
+                action: Some(action),
+            })
+        };
+        observe(
+            monitor,
+            FileAction::Write {
+                entropy: EntropyObservation::High,
+            },
+        );
+        observe(monitor, FileAction::Rename)
+    }
+
+    #[test]
+    fn one_high_entropy_save_and_rename_is_not_ransomware() {
+        let mut monitor = RansomwareMonitor::default();
+        let decision = encrypt(&mut monitor, ProcessTrust::Untrusted, 1);
+        assert!(!decision.alert && !decision.block);
+    }
+
+    #[test]
+    fn a_few_encrypted_files_from_an_unsigned_writer_block_early() {
+        let mut monitor = RansomwareMonitor::default();
+        let decisions = (0..UNTRUSTED_ENCRYPTED_THRESHOLD)
+            .map(|index| encrypt(&mut monitor, ProcessTrust::Untrusted, index))
+            .collect::<Vec<_>>();
+        assert!(decisions[..UNTRUSTED_ENCRYPTED_THRESHOLD - 1]
+            .iter()
+            .all(|decision| !decision.block));
+        assert!(decisions.last().unwrap().alert && decisions.last().unwrap().block);
+    }
+
+    #[test]
+    fn signed_writers_never_trip_the_encryption_pattern() {
+        let mut monitor = RansomwareMonitor::default();
+        for index in 0..20 {
+            assert!(!encrypt(&mut monitor, ProcessTrust::Trusted, index).block);
+        }
     }
 }

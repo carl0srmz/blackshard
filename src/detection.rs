@@ -116,6 +116,14 @@ impl DetectionReport {
     }
 }
 
+/// Built-in rules that convict content submitted through AMSI; see `scan_amsi_submission`.
+const AMSI_CONVICTING_RULES: &[&str] = &[
+    "blackshard_powershell_obfuscated_download_execute",
+    "blackshard_powershell_amsi_bypass_sequence",
+    "blackshard_lolbin_remote_execution_command",
+    "blackshard_office_macro_autoexec_shell_chain",
+];
+
 /// Whether a scan may hand content to the Windows AMSI for a second opinion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SystemAmsi {
@@ -366,6 +374,7 @@ impl DetectionEngine {
         );
 
         let cascade = EvidenceCascade {
+            learned_shard: learned_shard(&static_report),
             static_report,
             native_index_match,
             rule_matches,
@@ -388,8 +397,32 @@ impl DetectionEngine {
     /// it back to the system AMSI would be redundant. It would also recurse: the system AMSI calls
     /// blackshard's provider, which calls this service, which calls the system AMSI again, each
     /// level holding a pipe instance until they run out and the innermost call fails open.
+    ///
+    /// Content arriving here is about to run, already deobfuscated, so the built-in rules that
+    /// describe what a script *does* convict it. On disk the same rules only raise suspicion,
+    /// because documentation, research notes and detection rules quote the same strings.
     pub fn scan_amsi_submission(&self, bytes: &[u8]) -> DetectionReport {
-        self.scan_bytes_with(bytes, SystemAmsi::Skip)
+        let mut report = self.scan_bytes_with(bytes, SystemAmsi::Skip);
+        if matches!(
+            report.verdict,
+            DetectionVerdict::Clean | DetectionVerdict::Suspicious
+        ) {
+            if let Some(rule) = report.rule_matches.iter().find(|matched| {
+                matched.namespace == "blackshard_builtin"
+                    && AMSI_CONVICTING_RULES.contains(&matched.identifier.as_str())
+            }) {
+                report.threat_name = Some(format!(
+                    "AMSI.{}",
+                    rule.threat_name
+                        .strip_prefix("Suspicious.")
+                        .unwrap_or(&rule.threat_name)
+                ));
+                report.verdict = DetectionVerdict::Malicious;
+                report.risk_score = report.risk_score.max(95);
+                report.confidence = report.confidence.max(95);
+            }
+        }
+        report
     }
 
     fn scan_bytes_with(&self, bytes: &[u8], system_amsi: SystemAmsi) -> DetectionReport {
@@ -448,6 +481,7 @@ impl DetectionEngine {
                 );
 
                 let cascade = EvidenceCascade {
+                    learned_shard: learned_shard(&static_report),
                     static_report,
                     native_index_match,
                     rule_matches,
@@ -802,6 +836,8 @@ pub struct EvidenceCascade {
     pub static_report: ScanReport,
     /// A hit from the natively parsed ClamAV hash databases, if any.
     pub native_index_match: Option<IndexMatch>,
+    /// The threat name of a shard this machine learned for the file's digest, if any.
+    pub learned_shard: Option<String>,
     pub rule_matches: Vec<RuleMatch>,
     pub similarity_matches: Vec<SimilarityMatch>,
     pub amsi_report: Option<AmsiScanReport>,
@@ -811,13 +847,12 @@ pub struct EvidenceCascade {
 impl EvidenceCascade {
     pub fn resolve(self, elapsed: Duration) -> DetectionReport {
         // `sha256` is only ever the digest of the entire file, so an exact match convicts the file
-        // itself even when the rest of the analysis was bounded to a prefix. A whole-file hit in
-        // the ClamAV index is the same strength of evidence as the built-in exact list, so it is
-        // quarantined the same way; a section hit only proves one section and is not.
-        let whole_file_index_match = self
-            .native_index_match
-            .as_ref()
-            .is_some_and(|matched| matched.origin == MatchOrigin::WholeFile);
+        // itself even when the rest of the analysis was bounded to a prefix. Every conviction that
+        // names this file, by its whole digest or by a ClamAV section digest, removes it: blocking
+        // only its execution would leave a live sample on disk for the next double-click, archive
+        // tool or copy. Quarantine is encrypted and restorable, so a false positive costs a click.
+        // Rule, similarity and AMSI verdicts describe content rather than identify a file, and
+        // the historical reputation corpus carries mis-submitted benign files, so those only block.
         let automatic_quarantine_eligible = self.static_report.sha256.is_some()
             && ((self.static_report.verdict == StaticVerdict::Malicious
                 && self
@@ -825,7 +860,8 @@ impl EvidenceCascade {
                     .evidence
                     .iter()
                     .any(|evidence| evidence.code == "signature.exact_sha256"))
-                || whole_file_index_match);
+                || self.native_index_match.is_some()
+                || self.learned_shard.is_some());
         let reputation_block_eligible = self.static_report.verdict == StaticVerdict::Malicious
             && self.static_report.sha256.is_some()
             && self
@@ -892,6 +928,12 @@ impl EvidenceCascade {
             risk_score = score;
             confidence = certainty;
             threat_name = Some(matched.threat_name);
+            block_eligible = true;
+        } else if let Some(name) = self.learned_shard.clone() {
+            verdict = DetectionVerdict::Malicious;
+            risk_score = 100;
+            confidence = 100;
+            threat_name = Some(name);
             block_eligible = true;
         } else if amsi_provider_detection {
             verdict = DetectionVerdict::Malicious;
@@ -984,6 +1026,13 @@ impl EvidenceCascade {
             execution_block_eligible: block_eligible,
         }
     }
+}
+
+fn learned_shard(static_report: &ScanReport) -> Option<String> {
+    static_report
+        .sha256
+        .as_deref()
+        .and_then(crate::shards::lookup)
 }
 
 fn shared_native_index() -> Arc<RwLock<NativeIndex>> {
@@ -1105,6 +1154,7 @@ mod tests {
         let cascade = EvidenceCascade {
             static_report,
             native_index_match: None,
+            learned_shard: None,
             rule_matches: Vec::new(),
             similarity_matches: Vec::new(),
             amsi_report: Some(AmsiScanReport::synthetic(0x8000, 26, false)),
@@ -1115,5 +1165,77 @@ mod tests {
         assert!(report.should_block());
         assert!(!report.should_quarantine());
         assert!(!report.automatic_quarantine_eligible);
+    }
+
+    fn cascade(native_index_match: Option<IndexMatch>, learned: Option<&str>) -> DetectionReport {
+        EvidenceCascade {
+            static_report: ScanEngine::default().scan_bytes(b"an ordinary file body"),
+            native_index_match,
+            learned_shard: learned.map(str::to_owned),
+            rule_matches: Vec::new(),
+            similarity_matches: Vec::new(),
+            amsi_report: None,
+            amsi_error: None,
+        }
+        .resolve(Duration::ZERO)
+    }
+
+    #[test]
+    fn a_section_signature_blocks_and_quarantines_the_file() {
+        let report = cascade(
+            Some(IndexMatch {
+                threat_name: "Win.Trojan.Section".to_owned(),
+                origin: MatchOrigin::PeSection,
+            }),
+            None,
+        );
+        assert_eq!(report.verdict, DetectionVerdict::Malicious);
+        assert!(report.should_block() && report.should_quarantine());
+    }
+
+    #[test]
+    fn a_learned_shard_blocks_and_quarantines_the_file() {
+        let report = cascade(None, Some("Shard.Behavior.Ransomware"));
+        assert_eq!(report.verdict, DetectionVerdict::Malicious);
+        assert_eq!(
+            report.threat_name.as_deref(),
+            Some("Shard.Behavior.Ransomware")
+        );
+        assert!(report.should_block() && report.should_quarantine());
+    }
+
+    #[test]
+    fn a_file_whose_digest_was_learned_is_convicted_on_sight() {
+        let body = b"blackshard learned-shard detection test body 7f3c";
+        let digest = hex::encode(Sha256::digest(body));
+        crate::shards::learn(&digest, "Shard.Test.Detection").unwrap();
+        let report = DetectionEngine::builtin().unwrap().scan_bytes(body);
+        crate::shards::forget(&digest).unwrap();
+        assert_eq!(report.verdict, DetectionVerdict::Malicious);
+        assert!(report.should_quarantine());
+    }
+
+    #[test]
+    fn an_amsi_bypass_is_refused_at_runtime_but_only_suspicious_on_disk() {
+        let script = b"$a=[Ref].Assembly.GetType('System.Management.Automation.AmsiUtils');
+            $a.GetField('amsiInitFailed','NonPublic,Static').SetValue($null,$true);
+            # AmsiScanBuffer VirtualProtect";
+        let engine = DetectionEngine::builtin().unwrap();
+        let on_disk = engine.scan_bytes(script);
+        assert_ne!(on_disk.verdict, DetectionVerdict::Malicious);
+        let at_runtime = engine.scan_amsi_submission(script);
+        assert_eq!(at_runtime.verdict, DetectionVerdict::Malicious);
+        assert_eq!(
+            at_runtime.threat_name.as_deref(),
+            Some("AMSI.PowerShell.AMSIBypass")
+        );
+        assert!(!at_runtime.should_quarantine());
+    }
+
+    #[test]
+    fn ordinary_scripts_pass_amsi() {
+        let engine = DetectionEngine::builtin().unwrap();
+        let report = engine.scan_amsi_submission(b"Get-ChildItem $env:TEMP | Measure-Object");
+        assert_eq!(report.verdict, DetectionVerdict::Clean);
     }
 }

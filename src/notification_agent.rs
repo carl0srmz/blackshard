@@ -1,9 +1,10 @@
 use crate::atomic_file;
 use crate::config::Settings;
-use crate::history::{EventHistory, EventKind};
-use crate::notifications::notify_detection;
+use crate::history::{EventHistory, EventKind, SecurityEvent};
+use crate::notifications::{notify_blocked, notify_detection};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
@@ -12,6 +13,8 @@ use std::time::Duration;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const CURSOR_SCHEMA_VERSION: u32 = 1;
+/// One toast per file in this window: a blocked launch is followed by its quarantine.
+const SAME_PATH_QUIET_SECONDS: i64 = 30;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -27,36 +30,69 @@ pub fn run() -> Result<(), String> {
     let mut last_seen = load_cursor(&cursor_path).unwrap_or_else(|_| Utc::now());
     save_cursor(&cursor_path, last_seen)
         .map_err(|error| format!("could not initialize the notification cursor: {error}"))?;
+    let mut last_toast_by_path = HashMap::<PathBuf, DateTime<Utc>>::new();
 
     loop {
         if let Ok(mut events) = history.recent(512) {
             events.sort_by_key(|event| event.timestamp);
+            let enabled = Settings::load(&Settings::default_machine_path())
+                .map(|settings| settings.notify_on_detection)
+                .unwrap_or(true);
             for event in events.into_iter() {
                 if event.timestamp <= last_seen {
                     continue;
                 }
-                if matches!(
-                    event.kind,
-                    EventKind::Quarantined | EventKind::QuarantineFailed
-                ) && Settings::load(&Settings::default_machine_path())
-                    .map(|settings| settings.notify_on_detection)
-                    .unwrap_or(true)
-                {
-                    if let (Some(path), Some(threat_name)) =
-                        (event.path.as_deref(), event.threat_name.as_deref())
-                    {
-                        let _ = notify_detection(
-                            threat_name,
-                            path,
-                            event.kind == EventKind::Quarantined,
-                        );
-                    }
-                }
                 last_seen = last_seen.max(event.timestamp);
+                let (Some(toast), Some(path), Some(threat_name), true) = (
+                    toast_for(&event),
+                    event.path.as_deref(),
+                    event.threat_name.as_deref(),
+                    enabled,
+                ) else {
+                    continue;
+                };
+                if last_toast_by_path.get(path).is_some_and(|shown| {
+                    (event.timestamp - *shown).num_seconds() < SAME_PATH_QUIET_SECONDS
+                }) {
+                    continue;
+                }
+                last_toast_by_path.insert(path.to_path_buf(), event.timestamp);
+                let _ = match toast {
+                    Toast::Removed => notify_detection(threat_name, path, true),
+                    Toast::NotRemoved => notify_detection(threat_name, path, false),
+                    Toast::Blocked => notify_blocked(threat_name, path),
+                };
             }
+            last_toast_by_path
+                .retain(|_, shown| (last_seen - *shown).num_seconds() < SAME_PATH_QUIET_SECONDS);
             let _ = save_cursor(&cursor_path, last_seen);
         }
         thread::sleep(POLL_INTERVAL);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Toast {
+    Removed,
+    NotRemoved,
+    Blocked,
+}
+
+fn toast_for(event: &SecurityEvent) -> Option<Toast> {
+    match event.kind {
+        EventKind::Quarantined => Some(Toast::Removed),
+        EventKind::QuarantineFailed => Some(Toast::NotRemoved),
+        // Real-time detections record whether the driver accepted the block; a suspicious file
+        // that was only observed stays quiet, or every Explorer thumbnail would raise a toast.
+        EventKind::Detection
+            if event
+                .details
+                .as_deref()
+                .is_some_and(|details| details.contains("block_reply_accepted=true")) =>
+        {
+            Some(Toast::Blocked)
+        }
+        _ => None,
     }
 }
 
@@ -150,6 +186,20 @@ impl SingleInstance {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_blocks_and_removals_raise_toasts() {
+        let mut event =
+            SecurityEvent::new(EventKind::Detection, "Real-time suspicious file observed");
+        event.details = Some("block_reply_accepted=false; pid=4".to_owned());
+        assert_eq!(toast_for(&event), None);
+        event.details = Some("block_reply_accepted=true; pid=4".to_owned());
+        assert_eq!(toast_for(&event), Some(Toast::Blocked));
+        event.kind = EventKind::Quarantined;
+        assert_eq!(toast_for(&event), Some(Toast::Removed));
+        event.kind = EventKind::ScanCompleted;
+        assert_eq!(toast_for(&event), None);
+    }
 
     #[test]
     fn cursor_round_trip_is_bounded_and_versioned() {

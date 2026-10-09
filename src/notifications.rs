@@ -62,6 +62,19 @@ pub fn notify_detection(threat_name: &str, path: &Path, isolated: bool) -> Resul
     )
 }
 
+/// A threat was stopped in the act, by denying the program or the write, whether or not its file
+/// has been removed yet.
+pub fn notify_blocked(threat_name: &str, path: &Path) -> Result<(), String> {
+    show_notification(
+        "blackshard blocked a threat",
+        &format!(
+            "{threat_name}\n{}\nIt was stopped before it could act.",
+            path.display()
+        ),
+        NotificationSeverity::Warning,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

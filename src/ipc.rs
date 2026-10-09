@@ -1311,6 +1311,23 @@ mod windows_transport {
             .map_err(|_| internal("engine lock"))?
             .clone();
         let report = engine.scan_amsi_submission(&content);
+        if report.verdict == crate::detection::DetectionVerdict::Malicious {
+            // A script refused here never touches the minifilter, so this is the only record of it.
+            let mut event = SecurityEvent::new(EventKind::Detection, "Script blocked by AMSI");
+            let source = if request.content_name.is_empty() {
+                &request.application_name
+            } else {
+                &request.content_name
+            };
+            event.path = Some(PathBuf::from(source));
+            event.threat_name = report.threat_name.clone();
+            event.risk_score = Some(report.risk_score);
+            event.details = Some(format!(
+                "block_reply_accepted=true; source=amsi; application={}",
+                request.application_name
+            ));
+            let _ = resources.history.append(&event);
+        }
         Ok(match report.verdict {
             crate::detection::DetectionVerdict::Clean => DetectionVerdictView::Clean,
             crate::detection::DetectionVerdict::Suspicious => DetectionVerdictView::Suspicious,
@@ -1481,10 +1498,17 @@ mod windows_transport {
                 Ok(RpcResponse::Quarantine { records })
             }
             RpcCommand::RestoreQuarantine { id } => {
+                let record = resources
+                    .quarantine
+                    .load(id)
+                    .map_err(map_quarantine_error)?;
                 let destination = resources
                     .quarantine
                     .restore(id, None, false)
                     .map_err(map_quarantine_error)?;
+                // Restoring is the person overruling blackshard, so a shard this machine learned
+                // for the file must not convict it again the moment it is opened.
+                let _ = crate::shards::forget(&record.sha256);
                 let mut event =
                     SecurityEvent::new(EventKind::Restored, "File restored from quarantine");
                 event.path = Some(destination.clone());
@@ -1587,7 +1611,14 @@ mod windows_transport {
         roots: &[String],
     ) -> Result<ScanKind, RpcFailure> {
         match kind {
-            ScanRequestKind::Quick => Ok(ScanKind::Custom(validate_scan_roots(roots, "quick")?)),
+            ScanRequestKind::Quick => {
+                // The client names the folders in its own profile; the service adds the image of
+                // every running process, which only it can see across sessions. Malware that is
+                // already running is the first thing a quick scan should find.
+                let mut paths = validate_scan_roots(roots, "quick")?;
+                paths.extend(crate::realtime::running_process_images());
+                Ok(ScanKind::Custom(paths))
+            }
             ScanRequestKind::Full if roots.is_empty() => Ok(ScanKind::Full),
             ScanRequestKind::Full => Err(invalid("a full scan does not accept client roots")),
             ScanRequestKind::Custom {
@@ -2026,12 +2057,17 @@ mod windows_transport {
 
     fn quick_scan_roots() -> Vec<String> {
         let mut roots = Vec::<PathBuf>::new();
+        // Where malware lands and installs itself: the user's own folders, roaming AppData (which
+        // holds the Startup folder), per-user program installs, and the shared Public profile.
         if let Some(profile) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
             roots.push(profile.join("Desktop"));
             roots.push(profile.join("Downloads"));
-            roots.push(
-                profile.join(r"AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"),
-            );
+            roots.push(profile.join("Documents"));
+            roots.push(profile.join(r"AppData\Roaming"));
+            roots.push(profile.join(r"AppData\Local\Programs"));
+        }
+        if let Some(public) = std::env::var_os("PUBLIC").map(PathBuf::from) {
+            roots.push(public);
         }
         if let Some(temp) = std::env::var_os("TEMP").map(PathBuf::from) {
             roots.push(temp);

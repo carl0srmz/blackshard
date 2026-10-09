@@ -1341,7 +1341,11 @@ BlackshardShouldScanName (
         RTL_CONSTANT_STRING(L"ppt"), RTL_CONSTANT_STRING(L"pptm"),
         RTL_CONSTANT_STRING(L"rtf"), RTL_CONSTANT_STRING(L"pdf"),
         RTL_CONSTANT_STRING(L"zip"), RTL_CONSTANT_STRING(L"rar"),
-        RTL_CONSTANT_STRING(L"7z"),  RTL_CONSTANT_STRING(L"iso")
+        RTL_CONSTANT_STRING(L"7z"),  RTL_CONSTANT_STRING(L"iso"),
+        /* Run by an interpreter that only reads them, so no executable section is ever made. */
+        RTL_CONSTANT_STRING(L"jar"), RTL_CONSTANT_STRING(L"chm"),
+        RTL_CONSTANT_STRING(L"one"), RTL_CONSTANT_STRING(L"msc"),
+        RTL_CONSTANT_STRING(L"sct"), RTL_CONSTANT_STRING(L"wsc")
     };
     ULONG index;
 

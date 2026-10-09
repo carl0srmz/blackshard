@@ -490,6 +490,9 @@ pub(crate) fn realtime_worker(
                 &counters,
                 &ransomware_monitor,
                 &process_trust_cache,
+                &engine,
+                &quarantine,
+                &definition_generation,
             );
             continue;
         }
@@ -768,6 +771,9 @@ fn handle_protected_modification(
     counters: &Arc<Mutex<RealtimeCounters>>,
     monitor: &Arc<Mutex<RansomwareMonitor>>,
     trust_cache: &Arc<Mutex<HashMap<(u32, u64), ProcessTrust>>>,
+    engine: &SharedDetectionEngine,
+    quarantine: &QuarantineStore,
+    definition_generation: &AtomicU64,
 ) {
     let observed_at = std::time::SystemTime::now();
     let (enabled, block_mode) = settings
@@ -839,8 +845,13 @@ fn handle_protected_modification(
         if let Ok(mut counters) = counters.lock() {
             counters.blocked_replies += 1;
         }
-        if notification.process_id != 0 {
-            terminate_ransomware_process(notification.process_id, observed_at);
+        let terminated = (notification.process_id != 0)
+            .then(|| terminate_ransomware_process(notification.process_id, observed_at))
+            .flatten();
+        // Only an unsigned writer is learned. A signed program doing this is far more likely
+        // hijacked than malicious itself, and a shard for powershell.exe would break the machine.
+        if let (Some(image), ProcessTrust::Untrusted) = (terminated, process_trust) {
+            learn_and_quarantine(&image, engine, quarantine, history, definition_generation);
         }
     }
     if !decision.alert {
@@ -885,19 +896,80 @@ fn handle_protected_modification(
     })));
 }
 
+/// Turns a behavioural conviction into a shard, so the program is blocked on sight from now on,
+/// and moves the program itself to quarantine.
+fn learn_and_quarantine(
+    image: &Path,
+    engine: &SharedDetectionEngine,
+    quarantine: &QuarantineStore,
+    history: &EventHistory,
+    definition_generation: &AtomicU64,
+) {
+    const THREAT_NAME: &str = "Shard.Behavior.Ransomware";
+    let active = Arc::clone(
+        &engine
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    );
+    let report = active.scan_path(image);
+    let Some(sha256) = report.sha256.as_deref() else {
+        log::warn!("Could not hash {image:?} to learn it: {:?}", report.error);
+        return;
+    };
+    match crate::shards::learn(sha256, THREAT_NAME) {
+        // Cached clean verdicts for this file are stale now.
+        Ok(_) => {
+            definition_generation.fetch_add(1, Ordering::AcqRel);
+        }
+        Err(error) => log::warn!("Could not learn a shard for {image:?}: {error}"),
+    }
+    let (kind, summary, details) = match quarantine.quarantine_verified(
+        image,
+        THREAT_NAME,
+        100,
+        sha256,
+        report.file_size,
+        None,
+    ) {
+        Ok(record) if record.state == IsolationState::Isolated => (
+            EventKind::Quarantined,
+            "Ransomware program stopped, learned and moved to quarantine",
+            None,
+        ),
+        Ok(_) => (
+            EventKind::QuarantineFailed,
+            "Ransomware program stopped and learned; its file could not be removed",
+            None,
+        ),
+        Err(error) => (
+            EventKind::QuarantineFailed,
+            "Ransomware program stopped and learned; quarantine failed",
+            Some(error.to_string()),
+        ),
+    };
+    let mut event = SecurityEvent::new(kind, summary);
+    event.path = Some(image.to_path_buf());
+    event.threat_name = Some(THREAT_NAME.to_owned());
+    event.risk_score = Some(100);
+    event.details = details;
+    let _ = history.append(&event);
+}
+
 fn cached_process_trust(
     cache: &Mutex<HashMap<(u32, u64), ProcessTrust>>,
     process_id: u32,
     process_start_key: u64,
 ) -> ProcessTrust {
     let key = (process_id, process_start_key);
-    if let Ok(cache) = cache.lock() {
+    if let Ok(mut cache) = cache.lock() {
         if let Some(trust) = cache.get(&key) {
             return *trust;
         }
 
         if cache.len() >= 256 {
-            return ProcessTrust::Unknown;
+            // Entries are never evicted one by one, and refusing to resolve once full left every
+            // later process Unknown for the life of the service.
+            cache.clear();
         }
     }
     let resolved = process_image_path(process_id)
@@ -1127,31 +1199,100 @@ fn termination_policy(
     Ok(())
 }
 
-/// Terminates the process the ransomware heuristic blocked, unless the policy spares it.
+/// Terminates the process the ransomware heuristic blocked, unless the policy spares it, and
+/// returns its image when it was terminated.
 ///
-/// Only this path terminates anything. The write that tripped the heuristic is already denied;
-/// terminating the writer stops it moving on to the next file.
-fn terminate_ransomware_process(process_id: u32, observed_at: std::time::SystemTime) {
+/// Only the ransomware path terminates on behaviour. The write that tripped the heuristic is
+/// already denied; terminating the writer stops it moving on to the next file.
+fn terminate_ransomware_process(
+    process_id: u32,
+    observed_at: std::time::SystemTime,
+) -> Option<PathBuf> {
+    terminate_if_allowed(process_id, observed_at, None)
+}
+
+/// Terminates every process running `image`, so a convicted file that is already running can be
+/// removed: Windows refuses to delete an image that is mapped into a process. Returns how many
+/// processes were terminated. The same policy spares critical processes and the shell.
+pub(crate) fn terminate_processes_running(image: &Path) -> usize {
+    let target = comparable_image_path(image);
+    let now = std::time::SystemTime::now();
+    running_process_ids()
+        .into_iter()
+        .filter(|process_id| terminate_if_allowed(*process_id, now, Some(&target)).is_some())
+        .count()
+}
+
+/// The image of every running process this service can query, for a quick scan.
+pub(crate) fn running_process_images() -> Vec<PathBuf> {
+    let mut images = running_process_ids()
+        .into_iter()
+        .filter_map(process_image_path)
+        .collect::<Vec<_>>();
+    images.sort();
+    images.dedup();
+    images
+}
+
+fn running_process_ids() -> Vec<u32> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn K32EnumProcesses(process_ids: *mut u32, size: u32, returned: *mut u32) -> i32;
+    }
+    let mut process_ids = vec![0u32; 4096];
+    loop {
+        let size = (process_ids.len() * mem::size_of::<u32>()) as u32;
+        let mut returned = 0u32;
+        if unsafe { K32EnumProcesses(process_ids.as_mut_ptr(), size, &mut returned) } == 0 {
+            return Vec::new();
+        }
+        // A full buffer may have been truncated, so retry with more room.
+        if returned < size || process_ids.len() >= 1 << 20 {
+            process_ids.truncate(returned as usize / mem::size_of::<u32>());
+            return process_ids;
+        }
+        process_ids.resize(process_ids.len() * 2, 0);
+    }
+}
+
+/// Lower-cased and without the `\\?\` prefix, so a canonical path compares with the Win32 path
+/// `QueryFullProcessImageNameW` reports.
+fn comparable_image_path(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy().to_lowercase();
+    PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text))
+}
+
+/// Terminates `process_id` unless the policy spares it or, when `expected_image` is given, it runs
+/// a different image. Returns the image of a process it terminated.
+fn terminate_if_allowed(
+    process_id: u32,
+    observed_at: std::time::SystemTime,
+    expected_image: Option<&Path>,
+) -> Option<PathBuf> {
     #[cfg(windows)]
     unsafe {
         use std::os::windows::ffi::OsStringExt;
         use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
         use windows_sys::Win32::System::Threading::{
             GetProcessTimes, IsProcessCritical, OpenProcess, QueryFullProcessImageNameW,
-            TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+            TerminateProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
+            PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
         };
 
         let handle = OpenProcess(
-            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
             0,
             process_id,
         );
         if handle == 0 {
-            return;
+            return None;
         }
         let close = |reason: &str| {
-            log::warn!("Not terminating PID {process_id}: {reason}");
+            if expected_image.is_none() {
+                log::warn!("Not terminating PID {process_id}: {reason}");
+            }
             CloseHandle(handle);
+            None
         };
 
         let mut image = vec![0u16; 32_768];
@@ -1161,6 +1302,9 @@ fn terminate_ransomware_process(process_id: u32, observed_at: std::time::SystemT
         }
         image.truncate(length as usize);
         let image = PathBuf::from(std::ffi::OsString::from_wide(&image));
+        if expected_image.is_some_and(|expected| comparable_image_path(&image) != expected) {
+            return close("it runs a different image");
+        }
 
         let mut critical = 0;
         if IsProcessCritical(handle, &mut critical) == 0 {
@@ -1192,15 +1336,23 @@ fn terminate_ransomware_process(process_id: u32, observed_at: std::time::SystemT
             &system_root,
         ) {
             Ok(()) => {
-                let _ = TerminateProcess(handle, 1);
+                let terminated = TerminateProcess(handle, 1) != 0;
+                // Wait for the exit, so the image is unmapped by the time the caller deletes it.
+                if terminated {
+                    WaitForSingleObject(handle, 5_000);
+                }
                 CloseHandle(handle);
-                log::warn!("Terminated ransomware-suspect PID {process_id} ({image:?})");
+                log::warn!("Terminated PID {process_id} ({image:?})");
+                terminated.then_some(image)
             }
             Err(reason) => close(&format!("{reason:?} ({image:?})")),
         }
     }
     #[cfg(not(windows))]
-    let _ = (process_id, observed_at);
+    {
+        let _ = (process_id, observed_at, expected_image);
+        None
+    }
 }
 
 #[cfg(test)]

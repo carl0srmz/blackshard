@@ -439,6 +439,13 @@ mod windows_service_host {
             crate::clamdb::downloader::active_database(&blackshard_data).ok();
         let freshclam_receiver = crate::clamdb::scheduler::start_scheduler(blackshard_data.clone());
 
+        match crate::shards::load(&crate::shards::default_machine_path()) {
+            Ok(count) => log::info!("Loaded {count} locally learned shards"),
+            Err(error) => append_error(
+                &history,
+                &format!("Learned shards could not be loaded; none are active: {error}"),
+            ),
+        }
         readiness.update_state(crate::readiness::ReadinessState::LoadingDefinitions);
         snapshot.readiness = Some(readiness.diagnostics().current_state);
         let engine = match load_detection_engine(&mut snapshot, &history) {
