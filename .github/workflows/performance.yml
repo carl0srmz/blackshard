@@ -1,0 +1,149 @@
+name: performance
+
+# How fast blackshard scans, measured on every change to it.
+#
+# - Speed test: the service built from this change and from the commit it builds on scan the same
+#   corpus (tools/New-PerfCorpus.ps1), alternating runs on one runner. A change that scans more
+#   than 15% slower fails; the numbers land in the job summary either way.
+# - Auto-optimisation: on main, the change is also built with profile-guided optimisation, trained
+#   on that corpus (tools/Build-PgoService.ps1) exactly as the published build is. It must make the
+#   same detections as the plain build, and its speed-up is reported. Pull requests skip it: it
+#   adds two fat-LTO builds for a gain of a few percent.
+
+on:
+  pull_request:
+    paths:
+      - ".cargo/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "src/**"
+      - "!src/driver/**"
+      - "tools/New-PerfCorpus.ps1"
+      - "tools/Measure-Performance.ps1"
+      - "tools/Build-PgoService.ps1"
+      - ".github/workflows/performance.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - ".cargo/**"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "src/**"
+      - "!src/driver/**"
+      - "tools/New-PerfCorpus.ps1"
+      - "tools/Measure-Performance.ps1"
+      - "tools/Build-PgoService.ps1"
+      - ".github/workflows/performance.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: performance-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  speed:
+    runs-on: windows-2022
+    timeout-minutes: 150
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          components: llvm-tools
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Pick the commit to compare against
+        id: baseline
+        shell: pwsh
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          $base = switch ($env:EVENT) {
+            'pull_request' { $env:PR_BASE }
+            'push' { $env:PUSH_BEFORE }
+            default { (git rev-parse HEAD~1).Trim() }
+          }
+          git cat-file -e "$base^{commit}" 2>$null
+          if ($base -match '^0+$' -or $LASTEXITCODE -ne 0) {
+            "::notice::No earlier commit to compare with; only this change is measured."
+            $base = ''
+          }
+          "sha=$base" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+          exit 0
+
+      - name: Build the corpus
+        shell: pwsh
+        run: .\tools\New-PerfCorpus.ps1 -OutputDirectory "$env:RUNNER_TEMP\corpus"
+
+      - name: Build this change
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\builds" | Out-Null
+          cargo build --release --bin blackshard-service
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item .\target\release\blackshard-service.exe "$env:RUNNER_TEMP\builds\change.exe"
+
+      - name: Build the baseline
+        if: steps.baseline.outputs.sha != ''
+        shell: pwsh
+        env:
+          BASE: ${{ steps.baseline.outputs.sha }}
+        run: |
+          git worktree add "$env:RUNNER_TEMP\baseline" $env:BASE
+          cargo build --release --bin blackshard-service `
+            --manifest-path "$env:RUNNER_TEMP\baseline\Cargo.toml" --target-dir .\target\perf-baseline
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item .\target\perf-baseline\release\blackshard-service.exe "$env:RUNNER_TEMP\builds\baseline.exe"
+
+      - name: Optimise this change with its own scan profile
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        run: |
+          .\tools\Build-PgoService.ps1 -CorpusDirectory "$env:RUNNER_TEMP\corpus" `
+            -OutputPath "$env:RUNNER_TEMP\builds\change-pgo.exe" `
+            -WorkDirectory "$env:RUNNER_TEMP\pgo"
+
+      - name: Measure
+        shell: pwsh
+        run: |
+          $builds = @()
+          if (Test-Path "$env:RUNNER_TEMP\builds\baseline.exe") { $builds += "baseline=$env:RUNNER_TEMP\builds\baseline.exe" }
+          $builds += "change=$env:RUNNER_TEMP\builds\change.exe"
+          if (Test-Path "$env:RUNNER_TEMP\builds\change-pgo.exe") {
+            $builds += "change-pgo=$env:RUNNER_TEMP\builds\change-pgo.exe"
+          }
+          "## Scan speed" | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          $arguments = @{
+            CorpusDirectory = "$env:RUNNER_TEMP\corpus"
+            Build = $builds
+            Rounds = 5
+            MustAgree = @('change', 'change-pgo')
+            ReportPath = "$env:RUNNER_TEMP\builds\performance.json"
+            SummaryPath = $env:GITHUB_STEP_SUMMARY
+          }
+          if ($builds[0] -like 'baseline=*') {
+            $arguments.Baseline = 'baseline'
+            $arguments.MaxRegressionPercent = 15
+          }
+          .\tools\Measure-Performance.ps1 @arguments
+
+      - name: Keep the optimised service
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: blackshard-service-pgo
+          path: |
+            ${{ runner.temp }}/builds/change-pgo.exe
+            ${{ runner.temp }}/builds/change-pgo.profdata
+            ${{ runner.temp }}/builds/performance.json
+          if-no-files-found: ignore

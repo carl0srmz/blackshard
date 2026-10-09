@@ -1,5 +1,9 @@
 [CmdletBinding()]
-param()
+param(
+    # Rebuild the service with profile-guided optimisation, trained on a scan corpus. CI uses it
+    # for the published build; it adds two service builds, so local builds leave it off.
+    [switch]$ProfileGuided
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -33,6 +37,29 @@ try {
     $driverSource = Join-Path $PSScriptRoot "src\driver\blackshard_driver.c"
     $driverBinary = Join-Path $PSScriptRoot "src\driver\x64\Release\blackshard.sys"
     $serviceBinary = Join-Path $PSScriptRoot "target\release\blackshard-service.exe"
+
+    if ($ProfileGuided) {
+        # The optimised service only ships once it reaches the plain build's verdict on every file
+        # of the corpus. Any failure ships the plain build instead: an optimisation must never be
+        # what stops a release.
+        try {
+            $pgoRoot = Join-Path $PSScriptRoot "target\pgo"
+            $corpus = Join-Path $pgoRoot "corpus"
+            $optimised = Join-Path $pgoRoot "blackshard-service.exe"
+            & (Join-Path $PSScriptRoot "tools\New-PerfCorpus.ps1") -OutputDirectory $corpus
+            & (Join-Path $PSScriptRoot "tools\Build-PgoService.ps1") -CorpusDirectory $corpus `
+                -OutputPath $optimised -WorkDirectory (Join-Path $pgoRoot "work")
+            & (Join-Path $PSScriptRoot "tools\Measure-Performance.ps1") -CorpusDirectory $corpus `
+                -Build "plain=$serviceBinary", "profile-guided=$optimised" -Baseline plain `
+                -MustAgree plain, profile-guided -Rounds 2 -SummaryPath $env:GITHUB_STEP_SUMMARY
+            $serviceBinary = $optimised
+            Write-Host "[+] Shipping the profile-guided service." -ForegroundColor Green
+        }
+        catch {
+            Write-Warning "Profile-guided optimisation failed; shipping the plain service: $_"
+            if ($env:GITHUB_ACTIONS) { Write-Host "::warning::Profile-guided optimisation failed; the plain service was shipped. $_" }
+        }
+    }
     $uiBinary = Join-Path $PSScriptRoot "target\release\blackshard-ui.exe"
     $amsiX64Binary = Join-Path $PSScriptRoot "target\release\blackshard_amsi.dll"
     $amsiX86Binary = Join-Path $PSScriptRoot "target\$x86Target\release\blackshard_amsi.dll"
