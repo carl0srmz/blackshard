@@ -139,6 +139,10 @@ pub struct NativeIndex {
     md5_sizes: HashSet<u64>,
     /// Set when some MD5 entry uses the `*` size wildcard, which could match a file of any size.
     md5_any_size: bool,
+    /// Section sizes named by section signatures, so only sections that could match are hashed.
+    section_sizes: HashSet<u64>,
+    /// Set when some section signature uses the `*` size wildcard.
+    section_any_size: bool,
 }
 
 /// Which database families a load should consider.
@@ -308,11 +312,13 @@ impl NativeIndex {
             (Family::SectionHash, 32) => {
                 let hash: [u8; 32] = bytes.try_into().expect("length checked above");
                 self.section_sha256.push(hash, size, name.to_owned());
+                self.note_section_size(size);
                 true
             }
             (Family::SectionHash, 16) => {
                 let hash: [u8; 16] = bytes.try_into().expect("length checked above");
                 self.section_md5.push(hash, size, name.to_owned());
+                self.note_section_size(size);
                 true
             }
             (Family::Allowlist, 32) => {
@@ -339,6 +345,29 @@ impl NativeIndex {
             }
             None => self.md5_any_size = true,
         }
+    }
+
+    fn note_section_size(&mut self, size: Option<u64>) {
+        match size {
+            Some(size) => {
+                self.section_sizes.insert(size);
+            }
+            None => self.section_any_size = true,
+        }
+    }
+
+    /// The digests of the PE sections in `bytes` that a section signature could match.
+    ///
+    /// Hashing every section of every executable twice was the costliest part of a lookup, and
+    /// usually for nothing: with no section signatures loaded nothing is parsed at all, and
+    /// otherwise only sections of a size some signature names are hashed.
+    pub fn section_digests(&self, bytes: &[u8]) -> Vec<SectionDigest> {
+        if self.section_sha256.is_empty() && self.section_md5.is_empty() {
+            return Vec::new();
+        }
+        section_digests_where(bytes, |size| {
+            self.section_any_size || self.section_sizes.contains(&size)
+        })
     }
 
     /// Whether a whole-file MD5 of a file this size could match anything in the index.
@@ -429,6 +458,10 @@ impl NativeIndex {
 /// malformed sample simply yields fewer digests rather than an error. Zero length sections carry
 /// no distinguishing content and are ignored.
 pub fn pe_section_digests(bytes: &[u8]) -> Vec<SectionDigest> {
+    section_digests_where(bytes, |_| true)
+}
+
+fn section_digests_where(bytes: &[u8], wanted: impl Fn(u64) -> bool) -> Vec<SectionDigest> {
     let Ok(pe) = goblin::pe::PE::parse(bytes) else {
         return Vec::new();
     };
@@ -437,7 +470,7 @@ pub fn pe_section_digests(bytes: &[u8]) -> Vec<SectionDigest> {
     for section in &pe.sections {
         let start = section.pointer_to_raw_data as usize;
         let length = section.size_of_raw_data as usize;
-        if length == 0 {
+        if length == 0 || !wanted(length as u64) {
             continue;
         }
         let Some(end) = start.checked_add(length) else {
@@ -799,6 +832,34 @@ mod tests {
     }
 
     #[test]
+    fn only_sections_a_signature_could_match_are_hashed() {
+        let sample = minimal_pe(0xc3);
+        assert!(NativeIndex::new().section_digests(&sample).is_empty());
+
+        let directory = tempfile::tempdir().unwrap();
+        write(
+            directory.path(),
+            "daily.mdb",
+            &format!("512:{}:Test.OtherSize", "44".repeat(16)),
+        );
+        let mut index = NativeIndex::new();
+        index
+            .load_from_directory(directory.path(), LoadOptions::default())
+            .unwrap();
+        assert!(index.section_digests(&sample).is_empty());
+
+        write(
+            directory.path(),
+            "main.mdb",
+            &format!("{}:{}:Test.ThisSize", 0x1000, "55".repeat(16)),
+        );
+        index
+            .load_from_directory(directory.path(), LoadOptions::default())
+            .unwrap();
+        assert_eq!(index.section_digests(&sample), pe_section_digests(&sample));
+    }
+
+    #[test]
     fn a_repacked_variant_is_caught_by_its_section_hash() {
         let original = minimal_pe(0xc3);
         let section = pe_section_digests(&original).remove(0);
@@ -832,7 +893,7 @@ mod tests {
                 &Sha256::digest(&repacked).into(),
                 Some(&Md5::digest(&repacked).into()),
                 Some(repacked.len() as u64),
-                &pe_section_digests(&repacked),
+                &index.section_digests(&repacked),
             )
             .unwrap();
         assert_eq!(matched.threat_name, "Test.Repacked");

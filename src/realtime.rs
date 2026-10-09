@@ -546,7 +546,7 @@ pub(crate) fn realtime_worker(
                     }
 
                     if let Some(cached) = cached_result {
-                        log::info!("Real-time cache hit for {:?}", key);
+                        log::debug!("Real-time cache hit for {:?}", key);
                         DetectionReport {
                             verdict: match cached.verdict {
                                 CacheVerdict::Clean => DetectionVerdict::Clean,

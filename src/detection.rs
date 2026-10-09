@@ -1,6 +1,6 @@
 use crate::amsi::{AmsiScanReport, AmsiScanner};
 use crate::archive::{inspect_gzip, inspect_ole, inspect_zip, ContainerInspection};
-use crate::clamdb::native_index::{pe_section_digests, IndexMatch, MatchOrigin, NativeIndex};
+use crate::clamdb::native_index::{IndexMatch, MatchOrigin, NativeIndex};
 use crate::definitions::{DefinitionMatchRateCircuitBreaker, DefinitionMatchRateState};
 use crate::engine::{ContentType, ScanEngine, ScanReport, Verdict as StaticVerdict};
 use crate::rules::{RuleDisposition, RuleEnforcementAuthority, RuleEngine, RuleMatch};
@@ -197,17 +197,16 @@ impl DetectionEngine {
             .and_then(|value| hex::decode(value).ok())
             .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())?;
 
-        // Section digests only mean anything for a PE, and parsing is skipped otherwise.
-        let sections = if matches!(
-            static_report.content_type,
-            ContentType::Pe32 | ContentType::Pe64 | ContentType::PeUnknown
-        ) {
-            pe_section_digests(sample)
-        } else {
-            Vec::new()
-        };
-
         self.native_index.read().ok().and_then(|index| {
+            // Section digests only mean anything for a PE, and parsing is skipped otherwise.
+            let sections = if matches!(
+                static_report.content_type,
+                ContentType::Pe32 | ContentType::Pe64 | ContentType::PeUnknown
+            ) {
+                index.section_digests(sample)
+            } else {
+                Vec::new()
+            };
             index.evaluate(
                 &sha256,
                 whole_file_md5.as_ref(),
@@ -330,33 +329,7 @@ impl DetectionEngine {
         let native_index_duration = native_index_start.elapsed();
 
         let yara_start = Instant::now();
-        let rule_matches = match self.rules.scan(&sample) {
-            Ok(matches) => self.apply_external_rule_circuit_breaker(matches),
-            Err(error) => {
-                return DetectionReport {
-                    verdict: DetectionVerdict::Error,
-                    risk_score: static_report.risk_score,
-                    confidence: 0,
-                    threat_name: None,
-                    sha256: static_report.sha256.clone(),
-                    file_size: declared_size,
-                    bytes_scanned: sample.len(),
-                    truncated: static_report.truncated,
-                    analysis_completeness: static_report.analysis_completeness,
-                    static_report: Some(static_report),
-                    rule_matches: Vec::new(),
-                    similarity_matches: Vec::new(),
-                    container_inspection: None,
-                    amsi_report: None,
-                    amsi_error: None,
-                    elapsed: started.elapsed(),
-                    from_cache: false,
-                    error: Some(error),
-                    automatic_quarantine_eligible: false,
-                    execution_block_eligible: false,
-                }
-            }
-        };
+        let (rule_matches, rule_failure) = self.scan_rules(&sample);
         let yara_duration = yara_start.elapsed();
 
         let ml_start = Instant::now();
@@ -368,7 +341,7 @@ impl DetectionEngine {
         let (amsi_report, amsi_error) = self.scan_with_amsi(&static_report, &rule_matches, &sample);
         let amsi_duration = amsi_start.elapsed();
 
-        log::info!(
+        log::debug!(
             "EvidenceCascade metrics: Static: {:?}, ClamDb: {:?}, YARA: {:?}, Similarity: {:?}, AMSI: {:?}",
             static_duration, native_index_duration, yara_duration, ml_duration, amsi_duration
         );
@@ -383,7 +356,8 @@ impl DetectionEngine {
             amsi_error,
         };
 
-        let report = cascade.resolve(started.elapsed());
+        let mut report = cascade.resolve(started.elapsed());
+        record_rule_failure(&mut report, rule_failure);
         self.with_container_inspection(&sample, report, started, SystemAmsi::Consult)
     }
 
@@ -454,65 +428,48 @@ impl DetectionEngine {
         let native_index_duration = native_index_start.elapsed();
 
         let yara_start = Instant::now();
-        let rule_matches_res = self.rules.scan(bytes);
+        let (rule_matches, rule_failure) = self.scan_rules(bytes);
         let yara_duration = yara_start.elapsed();
 
-        match rule_matches_res {
-            Ok(rule_matches) => {
-                let rule_matches = self.apply_external_rule_circuit_breaker(rule_matches);
-                let ml_start = Instant::now();
-                let similarity_matches = self.apply_similarity_circuit_breaker(
-                    self.similarity.scan(bytes, bytes.len() as u64),
-                );
-                let ml_duration = ml_start.elapsed();
+        let ml_start = Instant::now();
+        let similarity_matches =
+            self.apply_similarity_circuit_breaker(self.similarity.scan(bytes, bytes.len() as u64));
+        let ml_duration = ml_start.elapsed();
 
-                let amsi_start = Instant::now();
-                let (amsi_report, amsi_error) = match system_amsi {
-                    SystemAmsi::Consult => {
-                        self.scan_with_amsi(&static_report, &rule_matches, bytes)
-                    }
-                    SystemAmsi::Skip => (None, None),
-                };
-                let amsi_duration = amsi_start.elapsed();
+        let amsi_start = Instant::now();
+        let (amsi_report, amsi_error) = match system_amsi {
+            SystemAmsi::Consult => self.scan_with_amsi(&static_report, &rule_matches, bytes),
+            SystemAmsi::Skip => (None, None),
+        };
+        let amsi_duration = amsi_start.elapsed();
 
-                log::info!(
-                    "EvidenceCascade metrics (leaf): Static: {:?}, ClamDb: {:?}, YARA: {:?}, Similarity: {:?}, AMSI: {:?}",
-                    static_duration, native_index_duration, yara_duration, ml_duration, amsi_duration
-                );
+        log::debug!(
+            "EvidenceCascade metrics (leaf): Static: {:?}, ClamDb: {:?}, YARA: {:?}, Similarity: {:?}, AMSI: {:?}",
+            static_duration, native_index_duration, yara_duration, ml_duration, amsi_duration
+        );
 
-                let cascade = EvidenceCascade {
-                    learned_shard: learned_shard(&static_report),
-                    static_report,
-                    native_index_match,
-                    rule_matches,
-                    similarity_matches,
-                    amsi_report,
-                    amsi_error,
-                };
-                cascade.resolve(started.elapsed())
-            }
-            Err(error) => DetectionReport {
-                verdict: DetectionVerdict::Error,
-                risk_score: static_report.risk_score,
-                confidence: 0,
-                threat_name: None,
-                sha256: static_report.sha256.clone(),
-                file_size: bytes.len() as u64,
-                bytes_scanned: bytes.len(),
-                truncated: static_report.truncated,
-                analysis_completeness: static_report.analysis_completeness,
-                static_report: Some(static_report),
-                rule_matches: Vec::new(),
-                similarity_matches: Vec::new(),
-                container_inspection: None,
-                amsi_report: None,
-                amsi_error: None,
-                elapsed: started.elapsed(),
-                from_cache: false,
-                error: Some(error),
-                automatic_quarantine_eligible: false,
-                execution_block_eligible: false,
-            },
+        let cascade = EvidenceCascade {
+            learned_shard: learned_shard(&static_report),
+            static_report,
+            native_index_match,
+            rule_matches,
+            similarity_matches,
+            amsi_report,
+            amsi_error,
+        };
+        let mut report = cascade.resolve(started.elapsed());
+        record_rule_failure(&mut report, rule_failure);
+        report
+    }
+
+    /// Runs the YARA rules. A failure, usually the per-scan timeout on a large file, yields no rule
+    /// matches rather than ending the analysis: everything else the cascade knows still counts.
+    /// Ending it turned a hash conviction into a scan error, which real-time protection allows, so
+    /// padding a known sample until YARA gave up was enough to run it.
+    fn scan_rules(&self, bytes: &[u8]) -> (Vec<RuleMatch>, Option<String>) {
+        match self.rules.scan(bytes) {
+            Ok(matches) => (self.apply_external_rule_circuit_breaker(matches), None),
+            Err(error) => (Vec::new(), Some(error)),
         }
     }
 
@@ -1028,6 +985,15 @@ impl EvidenceCascade {
     }
 }
 
+/// Marks a report whose rules did not finish, so its verdict is never cached or treated as a
+/// complete clean bill of health.
+fn record_rule_failure(report: &mut DetectionReport, failure: Option<String>) {
+    if let Some(failure) = failure {
+        report.analysis_completeness = crate::engine::AnalysisCompleteness::TimedOut;
+        report.error.get_or_insert(failure);
+    }
+}
+
 fn learned_shard(static_report: &ScanReport) -> Option<String> {
     static_report
         .sha256
@@ -1237,5 +1203,30 @@ mod tests {
         let engine = DetectionEngine::builtin().unwrap();
         let report = engine.scan_amsi_submission(b"Get-ChildItem $env:TEMP | Measure-Object");
         assert_eq!(report.verdict, DetectionVerdict::Clean);
+    }
+
+    #[test]
+    fn a_rule_timeout_does_not_discard_a_hash_conviction() {
+        // A sample the exact-hash list knows, scanned by rules that cannot finish in time.
+        let rules = RuleEngine::compile(&[crate::rules::RuleBundle {
+            namespace: "slow".to_owned(),
+            source: r#"rule slow { condition: for all i in (0..400000000) : (uint8(i % filesize) != 7) }"#
+                .to_owned(),
+            policies: Vec::new(),
+        }])
+        .unwrap();
+        let engine = DetectionEngine::new(ScanEngine::default(), rules);
+        let report = engine.scan_bytes(crate::self_test::PAYLOAD);
+        assert_eq!(
+            report.verdict,
+            DetectionVerdict::Malicious,
+            "{:?}",
+            report.error
+        );
+        assert!(report.should_block() && report.should_quarantine());
+        assert_eq!(
+            report.analysis_completeness,
+            crate::engine::AnalysisCompleteness::TimedOut
+        );
     }
 }
