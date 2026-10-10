@@ -1,0 +1,60 @@
+name: clamav-mirror
+
+# Keeps blackshard's copy of the ClamAV containers (main.cvd, daily.cvd) on the `clamav-mirror`
+# release. The service only falls back to it when the official mirror refuses a machine that has
+# no definitions at all; see FALLBACK_MIRROR in src/clamdb/downloader.rs. The containers are
+# copied byte for byte, and the service verifies ClamAV's signature on them as it would on any
+# mirror's. A container is only downloaded when its version changed, the way cvdupdate does it.
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [.github/workflows/clamav-mirror.yml]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: clamav-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: clamav-mirror
+      UPSTREAM: https://database.clamav.net
+      USER_AGENT: "CVDUPDATE/1.1.1 (blackshard fallback mirror; +https://blackshard.dev)"
+    steps:
+      - name: Create the release
+        run: |
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --prerelease --latest=false \
+              --title "ClamAV definitions (fallback mirror)" \
+              --notes "Signed ClamAV containers, used by blackshard only when the official mirror refuses a machine that has no definitions. Refreshed every six hours."
+
+      - name: Mirror changed containers
+        run: |
+          set -euo pipefail
+          # The third field of a container's 512 byte header is its version.
+          version() { head -c 512 "$1" | cut -d: -f3; }
+          for name in main daily; do
+            curl -fsSL -A "$USER_AGENT" -r 0-511 "$UPSTREAM/$name.cvd" -o upstream.hdr
+            curl -fsSL -r 0-511 "https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$name.cvd" -o ours.hdr || : > ours.hdr
+            upstream=$(version upstream.hdr); ours=$(version ours.hdr)
+            if [ -n "$upstream" ] && [ "$upstream" = "$ours" ]; then
+              echo "$name.cvd is current at version $upstream"
+              continue
+            fi
+            curl -fsSL -A "$USER_AGENT" "$UPSTREAM/$name.cvd" -o "$name.cvd"
+            # A truncated or substituted body would fail the service's checks anyway; failing here
+            # keeps the good copy in place.
+            [ "$(head -c 11 "$name.cvd")" = "ClamAV-VDB:" ] || { echo "$name.cvd is not a ClamAV container"; exit 1; }
+            gh release upload "$TAG" "$name.cvd" --repo "$GITHUB_REPOSITORY" --clobber
+            echo "Mirrored $name.cvd version $(version "$name.cvd") (was '${ours}')"
+          done

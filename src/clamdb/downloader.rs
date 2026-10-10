@@ -43,6 +43,15 @@ const CONTAINERS: [&str; 2] = ["main", "daily"];
 
 const DEFAULT_MIRROR: &str = "https://database.clamav.net";
 
+/// blackshard's own copy of the containers, refreshed by `.github/workflows/clamav-mirror.yml`.
+///
+/// The official mirror rate limits by address, so a machine that downloaded the full set a few
+/// times (a test VM reverted to a checkpoint, say) can be refused for most of a day while it has no
+/// definitions at all. Only then is this copy used. Every container carries ClamAV's signature,
+/// verified the same way whichever mirror served it, so the copy is no less trustworthy.
+const FALLBACK_MIRROR: &str =
+    "https://github.com/carlosrmz009/blackshard/releases/download/clamav-mirror";
+
 /// User-Agent sent to the official mirror.
 ///
 /// `database.clamav.net` answers 403 to anything whose User-Agent does not begin with `ClamAV/` or
@@ -133,6 +142,13 @@ fn mirror() -> String {
 }
 
 pub fn download_databases(blackshard_data: &Path) -> Result<ActiveDatabase, DownloadError> {
+    download_databases_with_fallback(blackshard_data, FALLBACK_MIRROR)
+}
+
+fn download_databases_with_fallback(
+    blackshard_data: &Path,
+    fallback: &str,
+) -> Result<ActiveDatabase, DownloadError> {
     let previous = active_database(blackshard_data).ok();
     if let Some(active) = &previous {
         if Utc::now()
@@ -157,11 +173,12 @@ pub fn download_databases(blackshard_data: &Path) -> Result<ActiveDatabase, Down
                 );
                 Ok(active)
             }
-            None => Err(DownloadError::RateLimited(remaining)),
+            None => from_fallback(&clam_root, fallback, DownloadError::RateLimited(remaining)),
         };
     }
 
-    match refresh(&clam_root, previous) {
+    let had_definitions = previous.is_some();
+    let result = match refresh(&clam_root, previous, &mirror()) {
         Err(DownloadError::RateLimited(wait)) => {
             let until = Utc::now() + chrono::Duration::from_std(wait).unwrap_or_default();
             if let Err(error) =
@@ -172,7 +189,23 @@ pub fn download_databases(blackshard_data: &Path) -> Result<ActiveDatabase, Down
             Err(DownloadError::RateLimited(wait))
         }
         other => other,
+    };
+    match result {
+        Err(error) if !had_definitions => from_fallback(&clam_root, fallback, error),
+        other => other,
     }
+}
+
+/// Fetches the definitions from blackshard's copy for a machine the official mirror refused.
+fn from_fallback(
+    clam_root: &Path,
+    fallback: &str,
+    primary: DownloadError,
+) -> Result<ActiveDatabase, DownloadError> {
+    warn!("{primary}; fetching the definitions from blackshard's copy instead");
+    refresh(clam_root, None, fallback).map_err(|error| {
+        DownloadError::Http(format!("{primary}; blackshard's copy failed too: {error}"))
+    })
 }
 
 /// How long is left on a recorded cooldown, if it has not yet passed.
@@ -185,13 +218,13 @@ fn cooldown_remaining(path: &Path) -> Option<Duration> {
 fn refresh(
     clam_root: &Path,
     previous: Option<ActiveDatabase>,
+    base: &str,
 ) -> Result<ActiveDatabase, DownloadError> {
     // Ask the mirror what it has before downloading anything. Each header is signed, so a
     // tampered version number cannot be used to suppress an update.
-    let base = mirror();
     let mut remote_versions = BTreeMap::new();
     for name in CONTAINERS {
-        let header = fetch_header(&base, name)?;
+        let header = fetch_header(base, name)?;
         cvd::verify_signature(&header)?;
         remote_versions.insert(name.to_owned(), header.version);
     }
@@ -216,7 +249,7 @@ fn refresh(
     fs::create_dir_all(&unpacked_dir)?;
 
     let container_versions = match populate_generation(
-        &base,
+        base,
         previous.as_ref(),
         &remote_versions,
         &staging_dir,
@@ -722,15 +755,18 @@ mod tests {
         )
         .unwrap();
 
-        let kept = download_databases(directory.path()).unwrap();
+        // A non-HTTPS fallback fails before any request, so neither mirror is contacted.
+        let fallback = "http://fallback.invalid";
+        let kept = download_databases_with_fallback(directory.path(), fallback).unwrap();
         assert_eq!(kept.generation, 1);
 
-        // With nothing to fall back on, the cooldown is reported rather than ignored.
+        // With no definitions at all, blackshard's copy is tried, and both failures reported.
         fs::remove_file(directory.path().join("ClamAV").join(ACTIVE_POINTER)).unwrap();
-        assert!(matches!(
-            download_databases(directory.path()),
-            Err(DownloadError::RateLimited(_))
-        ));
+        let error = download_databases_with_fallback(directory.path(), fallback)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("rate limiting"), "{error}");
+        assert!(error.contains("fallback.invalid"), "{error}");
     }
 
     #[test]
