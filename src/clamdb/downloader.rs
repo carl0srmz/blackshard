@@ -769,6 +769,16 @@ mod tests {
         assert!(error.contains("fallback.invalid"), "{error}");
     }
 
+    /// Fetches, verifies and unpacks the real containers from blackshard's copy. Run it with
+    /// `cargo test --lib -- --ignored fallback_mirror` after changing the mirror or the downloader.
+    #[test]
+    #[ignore = "downloads about 110 MB"]
+    fn the_fallback_mirror_serves_verifiable_definitions() {
+        let directory = tempfile::tempdir().unwrap();
+        refresh(&directory.path().join("ClamAV"), None, FALLBACK_MIRROR).unwrap();
+        assert!(active_database(directory.path()).is_ok());
+    }
+
     #[test]
     fn an_expired_or_unreadable_cooldown_is_ignored() {
         let directory = tempfile::tempdir().unwrap();
