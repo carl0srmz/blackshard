@@ -57,7 +57,8 @@ if ($loaded) {
     $instanceOutput = & fltmc.exe instances -f $driverName 2>&1
     $instanceExitCode = $LASTEXITCODE
     $instanceOutput | Out-Host
-    $instancesHealthy = ($instanceExitCode -eq 0 -and (($instanceOutput | Out-String) -match "(?im)^\s*blackshard\s+"))
+    # `fltmc instances -f` can omit the filter column, so the instance name counts too.
+    $instancesHealthy = ($instanceExitCode -eq 0 -and (($instanceOutput | Out-String) -match "(?im)^\s*blackshard\s+|blackshard Instance"))
 }
 
 Write-Host "`n=== Installed driver file ===" -ForegroundColor Cyan
@@ -185,45 +186,32 @@ elseif ($null -ne $healthError) {
     Write-Host $healthError -ForegroundColor Red
 }
 
-$productionHealthy = (
-    $driverService.Running -and
-    $loaded -and
-    $instancesHealthy -and
-    $null -ne $protectionService -and
-    $protectionService.Running -and
-    $healthHealthy -and
-    $applicationsPresent -and
-    $applicationAclHealthy -and
-    $applicationsSigned
-)
-$userlandHealthy = (
-    -not $driverService.Exists -and
-    -not $loaded -and
-    $protectionService.Running -and
-    $healthHealthy -and
-    $applicationsPresent -and
-    $applicationAclHealthy -and
-    ($DevelopmentVm -or $applicationsSigned)
-)
-$developmentHealthy = (
-    $driverService.Running -and
-    $loaded -and
-    $instancesHealthy -and
-    $protectionService.Running -and
-    $healthHealthy -and
-    $applicationsPresent -and
-    $applicationAclHealthy
-)
-
-$passed = if ($Userland) {
-    $userlandHealthy
-}
-elseif ($DevelopmentVm) {
-    $developmentHealthy
+# Named so a failure says which check it was.
+$checks = if ($Userland) {
+    [ordered]@{
+        "no kernel minifilter service is registered"      = -not $driverService.Exists
+        "no blackshard minifilter is loaded"              = -not $loaded
+        "the protection service is running"               = $protectionService.Running
+        "service health is current"                       = $healthHealthy
+        "the applications are installed"                  = $applicationsPresent
+        "the application directory inherits its ACL"      = $applicationAclHealthy
+        "the applications are signed"                     = ($DevelopmentVm -or $applicationsSigned)
+    }
 }
 else {
-    $productionHealthy
+    [ordered]@{
+        "the kernel minifilter service is running"        = $driverService.Running
+        "the minifilter is loaded"                        = $loaded
+        "the minifilter is attached to volumes"           = $instancesHealthy
+        "the protection service is running"               = $protectionService.Running
+        "service health is current, connected and ready"  = $healthHealthy
+        "the applications are installed"                  = $applicationsPresent
+        "the application directory inherits its ACL"      = $applicationAclHealthy
+        "the applications are signed"                     = ($DevelopmentVm -or $applicationsSigned)
+    }
 }
+$failedChecks = @($checks.GetEnumerator() | Where-Object { -not $_.Value } | ForEach-Object { $_.Key })
+$passed = $failedChecks.Count -eq 0
 if ($passed) {
     if ($Userland) {
         Write-Host "`n[PASS] The protection service is running without the kernel minifilter." -ForegroundColor Green
@@ -247,11 +235,12 @@ if ($passed) {
     exit 0
 }
 
-Write-Host "`n[FAIL] blackshard did not pass all checks for this mode." -ForegroundColor Red
+$failureSummary = "blackshard did not pass all checks for this mode. Failed: $($failedChecks -join '; ')."
+Write-Host "`n[FAIL] $failureSummary" -ForegroundColor Red
 if (-not $DevelopmentVm) {
     Write-Host "Use -DevelopmentVm only for the legacy unsigned/test-signed disposable-VM workflow."
 }
 if ($NoExit) {
-    throw "blackshard did not pass all checks for this mode."
+    throw $failureSummary
 }
 exit 1
