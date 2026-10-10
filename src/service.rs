@@ -586,7 +586,17 @@ mod windows_service_host {
                 changed |= apply_realtime_event(&mut snapshot, event);
             }
 
-            while let Ok(active) = freshclam_receiver.try_recv() {
+            while let Ok(update) = freshclam_receiver.try_recv() {
+                let active = match update {
+                    Ok(active) => active,
+                    Err(error) => {
+                        snapshot.last_error =
+                            Some(format!("ClamAV definition download failed: {error}"));
+                        append_error(&history, snapshot.last_error.as_deref().unwrap());
+                        changed = true;
+                        continue;
+                    }
+                };
                 match load_native_index(&active) {
                     Ok(index) => {
                         if let Ok(current) = engine.read() {

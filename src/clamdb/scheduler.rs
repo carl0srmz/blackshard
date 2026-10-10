@@ -13,8 +13,11 @@ use super::downloader;
 /// waiting for the mirror. After that it checks every four hours, or every fifteen minutes while
 /// the machine has no definitions at all. A generation is only passed on when it differs from the
 /// last one seen, since each hand-off makes the service reload every signature and discard its
-/// verdict cache.
-pub fn start_scheduler(program_data: PathBuf) -> Receiver<downloader::ActiveDatabase> {
+/// verdict cache. A failed check is passed on too, since a service's log goes nowhere and the
+/// health file is the only place it can be seen.
+pub fn start_scheduler(
+    program_data: PathBuf,
+) -> Receiver<Result<downloader::ActiveDatabase, String>> {
     let (sender, receiver) = mpsc::sync_channel(1);
     thread::spawn(move || {
         let mut last_generation = downloader::active_database(&program_data)
@@ -39,10 +42,13 @@ pub fn start_scheduler(program_data: PathBuf) -> Receiver<downloader::ActiveData
                         active.generation
                     );
                     last_generation = Some(active.generation);
-                    let _ = sender.try_send(active);
+                    let _ = sender.try_send(Ok(active));
                 }
                 Ok(_) => info!("Definition updater: definitions are already current."),
-                Err(error) => error!("Definition update failed: {error}"),
+                Err(error) => {
+                    error!("Definition update failed: {error}");
+                    let _ = sender.try_send(Err(error.to_string()));
+                }
             }
         }
     });
