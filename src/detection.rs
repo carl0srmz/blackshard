@@ -256,6 +256,7 @@ impl DetectionEngine {
 
     fn analyze_open_file(&self, file: &File) -> DetectionReport {
         let started = Instant::now();
+        let change_time_before = opened_change_time(file);
         let before = match file.metadata() {
             Ok(metadata) if metadata.is_file() => metadata,
             Ok(_) => {
@@ -309,7 +310,12 @@ impl DetectionEngine {
                 )
             }
         };
-        if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
+        // Length and mtime miss a same-size rewrite that lands in the same mtime tick or sets the
+        // mtime back. The change time moves on every write, so it catches those as well.
+        if before.len() != after.len()
+            || before.modified().ok() != after.modified().ok()
+            || change_time_before != opened_change_time(file)
+        {
             return DetectionReport::error(
                 "the opened file changed while it was being analyzed",
                 started.elapsed(),
@@ -779,6 +785,34 @@ pub(crate) fn opened_file_identity(file: &File) -> io::Result<OpenedFileIdentity
         volume_serial_number: information.volume_serial_number,
         link_count: information.number_of_links,
     })
+}
+
+/// The file's change time (`FILE_BASIC_INFO::ChangeTime`), which the file system moves on every
+/// content or metadata change, including the mapped and kernel-mode writes the driver's generation
+/// counter misses. `None` when it cannot be read; callers then compare `None == None`, which is
+/// no worse than not checking it.
+#[cfg(windows)]
+pub(crate) fn opened_change_time(file: &File) -> Option<i64> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FileBasicInfo, GetFileInformationByHandleEx, FILE_BASIC_INFO,
+    };
+
+    let mut information = std::mem::MaybeUninit::<FILE_BASIC_INFO>::uninit();
+    let read = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as _,
+            FileBasicInfo,
+            information.as_mut_ptr().cast(),
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    };
+    (read != 0).then(|| unsafe { information.assume_init() }.ChangeTime)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn opened_change_time(_file: &File) -> Option<i64> {
+    None
 }
 
 #[cfg(not(windows))]

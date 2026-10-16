@@ -18,6 +18,11 @@ pub struct VerdictCacheKey {
     pub file_id: u64,
     pub file_size: u64,
     pub content_generation: u64,
+    /// The file system's change time, 0 when it could not be read. The driver's
+    /// `content_generation` misses mapped and kernel-mode writes and restarts when its stream
+    /// context is rebuilt, so on its own a same-size overwrite could be served the old file's
+    /// clean verdict.
+    pub change_time: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +155,7 @@ mod tests {
             file_id,
             file_size: 3,
             content_generation: 4,
+            change_time: 5,
         }
     }
 
@@ -193,6 +199,21 @@ mod tests {
         // that happens to have the same MFT record number.
         assert!(cache.get(&key(11, 200), 1).is_none());
         assert!(cache.get(&key(10, 200), 1).is_some());
+    }
+
+    #[test]
+    fn a_rewritten_file_is_not_a_hit() {
+        let cache = VerdictCache::new(4);
+        let mut cache = cache.write().unwrap();
+        assert!(cache.insert(key(1, 2), clean(AnalysisCompleteness::Complete, false)));
+
+        // Same file, same size, same driver generation: a mapped write the driver never saw.
+        let rewritten = VerdictCacheKey {
+            change_time: key(1, 2).change_time + 1,
+            ..key(1, 2)
+        };
+        assert!(cache.get(&rewritten, 1).is_none());
+        assert!(cache.get(&key(1, 2), 1).is_some());
     }
 
     #[test]

@@ -1,7 +1,8 @@
 use crate::behavior::{ProcessTrust, RansomwareMonitor};
 use crate::config::Settings;
 use crate::detection::{
-    open_candidate_file, opened_file_identity, DetectionEngine, DetectionReport, DetectionVerdict,
+    open_candidate_file, opened_change_time, opened_file_identity, DetectionEngine,
+    DetectionReport, DetectionVerdict,
 };
 use crate::history::{EventHistory, EventKind, SecurityEvent};
 use crate::quarantine::{IsolationState, QuarantineRecord, QuarantineStore};
@@ -537,6 +538,7 @@ pub(crate) fn realtime_worker(
                         file_id: identity.file_id,
                         file_size: file.metadata().map(|m| m.len()).unwrap_or(0),
                         content_generation: notification.content_generation,
+                        change_time: opened_change_time(&file).unwrap_or(0),
                     };
                     let current_gen = definition_generation.load(Ordering::Acquire);
 
