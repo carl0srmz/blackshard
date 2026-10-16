@@ -1,10 +1,13 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Text;
 using System.IO;
 using System.Reflection;
+using System.Security.AccessControl;
+using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -488,6 +491,15 @@ namespace blackshardDevelopmentSetup
             if (!File.Exists(script))
             {
                 FinishSetup(2, "The embedded setup script is missing.");
+                return;
+            }
+            try
+            {
+                EmbeddedPayload.Verify();
+            }
+            catch (Exception error)
+            {
+                FinishSetup(2, error.Message);
                 return;
             }
 
@@ -1432,6 +1444,10 @@ namespace blackshardDevelopmentSetup
 
         public static string Root { get; private set; }
 
+        // SHA-256 of each extracted file, taken from the embedded resource as it was written out.
+        private static readonly Dictionary<string, string> Digests =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
         public static void Prepare()
         {
             var assembly = Assembly.GetExecutingAssembly();
@@ -1441,10 +1457,19 @@ namespace blackshardDevelopmentSetup
                 "blackshard-vm-bootstrap"
             );
             var root = Path.Combine(parent, version);
-            Directory.CreateDirectory(root);
-            RejectReparsePoint(parent);
-            RejectReparsePoint(root);
+            // ProgramData lets any user create folders, and both names are predictable from the
+            // public installer. A standard user who created them first would own them and could
+            // swap vm-setup.ps1 before it runs elevated, so neither is used unless an administrator
+            // owns it, and both get an ACL standard users cannot write through.
+            CreateProtectedDirectory(parent);
+            if (Directory.Exists(root))
+            {
+                RejectReparsePoint(root);
+                Directory.Delete(root, true);
+            }
+            CreateProtectedDirectory(root);
 
+            Digests.Clear();
             foreach (var fileName in FileNames)
             {
                 var resourceName = "blackshard.payload." + fileName;
@@ -1456,13 +1481,10 @@ namespace blackshardDevelopmentSetup
                     }
 
                     var destination = Path.Combine(root, fileName);
-                    if (File.Exists(destination))
-                    {
-                        RejectReparsePoint(destination);
-                    }
                     var temporary = Path.Combine(root, Guid.NewGuid().ToString("N") + ".tmp");
                     try
                     {
+                        using (var hash = SHA256.Create())
                         using (var output = new FileStream(
                             temporary,
                             FileMode.CreateNew,
@@ -1472,12 +1494,16 @@ namespace blackshardDevelopmentSetup
                             FileOptions.WriteThrough
                         ))
                         {
-                            input.CopyTo(output);
+                            var buffer = new byte[131072];
+                            int read;
+                            while ((read = input.Read(buffer, 0, buffer.Length)) > 0)
+                            {
+                                hash.TransformBlock(buffer, 0, read, null, 0);
+                                output.Write(buffer, 0, read);
+                            }
+                            hash.TransformFinalBlock(buffer, 0, 0);
                             output.Flush(true);
-                        }
-                        if (File.Exists(destination))
-                        {
-                            File.Delete(destination);
+                            Digests[fileName] = BitConverter.ToString(hash.Hash);
                         }
                         File.Move(temporary, destination);
                     }
@@ -1491,6 +1517,95 @@ namespace blackshardDevelopmentSetup
                 }
             }
             Root = root;
+        }
+
+        /// <summary>
+        /// Re-hashes every extracted file against what was embedded, right before anything runs
+        /// elevated from the folder.
+        /// </summary>
+        public static void Verify()
+        {
+            foreach (var fileName in FileNames)
+            {
+                var path = Path.Combine(Root, fileName);
+                RejectReparsePoint(path);
+                string expected;
+                if (!Digests.TryGetValue(fileName, out expected))
+                {
+                    throw new InvalidOperationException("The installer payload was never extracted: " + fileName);
+                }
+                using (var hash = SHA256.Create())
+                using (var input = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+                {
+                    if (BitConverter.ToString(hash.ComputeHash(input)) != expected)
+                    {
+                        throw new InvalidOperationException("The installer payload changed after it was extracted: " + fileName);
+                    }
+                }
+            }
+        }
+
+        private static void CreateProtectedDirectory(string path)
+        {
+            if (Directory.Exists(path))
+            {
+                RejectReparsePoint(path);
+                var owner = Directory.GetAccessControl(path, AccessControlSections.Owner)
+                    .GetOwner(typeof(SecurityIdentifier)) as SecurityIdentifier;
+                if (!IsTrustedOwner(owner))
+                {
+                    throw new InvalidOperationException(
+                        path + " already exists and is owned by " + owner
+                            + ", not an administrator. Delete it and run setup again."
+                    );
+                }
+            }
+            else
+            {
+                Directory.CreateDirectory(path);
+                RejectReparsePoint(path);
+            }
+            // Applied to a folder that already existed too: one an older build made inherited
+            // ProgramData's ACL, which lets users add files beside the payload.
+            Directory.SetAccessControl(path, ProtectedSecurity());
+        }
+
+        private static DirectorySecurity ProtectedSecurity()
+        {
+            var security = new DirectorySecurity();
+            security.SetAccessRuleProtection(true, false);
+            security.SetOwner(new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null));
+            var inheritance = InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit;
+            foreach (var sid in new[] { WellKnownSidType.LocalSystemSid, WellKnownSidType.BuiltinAdministratorsSid })
+            {
+                security.AddAccessRule(new FileSystemAccessRule(
+                    new SecurityIdentifier(sid, null),
+                    FileSystemRights.FullControl,
+                    inheritance,
+                    PropagationFlags.None,
+                    AccessControlType.Allow
+                ));
+            }
+            security.AddAccessRule(new FileSystemAccessRule(
+                new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null),
+                FileSystemRights.ReadAndExecute | FileSystemRights.Synchronize,
+                inheritance,
+                PropagationFlags.None,
+                AccessControlType.Allow
+            ));
+            return security;
+        }
+
+        private static bool IsTrustedOwner(SecurityIdentifier owner)
+        {
+            if (owner == null) return false;
+            if (owner.IsWellKnown(WellKnownSidType.LocalSystemSid)) return true;
+            if (owner.IsWellKnown(WellKnownSidType.BuiltinAdministratorsSid)) return true;
+            // This process is elevated, so a folder it created under its own account is its own.
+            using (var identity = WindowsIdentity.GetCurrent())
+            {
+                return owner.Equals(identity.User);
+            }
         }
 
         private static void RejectReparsePoint(string path)

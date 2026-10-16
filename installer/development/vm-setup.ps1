@@ -155,6 +155,17 @@ function Test-TestSigningActive {
 
 function Set-StageAcl {
     New-Item -ItemType Directory -Path $stageRoot -Force | Out-Null
+    # The folder may already exist, created by a standard user who still owns it (and could grant
+    # themselves access again) or holding files with their own explicit entries. Take ownership and
+    # reset everything below it, as install.ps1 does, before applying the protected ACL.
+    & icacls.exe $stageRoot "/setowner" "*S-1-5-32-544" "/T" "/C" "/Q" | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not take ownership of $stageRoot."
+    }
+    & icacls.exe $stageRoot "/reset" "/T" "/C" "/Q" | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not reset the access entries under $stageRoot."
+    }
     $acl = New-Object Security.AccessControl.DirectorySecurity
     $acl.SetAccessRuleProtection($true, $false)
     $inheritance = [Security.AccessControl.InheritanceFlags]"ContainerInherit, ObjectInherit"
