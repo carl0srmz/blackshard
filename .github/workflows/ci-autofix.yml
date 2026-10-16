@@ -63,9 +63,11 @@ jobs:
           RUN_ID: ${{ github.event.workflow_run.id }}
         run: .\tools\Repair-FailedRun.ps1 -Mode Collect -RunId $env:RUN_ID -StateDirectory $env:STATE
 
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
-        with:
-          components: rustfmt, clippy
+      # The release the failed commit pins; an older commit without rust-toolchain.toml gets the
+      # runner's stable, which ships rustfmt and clippy.
+      - name: Install the failed commit's Rust toolchain
+        working-directory: failed
+        run: rustup toolchain install
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:

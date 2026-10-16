@@ -117,7 +117,13 @@ function Invoke-Collect {
 
     # A newer commit on the branch has its own run, and an open repair is already waiting for review.
     $head = Read-Native gh @('api', "repos/{owner}/{repo}/branches/$branch", '--jq', '.commit.sha')
-    if ($head -and $head -ne $run.headSha) {
+    if ($LASTEXITCODE -ne 0) {
+        # Most often a pull request branch deleted once it merged. This used to be read as the
+        # branch having moved, and gh's exit code then failed the whole job.
+        Write-Host "$branch no longer exists; there is nothing to repair."
+        if (-not $DryRun) { $state.action = 'skip' }
+    }
+    elseif ($head -ne $run.headSha) {
         Write-Host "$branch has moved past $($run.headSha); its newer run decides."
         if (-not $DryRun) { $state.action = 'skip' }
     }
@@ -312,3 +318,7 @@ function Invoke-Apply {
 if (-not $Mode -or $Mode -eq 'Collect') { Invoke-Collect }
 if (-not $Mode -or $Mode -eq 'Repair') { Invoke-Repair }
 if (-not $Mode -or $Mode -eq 'Apply') { Invoke-Apply }
+# Every real failure above throws. Without this, the exit code of whichever native tool ran last
+# (a cargo check that found the problem being repaired, a gh lookup that came back empty) would
+# become the step's result.
+exit 0
