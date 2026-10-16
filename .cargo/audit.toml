@@ -26,6 +26,21 @@ ignore = [
     # the component model, still not compiled (`cargo tree -e features -i wasmtime` lists only
     # cranelift, runtime and std). Fixed in 48.0.4+ / 49.0.2+; yara-x 1.21.0 still pins ^45.
     "RUSTSEC-2026-0327",
+
+    # wasmtime 45: type recursion can overflow stack while dropping instantiated component model
+    # values. The component model is not compiled in this build (`cargo tree -e features -i
+    # wasmtime` lists only cranelift, runtime and std). Fixed in 48.0.6+ / 49.0.3+.
+    "RUSTSEC-2026-0359",
+
+    # wasmtime 45: async-entrypoint checks can be bypassed through polymorphic wrappers. This is in
+    # component-model async entrypoints, which are not enabled in this build (same feature check as
+    # above). Fixed in 48.0.6+ / 49.0.3+.
+    "RUSTSEC-2026-0362",
+
+    # wasmtime 45: component handle tables can grow without a global bound. This is component-model
+    # specific and the feature is not compiled in this build (`cargo tree -e features -i wasmtime`
+    # shows no component-model features). Fixed in 48.0.6+ / 49.0.3+.
+    "RUSTSEC-2026-0363",
 ]
 
 [target]
