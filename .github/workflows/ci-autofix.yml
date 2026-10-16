@@ -8,42 +8,60 @@ name: ci-autofix
 #
 # No AI and no secrets: only the workflow's own token. Its pull requests start no CI by themselves,
 # so the script dispatches security-ci on the repair branch. The tooling runs from the default
-# branch; only the repairs touch the failed commit. Forks are never processed.
+# branch; only the repairs touch the failed commit. Forks are never processed. The job that runs
+# the failed commit's code (compute) can read but not write; the job that writes (apply) runs none.
 
 on:
   workflow_run:
     workflows: ["security-ci", "performance"]
     types: [completed]
 
+# Each job asks for what it needs; close-resolved below only touches issues.
 permissions:
-  contents: write
-  pull-requests: write
   issues: write
-  actions: write
 
 concurrency:
   group: ci-autofix-${{ github.event.workflow_run.head_branch }}
   cancel-in-progress: false
 
 jobs:
-  repair:
+  # Runs cargo on the failed commit, which executes that commit's build scripts and proc macros.
+  # Those are code from a branch (a Dependabot one included), so this job holds no token that can
+  # write, keeps no credentials in the checkouts, and saves no cache into the default branch's
+  # scope. It hands its repair over as a patch.
+  compute:
     if: >-
       github.event.workflow_run.conclusion == 'failure' &&
       github.event.workflow_run.head_repository.full_name == github.repository &&
       !startsWith(github.event.workflow_run.head_branch, 'autofix/')
     runs-on: windows-2022
     timeout-minutes: 60
+    permissions:
+      actions: read
+      contents: read
     env:
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
+      # Untracked, beside the checkouts; job-level env cannot see the runner context.
+      STATE: ${{ github.workspace }}/repair-state
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
 
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
           path: failed
+          persist-credentials: false
+
+      # The only step with a token, and it runs nothing from the failed commit.
+      - name: Read the failed run
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: .\tools\Repair-FailedRun.ps1 -Mode Collect -RunId $env:RUN_ID -StateDirectory $env:STATE
 
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
@@ -52,19 +70,61 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: failed
+          save-if: false
 
       - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: cargo-audit
 
-      - name: Repair or explain
+      - name: Repair
+        shell: pwsh
+        run: .\tools\Repair-FailedRun.ps1 -Mode Repair -WorkTree .\failed -StateDirectory $env:STATE
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: repair-state
+          path: ${{ env.STATE }}
+          retention-days: 3
+
+  # Pushes the repair and reports. It compiles nothing: the patch is applied as text, and only
+  # if it changes nothing but Rust sources and Cargo.lock.
+  apply:
+    needs: compute
+    runs-on: windows-2022
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      # Untracked, beside the checkouts; job-level env cannot see the runner context.
+      STATE: ${{ github.workspace }}/repair-state
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          path: failed
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: repair-state
+          path: ${{ env.STATE }}
+
+      - name: Push the repair or explain
         shell: pwsh
         env:
-          RUN_ID: ${{ github.event.workflow_run.id }}
           PULL_REQUEST: ${{ github.event.workflow_run.pull_requests[0].number }}
         run: |
           gh label create ci-autofix --color FFFF00 --force --description "Repaired or reported after a failed CI run" | Out-Null
-          .\tools\Repair-FailedRun.ps1 -RunId $env:RUN_ID -WorkTree .\failed -PullRequest "$env:PULL_REQUEST"
+          .\tools\Repair-FailedRun.ps1 -Mode Apply -WorkTree .\failed -PullRequest "$env:PULL_REQUEST" -StateDirectory $env:STATE
 
   close-resolved:
     if: >-
