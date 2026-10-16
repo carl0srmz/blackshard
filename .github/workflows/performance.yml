@@ -16,6 +16,7 @@ on:
       - ".cargo/**"
       - "Cargo.lock"
       - "Cargo.toml"
+      - "rust-toolchain.toml"
       - "src/**"
       - "!src/driver/**"
       - "tools/New-PerfCorpus.ps1"
@@ -29,6 +30,7 @@ on:
       - ".cargo/**"
       - "Cargo.lock"
       - "Cargo.toml"
+      - "rust-toolchain.toml"
       - "src/**"
       - "!src/driver/**"
       - "tools/New-PerfCorpus.ps1"
@@ -54,9 +56,9 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
-        with:
-          components: llvm-tools
+      # Installs the release rust-toolchain.toml names, with its components and targets.
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 

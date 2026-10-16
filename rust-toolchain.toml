@@ -1,0 +1,11 @@
+# The exact Rust release every build, local or CI, uses. A new stable release brings new clippy
+# lints and rustfmt changes, and with `-D warnings` an unpinned toolchain turned main red with no
+# code change. Dependabot proposes each new release as a pull request, so the new lints are dealt
+# with there, before anything merges.
+#
+# The fuzz targets ask for nightly explicitly (`cargo +nightly fuzz`), which overrides this file.
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+components = ["rustfmt", "clippy", "llvm-tools"]
+targets = ["x86_64-pc-windows-msvc", "i686-pc-windows-msvc"]

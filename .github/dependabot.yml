@@ -7,6 +7,11 @@ version: 2
 # `cooldown` holds version updates back until a release has been public for a week, which is when
 # most malicious or broken releases get noticed and yanked. Security updates ignore the cooldown
 # and arrive as soon as an advisory is published.
+#
+# Cargo updates are lockfile-only: Dependabot moves Cargo.lock within the ranges Cargo.toml already
+# allows, and never rewrites Cargo.toml. Dependabot calls a 0.x bump such as sha2 0.10 -> 0.11
+# "minor", although Cargo treats it as breaking, so it used to open upgrades that could not compile.
+# Breaking upgrades are made by hand, together with the code they need.
 
 updates:
   # Only the root. The fuzz crate depends on nothing but blackshard itself, so watching /fuzz as
@@ -20,6 +25,7 @@ updates:
       timezone: America/Mexico_City
     open-pull-requests-limit: 3
     rebase-strategy: auto
+    versioning-strategy: lockfile-only
     cooldown:
       default-days: 7
     groups:
@@ -34,6 +40,19 @@ updates:
         update-types:
           - minor
           - patch
+  # The Rust release in rust-toolchain.toml. Each new stable arrives as its own pull request, where
+  # CI shows any new clippy lints or rustfmt changes before they can reach main.
+  - package-ecosystem: rust-toolchain
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "05:33"
+      timezone: America/Mexico_City
+    open-pull-requests-limit: 1
+    cooldown:
+      default-days: 7
+
   - package-ecosystem: github-actions
     directory: /
     schedule:

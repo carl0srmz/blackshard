@@ -9,6 +9,7 @@ on:
       - ".github/workflows/ci.yml"
       - "Cargo.lock"
       - "Cargo.toml"
+      - "rust-toolchain.toml"
       - "blackshard-amsi/**"
       - "src/**"
       - "fuzz/**"
@@ -24,6 +25,7 @@ on:
       - ".github/workflows/ci.yml"
       - "Cargo.lock"
       - "Cargo.toml"
+      - "rust-toolchain.toml"
       - "blackshard-amsi/**"
       - "src/**"
       - "fuzz/**"
@@ -53,10 +55,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
-        with:
-          targets: i686-pc-windows-msvc
-          components: rustfmt, clippy, llvm-tools
+      # Installs the release rust-toolchain.toml names, with its components and targets.
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
@@ -387,17 +388,43 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          # The base commit, to tell whether this change touched Cargo.lock.
+          fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+      # Installs the release rust-toolchain.toml names, with its components and targets.
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
 
       - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
         with:
           tool: cargo-audit
 
       # Ignored advisories, each with the reason it does not apply, live in .cargo/audit.toml.
-      # Enforcing: a new advisory fails the job rather than being reported green.
+      #
+      # Advisories are published every day against crates that have not changed, so failing on
+      # every one turned unrelated pushes and every nightly run red. A change that updates
+      # Cargo.lock into an advisory still fails here. An advisory against dependencies the change
+      # did not touch is reported as a warning instead: it reaches you as a Dependabot alert and a
+      # security update pull request, which is where it gets fixed.
       - name: Run cargo audit
-        run: cargo audit
+        shell: bash
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if cargo audit; then
+            exit 0
+          fi
+          if [[ -n "$BASE" && ! "$BASE" =~ ^0+$ ]] && git cat-file -e "$BASE^{commit}" 2>/dev/null \
+            && ! git diff --quiet "$BASE" HEAD -- Cargo.lock; then
+            echo "::error title=Vulnerable dependency::This change updates Cargo.lock to a version with a RustSec advisory (listed above)."
+            exit 1
+          fi
+          echo "::warning title=RustSec advisory::A dependency this change did not touch has a new advisory (listed above). Fix it through the Dependabot security update, or record in .cargo/audit.toml why blackshard is not exposed."
+          {
+            echo "### RustSec advisory in an unchanged dependency"
+            echo "Not caused by this change, so it does not fail the build. See the log above."
+          } >> "$GITHUB_STEP_SUMMARY"
 
   definitions-smoke:
     name: Native ClamAV definition pipeline
@@ -408,7 +435,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+      # Installs the release rust-toolchain.toml names, with its components and targets.
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
 
       - run: cargo build --release --bin blackshard-service
 
