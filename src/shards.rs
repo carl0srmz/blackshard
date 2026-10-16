@@ -113,7 +113,12 @@ pub fn learn(sha256: &str, threat_name: &str) -> io::Result<bool> {
             learned_at: Utc::now(),
         },
     );
-    persist(&store)?;
+    // The shard is in force from here on even if it cannot be saved, so this still reports it as
+    // new: callers invalidate cached clean verdicts on `Ok(true)`, and an error would leave them
+    // serving the convicted file. It is saved again with the next shard learned.
+    if let Err(error) = persist(&store) {
+        log::warn!("A learned shard is active but could not be saved: {error}");
+    }
     Ok(true)
 }
 

@@ -35,20 +35,30 @@ pub fn start_scheduler(
             }
             first = false;
 
-            match downloader::download_databases(&program_data) {
+            // `send` waits for the service to take the previous result, which it does on every
+            // tick. `try_send` dropped a new generation whenever an earlier result was still
+            // queued, and the generation was never offered again. It fails only once the
+            // service has gone, which ends this thread.
+            let delivered = match downloader::download_databases(&program_data) {
                 Ok(active) if Some(active.generation) != last_generation => {
                     info!(
                         "Definition updater: activated generation {}.",
                         active.generation
                     );
                     last_generation = Some(active.generation);
-                    let _ = sender.try_send(Ok(active));
+                    sender.send(Ok(active))
                 }
-                Ok(_) => info!("Definition updater: definitions are already current."),
+                Ok(_) => {
+                    info!("Definition updater: definitions are already current.");
+                    Ok(())
+                }
                 Err(error) => {
                     error!("Definition update failed: {error}");
-                    let _ = sender.try_send(Err(error.to_string()));
+                    sender.send(Err(error.to_string()))
                 }
+            };
+            if delivered.is_err() {
+                return;
             }
         }
     });
