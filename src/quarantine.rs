@@ -449,7 +449,14 @@ impl QuarantineStore {
         let parent = destination.parent().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "restore target has no parent")
         })?;
+        // Restore runs as SYSTEM into a folder a standard user may control. Check the deepest
+        // folder that already exists before creating anything beneath it, then pin the final one
+        // for the rest of the restore, so a junction cannot steer the file into System32.
+        if let Some(existing) = parent.ancestors().find(|ancestor| ancestor.is_dir()) {
+            pin_restore_directory(existing)?;
+        }
         fs::create_dir_all(parent)?;
+        let _pinned_parent = pin_restore_directory(parent)?;
 
         let temporary_name = destination
             .file_name()
@@ -660,6 +667,111 @@ impl QuarantineStore {
     }
 }
 
+/// A restore folder held open, so it cannot be renamed, deleted or swapped for a junction (nor can
+/// any folder above it) until this is dropped.
+struct PinnedDirectory {
+    #[cfg(windows)]
+    _handle: File,
+}
+
+/// Opens `directory` following any links, and refuses it unless it resolves to the folder its
+/// path names. A junction, symbolic link or mount point anywhere in the path changes where it
+/// resolves; cloud-file placeholders such as OneDrive folders do not.
+fn pin_restore_directory(directory: &Path) -> io::Result<PinnedDirectory> {
+    let expected = std::path::absolute(directory)?;
+    let (pinned, resolved, expected) = open_and_resolve_directory(&expected)?;
+    if !same_directory(&resolved, &expected) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "restore folder {} resolves to {}; a junction or link redirects it, so nothing was restored",
+                expected.display(),
+                resolved.display()
+            ),
+        ));
+    }
+    Ok(pinned)
+}
+
+#[cfg(windows)]
+fn open_and_resolve_directory(directory: &Path) -> io::Result<(PinnedDirectory, PathBuf, PathBuf)> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFinalPathNameByHandleW, GetLongPathNameW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, VOLUME_NAME_DOS,
+    };
+
+    fn read_wide(call: impl Fn(*mut u16, u32) -> u32) -> io::Result<PathBuf> {
+        let mut buffer = vec![0u16; 1024];
+        loop {
+            let length = call(buffer.as_mut_ptr(), buffer.len() as u32) as usize;
+            if length == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if length < buffer.len() {
+                buffer.truncate(length);
+                return Ok(PathBuf::from(OsString::from_wide(&buffer)));
+            }
+            buffer.resize(length + 1, 0);
+        }
+    }
+
+    // No FILE_SHARE_DELETE: while this handle is open the folder cannot be renamed or removed,
+    // and neither can any folder above it.
+    let handle = OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(directory)?;
+    if !handle.metadata()?.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("restore folder {} is not a folder", directory.display()),
+        ));
+    }
+    let raw = handle.as_raw_handle();
+    let resolved = read_wide(|buffer, size| unsafe {
+        GetFinalPathNameByHandleW(raw as _, buffer, size, VOLUME_NAME_DOS)
+    })?;
+    // The final path uses long names; so must the comparison, or C:\Users\RUNNER~1 never matches.
+    let wide = directory
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let expected =
+        read_wide(|buffer, size| unsafe { GetLongPathNameW(wide.as_ptr(), buffer, size) })?;
+    Ok((PinnedDirectory { _handle: handle }, resolved, expected))
+}
+
+#[cfg(not(windows))]
+fn open_and_resolve_directory(directory: &Path) -> io::Result<(PinnedDirectory, PathBuf, PathBuf)> {
+    Ok((
+        PinnedDirectory {},
+        fs::canonicalize(directory)?,
+        directory.to_path_buf(),
+    ))
+}
+
+/// Compares two absolute Windows paths the way the file system names them: without the `\\?\`
+/// prefix, separators unified, trailing separators dropped, and case-insensitively.
+fn same_directory(left: &Path, right: &Path) -> bool {
+    fn normalize(path: &Path) -> String {
+        let text = path.to_string_lossy().replace('/', "\\");
+        let text = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{rest}")
+        } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+            rest.to_owned()
+        } else {
+            text
+        };
+        text.trim_end_matches('\\').to_lowercase()
+    }
+    normalize(left) == normalize(right)
+}
+
 #[cfg(windows)]
 fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
@@ -851,6 +963,95 @@ mod tests {
         let error = store.restore(record.id, None, false).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(fs::read(&source).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn restore_paths_compare_as_the_file_system_names_them() {
+        assert!(same_directory(
+            Path::new(r"\\?\C:\Users\Example\Downloads"),
+            Path::new(r"c:\users\example\downloads\")
+        ));
+        assert!(same_directory(
+            Path::new(r"\\?\UNC\server\share\folder"),
+            Path::new(r"\\server\share\folder")
+        ));
+        assert!(!same_directory(
+            Path::new(r"\\?\C:\Windows\System32"),
+            Path::new(r"C:\Users\Example\Downloads")
+        ));
+        assert!(!same_directory(
+            Path::new(r"C:\Users\Example\Downloads2"),
+            Path::new(r"C:\Users\Example\Downloads")
+        ));
+    }
+
+    /// A standard user can replace a folder they own with a junction to one they cannot write,
+    /// and wait for an administrator to restore something into it as SYSTEM.
+    #[test]
+    fn restore_refuses_a_folder_redirected_by_a_link() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = QuarantineStore::new(temporary.path().join("vault"));
+        let downloads = temporary.path().join("Downloads");
+        let protected = temporary.path().join("protected");
+        fs::create_dir_all(&downloads).unwrap();
+        fs::create_dir_all(&protected).unwrap();
+        let source = downloads.join("sample.bin");
+        fs::write(&source, b"quarantined payload").unwrap();
+        let record = store.quarantine(&source, "Unit.Test", 100).unwrap();
+
+        fs::remove_dir(&downloads).unwrap();
+        if !link_directory(&downloads, &protected) {
+            eprintln!("skipped: could not create a directory link here");
+            return;
+        }
+
+        let error = store.restore(record.id, None, false).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        assert_eq!(fs::read_dir(&protected).unwrap().count(), 0);
+        assert_eq!(store.list().unwrap().len(), 1);
+    }
+
+    /// The same, with the link above a folder restore has to create.
+    #[test]
+    fn restore_refuses_to_create_folders_beneath_a_link() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = QuarantineStore::new(temporary.path().join("vault"));
+        let home = temporary.path().join("home");
+        let protected = temporary.path().join("protected");
+        fs::create_dir_all(home.join("nested")).unwrap();
+        fs::create_dir_all(&protected).unwrap();
+        let source = home.join("nested").join("sample.bin");
+        fs::write(&source, b"quarantined payload").unwrap();
+        let record = store.quarantine(&source, "Unit.Test", 100).unwrap();
+
+        fs::remove_dir_all(&home).unwrap();
+        if !link_directory(&home, &protected) {
+            eprintln!("skipped: could not create a directory link here");
+            return;
+        }
+
+        let error = store.restore(record.id, None, false).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        assert_eq!(fs::read_dir(&protected).unwrap().count(), 0);
+    }
+
+    #[cfg(windows)]
+    fn link_directory(link: &Path, target: &Path) -> bool {
+        // A junction needs no privilege, which is exactly why a standard user can plant one.
+        std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(link)
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(unix)]
+    fn link_directory(link: &Path, target: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok()
     }
 
     #[test]
