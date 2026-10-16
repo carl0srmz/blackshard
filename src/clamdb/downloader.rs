@@ -131,6 +131,25 @@ pub struct ActiveDatabase {
     /// existed lack it, which simply forces one full refresh.
     #[serde(default)]
     pub container_versions: BTreeMap<String, u64>,
+    /// When the mirror last confirmed it had nothing newer. `activated_at` stays the time these
+    /// definitions were installed, which is the age the UI reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_at: Option<DateTime<Utc>>,
+}
+
+impl ActiveDatabase {
+    fn last_contact(&self) -> DateTime<Utc> {
+        self.checked_at
+            .map_or(self.activated_at, |checked| checked.max(self.activated_at))
+    }
+}
+
+/// Whether the installed copy of a container can stand in for the one the mirror offers.
+///
+/// An older offer is never installed over a newer copy: a lagging CDN node serves one routinely,
+/// and a hostile mirror could replay an old container whose ClamAV signature is still valid.
+fn installed_is_current(installed: Option<u64>, offered: Option<u64>) -> bool {
+    matches!((installed, offered), (Some(installed), Some(offered)) if installed >= offered)
 }
 
 /// The mirror containers are fetched from, overridable for testing and for private mirrors.
@@ -152,7 +171,7 @@ fn download_databases_with_fallback(
     let previous = active_database(blackshard_data).ok();
     if let Some(active) = &previous {
         if Utc::now()
-            .signed_duration_since(active.activated_at)
+            .signed_duration_since(active.last_contact())
             .num_minutes()
             < REFRESH_INTERVAL_MINUTES
         {
@@ -228,12 +247,30 @@ fn refresh(
         cvd::verify_signature(&header)?;
         remote_versions.insert(name.to_owned(), header.version);
     }
-    if let Some(active) = previous
-        .as_ref()
-        .filter(|active| active.container_versions == remote_versions)
-    {
-        info!("ClamAV definitions are current ({remote_versions:?}); nothing to download");
-        return Ok(active.clone());
+    if let Some(active) = previous.as_ref().filter(|active| {
+        CONTAINERS.iter().all(|name| {
+            installed_is_current(
+                active.container_versions.get(*name).copied(),
+                remote_versions.get(*name).copied(),
+            )
+        })
+    }) {
+        if active.container_versions != remote_versions {
+            warn!(
+                "the ClamAV mirror offers {remote_versions:?}, older than the installed {:?}; keeping the installed definitions",
+                active.container_versions
+            );
+        } else {
+            info!("ClamAV definitions are current ({remote_versions:?}); nothing to download");
+        }
+        let mut active = active.clone();
+        active.checked_at = Some(Utc::now());
+        // Without this the 60 minute short-circuit never applies again once the definitions are
+        // more than an hour old, and every scheduler tick goes back to the mirror.
+        if let Err(error) = write_active_pointer(clam_root, &active) {
+            warn!("could not record the mirror check: {error}");
+        }
+        return Ok(active);
     }
 
     let staging_root = clam_root.join("Staging");
@@ -277,6 +314,7 @@ fn refresh(
         path: generation_dir.clone(),
         unpacked_path: generation_dir.join("Unpacked"),
         container_versions,
+        checked_at: None,
     };
     write_active_pointer(clam_root, &active)?;
     info!(
@@ -304,8 +342,10 @@ fn populate_generation(
     let mut installed = BTreeMap::new();
     for name in CONTAINERS {
         let unchanged = previous.filter(|active| {
-            active.container_versions.contains_key(name)
-                && active.container_versions.get(name) == remote_versions.get(name)
+            installed_is_current(
+                active.container_versions.get(name).copied(),
+                remote_versions.get(name).copied(),
+            )
         });
         if let Some(active) = unchanged {
             let linked = link_container_files(&active.unpacked_path, unpacked_dir, name)?;
@@ -317,6 +357,15 @@ fn populate_generation(
         let container = staging_dir.join(format!("{name}.cvd"));
         fetch_container(base, name, &container)?;
         let header = verify_container(&container)?;
+        // The header check above saw a newer version, but the body can come from another node.
+        if let Some(installed) = previous.and_then(|active| active.container_versions.get(name)) {
+            if header.version < *installed {
+                return Err(DownloadError::Validation(format!(
+                    "the mirror served {name}.cvd version {}, older than the installed {installed}",
+                    header.version
+                )));
+            }
+        }
         let (_, extracted) = cvd::extract(&container, unpacked_dir)?;
         // The unpacked databases are all blackshard reads, so the container itself is not kept.
         fs::remove_file(&container)?;
@@ -574,6 +623,7 @@ mod tests {
             path,
             unpacked_path: unpacked,
             container_versions: BTreeMap::from([("main".to_owned(), 63), ("daily".to_owned(), 1)]),
+            checked_at: None,
         };
         write_active_pointer(&root.join("ClamAV"), &active).unwrap();
         active
@@ -704,6 +754,33 @@ mod tests {
         // Removing the generation the files came from must not take them with it.
         fs::remove_dir_all(&active.path).unwrap();
         assert_eq!(fs::read(target.join("main.hsb")).unwrap(), b"main.hsb");
+    }
+
+    #[test]
+    fn an_older_container_never_replaces_a_newer_one() {
+        assert!(installed_is_current(Some(27_800), Some(27_800)));
+        // A lagging or replaying mirror: keep what is installed.
+        assert!(installed_is_current(Some(27_800), Some(27_799)));
+        assert!(!installed_is_current(Some(27_800), Some(27_801)));
+        // Nothing installed, or nothing offered, is never "current".
+        assert!(!installed_is_current(None, Some(1)));
+        assert!(!installed_is_current(Some(1), None));
+    }
+
+    #[test]
+    fn a_confirmed_check_counts_as_recent_contact() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut active = store_with_generation(directory.path(), 1, &["main.info", "daily.info"]);
+        active.activated_at = Utc::now() - chrono::Duration::days(3);
+        assert_eq!(active.last_contact(), active.activated_at);
+        let checked = Utc::now();
+        active.checked_at = Some(checked);
+        assert_eq!(active.last_contact(), checked);
+
+        // The field round-trips through the pointer, and old pointers without it still load.
+        write_active_pointer(&directory.path().join("ClamAV"), &active).unwrap();
+        let reloaded = active_database(directory.path()).unwrap();
+        assert_eq!(reloaded.checked_at, Some(checked));
     }
 
     #[test]
