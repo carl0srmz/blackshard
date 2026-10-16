@@ -1010,7 +1010,7 @@ fn shared_system_amsi() -> Result<Arc<AmsiScanner>, String> {
     static SHARED: OnceLock<Result<Arc<AmsiScanner>, String>> = OnceLock::new();
     SHARED
         .get_or_init(|| {
-            AmsiScanner::new("Blackshard")
+            AmsiScanner::new(crate::ipc::SERVICE_AMSI_APP_NAME)
                 .map(Arc::new)
                 .map_err(|e| e.to_string())
         })

@@ -12,12 +12,21 @@ use std::thread::{self, JoinHandle};
 use uuid::Uuid;
 
 pub const IPC_PROTOCOL_VERSION: u32 = 1;
-pub const AMSI_IPC_PROTOCOL_VERSION: u32 = 1;
+/// Version 2 carries chunks as base64 strings. Version 1 sent them as JSON arrays of numbers,
+/// which inflated a script about 3.5 times and pushed anything over ~1.1 MB past the frame limit,
+/// where the provider treated the failed send as a clean result.
+pub const AMSI_IPC_PROTOCOL_VERSION: u32 = 2;
+/// The application name blackshard's own service passes to `AmsiInitialize`. Content the service
+/// scans through the system AMSI reaches blackshard's provider too; the provider recognises this
+/// name and does not send the content back, which would be a second scan that also convicts
+/// on-disk content on rules meant only for code about to run.
+pub const SERVICE_AMSI_APP_NAME: &str = "Blackshard.Service";
 pub const PIPE_NAME: &str = r"\\.\pipe\BlackshardProtection-v1";
 pub const AMSI_PIPE_NAME: &str = r"\\.\pipe\BlackshardAmsi-v1";
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_AMSI_CONTENT_BYTES: usize = 4 * 1024 * 1024;
-const MAX_AMSI_REQUEST_BYTES: usize = MAX_AMSI_CONTENT_BYTES + 16 * 1024;
+// Base64 grows content by 4/3; the headroom covers chunk quoting and escaped metadata.
+const MAX_AMSI_REQUEST_BYTES: usize = MAX_AMSI_CONTENT_BYTES.div_ceil(3) * 4 + 64 * 1024;
 const MAX_AMSI_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_AMSI_CHUNKS: usize = MAX_AMSI_CONTENT_BYTES / MAX_AMSI_CHUNK_BYTES;
 const MAX_RESPONSE_BYTES: usize = 512 * 1024;
@@ -53,8 +62,29 @@ struct AmsiRequestEnvelope {
     application_name: String,
     content_name: String,
     content_type: String,
+    #[serde(with = "base64_chunks")]
     chunks: Vec<Vec<u8>>,
     finalize: bool,
+}
+
+mod base64_chunks {
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine;
+    use serde::de::Error;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(chunks: &[Vec<u8>], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(chunks.iter().map(|chunk| STANDARD.encode(chunk)))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<Vec<u8>>, D::Error> {
+        Vec::<String>::deserialize(deserializer)?
+            .iter()
+            .map(|chunk| STANDARD.decode(chunk).map_err(D::Error::custom))
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1283,6 +1313,12 @@ mod windows_transport {
         }
         if !request.finalize {
             return Err(invalid("AMSI requests must explicitly finalize the scan"));
+        }
+        if request.application_name == SERVICE_AMSI_APP_NAME {
+            // The provider already drops these; this guards against an older provider build.
+            return Err(invalid(
+                "content blackshard's own service scanned through AMSI is not resubmitted",
+            ));
         }
         if request.chunks.len() > MAX_AMSI_CHUNKS
             || request
@@ -2579,6 +2615,46 @@ mod tests {
         };
         let encoded = serde_json::to_vec(&amsi).unwrap();
         assert!(serde_json::from_slice::<RequestEnvelope>(&encoded).is_err());
+    }
+
+    #[test]
+    fn largest_amsi_request_fits_its_frame_and_round_trips() {
+        // Every byte value, so the encoding cannot lean on a friendly alphabet.
+        let content: Vec<u8> = (0..MAX_AMSI_CONTENT_BYTES).map(|i| i as u8).collect();
+        let request = AmsiRequestEnvelope {
+            version: AMSI_IPC_PROTOCOL_VERSION,
+            request_id: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            application_name: "\"".repeat(MAX_WIRE_TEXT_CHARS),
+            content_name: "\\".repeat(MAX_WIRE_TEXT_CHARS),
+            content_type: "\u{1}".repeat(MAX_WIRE_TEXT_CHARS),
+            chunks: content
+                .chunks(MAX_AMSI_CHUNK_BYTES)
+                .map(<[u8]>::to_vec)
+                .collect(),
+            finalize: true,
+        };
+        let encoded = serde_json::to_vec(&request).unwrap();
+        // A request the client cannot send is a script the provider reports as clean.
+        assert!(
+            encoded.len() <= MAX_AMSI_REQUEST_BYTES,
+            "{} > {MAX_AMSI_REQUEST_BYTES}",
+            encoded.len()
+        );
+        let decoded: AmsiRequestEnvelope = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.chunks.concat(), content);
+    }
+
+    #[test]
+    fn amsi_chunks_that_are_not_base64_are_rejected() {
+        let document = format!(
+            r#"{{"version":{AMSI_IPC_PROTOCOL_VERSION},"request_id":"{}","session_id":"{}","application_name":"a","content_name":"","content_type":"","chunks":[[87,114]],"finalize":true}}"#,
+            Uuid::new_v4(),
+            Uuid::new_v4()
+        );
+        assert!(serde_json::from_str::<AmsiRequestEnvelope>(&document).is_err());
+        let document = document.replace("[[87,114]]", r#"["not base64!"]"#);
+        assert!(serde_json::from_str::<AmsiRequestEnvelope>(&document).is_err());
     }
 
     #[test]
