@@ -148,10 +148,20 @@ impl IClassFactory_Impl for ProviderFactory {
         if lock.as_bool() {
             OUTSTANDING.fetch_add(1, Ordering::SeqCst);
         } else {
-            // An unbalanced unlock from a buggy host must not wrap the count and pin nothing.
-            let _ = OUTSTANDING.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
-                count.checked_sub(1)
-            });
+            // An unbalanced unlock from a buggy host must not wrap the count below zero, which
+            // would keep the DLL loaded for good.
+            let mut count = OUTSTANDING.load(Ordering::SeqCst);
+            while count > 0 {
+                match OUTSTANDING.compare_exchange_weak(
+                    count,
+                    count - 1,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => count = actual,
+                }
+            }
         }
         Ok(())
     }
