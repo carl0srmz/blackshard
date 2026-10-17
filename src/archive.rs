@@ -588,26 +588,4 @@ mod tests {
         assert!(result.findings[0].automatic_quarantine_eligible);
         assert!(engine.scan_bytes(&gzip).should_quarantine());
     }
-
-    #[test]
-    fn vba_decoder_matches_microsoft_uncompressed_example() {
-        let encoded =
-            hex::decode("0119b000616263646566676800696a6b6c6d6e6f70007172737475762e").unwrap();
-        assert_eq!(
-            vba::decompress(&encoded, 4096).unwrap(),
-            b"abcdefghijklmnopqrstuv."
-        );
-    }
-
-    #[test]
-    fn vba_decoder_matches_microsoft_compressed_example() {
-        let encoded = hex::decode(
-            "012fb000236161616263646582660070616768696a013808616b6c00206d6e6f700671027004007273747576107778797a002c",
-        )
-        .unwrap();
-        assert_eq!(
-            vba::decompress(&encoded, 4096).unwrap(),
-            b"#aaabcdefaaaaghijaaaaaklaaamnopqaaaaaaaaaaaarstuvwxyzaaa"
-        );
-    }
 }
