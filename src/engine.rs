@@ -510,7 +510,7 @@ impl ScanEngine {
 
         match content_type {
             ContentType::Pe32 | ContentType::Pe64 | ContentType::PeUnknown => {
-                analyze_pe(bytes, &mut content_type, &mut evidence)
+                analyze_pe(bytes, file_size, &mut content_type, &mut evidence)
             }
             ContentType::Script(_) => {
                 analyze_script(bytes, self.config.max_script_sample_bytes, &mut evidence)
@@ -798,9 +798,32 @@ fn identify_script_language(lower: &str) -> Option<ScriptLanguage> {
     None
 }
 
-fn analyze_pe(bytes: &[u8], content_type: &mut ContentType, evidence: &mut Vec<Evidence>) {
+/// `bytes` is all of the file, or for a file over the read limit only its first part; `file_size`
+/// is the size of the whole file. A large, perfectly valid binary must not look malformed because
+/// its sections or directories run past the part that was read.
+fn analyze_pe(
+    bytes: &[u8],
+    file_size: u64,
+    content_type: &mut ContentType,
+    evidence: &mut Vec<Evidence>,
+) {
+    let truncated = file_size > bytes.len() as u64;
     let pe = match PE::parse(bytes) {
         Ok(pe) => pe,
+        Err(error) if truncated => {
+            push_evidence(
+                evidence,
+                "pe.unparsed_prefix",
+                EvidenceSeverity::Informational,
+                0,
+                format!(
+                    "the first {} bytes of this {file_size}-byte PE could not be parsed on their own: {error}",
+                    bytes.len()
+                ),
+            );
+            *content_type = ContentType::PeUnknown;
+            return;
+        }
         Err(error) => {
             push_evidence(
                 evidence,
@@ -900,6 +923,10 @@ fn analyze_pe(bytes: &[u8], content_type: &mut ContentType, evidence: &mut Vec<E
             continue;
         };
         last_raw_end = last_raw_end.max(raw_end);
+        if raw_end > bytes.len() && raw_end as u64 <= file_size {
+            // In the file, just beyond the part that was read.
+            continue;
+        }
         if raw_end > bytes.len() {
             push_evidence(
                 evidence,
@@ -1569,6 +1596,30 @@ mod tests {
         assert!(!evidence
             .iter()
             .any(|item| item.code == "pe.process_injection_capability"));
+    }
+
+    #[test]
+    fn a_large_pe_is_not_malformed_because_only_its_start_was_read() {
+        let pe = minimal_pe(false, false, ".text");
+        let engine = ScanEngine::default();
+        // The section's raw data ends at 0x1200; only the first 0x800 bytes were read.
+        let report = engine.scan_sample_with_digest(&pe[..0x800], pe.len() as u64, [0; 32]);
+        assert_eq!(report.content_type, ContentType::Pe64);
+        assert!(!report
+            .evidence
+            .iter()
+            .any(|item| item.code == "pe.invalid_section_bounds"));
+        assert_ne!(report.verdict, Verdict::Suspicious);
+
+        // A section that runs past the end of the whole file is still malformed.
+        let mut lying = minimal_pe(false, false, ".text");
+        let section = 0x84 + 20 + 0xf0;
+        lying[section + 16..section + 20].copy_from_slice(&0x4000u32.to_le_bytes());
+        let report = engine.scan_bytes(&lying);
+        assert!(report
+            .evidence
+            .iter()
+            .any(|item| item.code == "pe.invalid_section_bounds"));
     }
 
     #[test]
