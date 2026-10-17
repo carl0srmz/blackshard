@@ -1185,8 +1185,8 @@ mod windows_transport {
             return Ok(component);
         }
 
-        if !crate::trust::verify_file(&canonical_service).is_trusted()
-            || !crate::trust::verify_file(&canonical_client).is_trusted()
+        if !crate::trust::verify_file_cached(&canonical_service).is_trusted()
+            || !crate::trust::verify_file_cached(&canonical_client).is_trusted()
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,

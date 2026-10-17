@@ -1,4 +1,7 @@
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AuthenticodeStatus {
@@ -28,6 +31,48 @@ pub fn verify_current_executable() -> AuthenticodeStatus {
 
 pub fn verify_file(path: &Path) -> AuthenticodeStatus {
     platform::verify_file(path)
+}
+
+/// How long a trusted result is reused for an unchanged file.
+const TRUSTED_CACHE_LIFETIME: Duration = Duration::from_secs(10 * 60);
+const TRUSTED_CACHE_CAPACITY: usize = 64;
+
+type TrustedCache = HashMap<(PathBuf, u64, Option<SystemTime>), (Instant, AuthenticodeStatus)>;
+static TRUSTED: Mutex<Option<TrustedCache>> = Mutex::new(None);
+
+/// [`verify_file`], reusing a trusted result for a file whose size and modification time have not
+/// changed in the last ten minutes.
+///
+/// Every IPC connection checked both the client and the service, and the UI connects four times a
+/// second while a scan runs. Only trusted results are kept, so an unsigned or tampered file is
+/// always checked afresh, and replacing a trusted one changes its size or time.
+pub fn verify_file_cached(path: &Path) -> AuthenticodeStatus {
+    let key = match std::fs::metadata(path) {
+        Ok(metadata) => (path.to_path_buf(), metadata.len(), metadata.modified().ok()),
+        Err(_) => return verify_file(path),
+    };
+    {
+        let cache = TRUSTED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some((checked, status)) = cache.as_ref().and_then(|cache| cache.get(&key)) {
+            if checked.elapsed() < TRUSTED_CACHE_LIFETIME {
+                return status.clone();
+            }
+        }
+    }
+    let status = verify_file(path);
+    if status.is_trusted() {
+        let mut cache = TRUSTED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cache = cache.get_or_insert_with(HashMap::new);
+        if cache.len() >= TRUSTED_CACHE_CAPACITY {
+            cache.clear();
+        }
+        cache.insert(key, (Instant::now(), status.clone()));
+    }
+    status
 }
 
 #[cfg(windows)]
