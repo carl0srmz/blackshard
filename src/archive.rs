@@ -1,6 +1,6 @@
 use crate::detection::{DetectionReport, DetectionVerdict};
 use crate::vba;
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use std::io::{Cursor, Read};
 use std::time::{Duration, Instant};
 use zip::ZipArchive;
@@ -202,7 +202,9 @@ where
     F: FnMut(&[u8]) -> DetectionReport,
 {
     let mut report = ContainerInspection::default();
-    let mut decoder = GzDecoder::new(bytes);
+    // Every member: a gzip file may be several concatenated, and decoding only the first left
+    // whatever followed it unscanned.
+    let mut decoder = MultiGzDecoder::new(bytes);
     let mut contents = Vec::new();
     match decoder
         .by_ref()
@@ -515,6 +517,25 @@ mod tests {
             result.findings
         );
         assert!(engine.scan_bytes(&zip).should_quarantine());
+    }
+
+    #[test]
+    fn every_member_of_a_concatenated_gzip_is_scanned() {
+        let member = |contents: &[u8]| {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(contents).unwrap();
+            encoder.finish().unwrap()
+        };
+        let mut gzip = member(b"an innocent first member\n");
+        gzip.extend(member(crate::self_test::PAYLOAD));
+        let engine = DetectionEngine::builtin().unwrap();
+        let mut scanned = Vec::new();
+        inspect_gzip(&gzip, |bytes| {
+            scanned = bytes.to_vec();
+            engine.scan_leaf_bytes(bytes)
+        });
+        assert!(scanned.starts_with(b"an innocent first member\n"));
+        assert!(scanned.ends_with(crate::self_test::PAYLOAD));
     }
 
     #[test]
