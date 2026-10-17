@@ -2265,6 +2265,7 @@ fn event_kind_label(kind: &EventKind) -> (&'static str, Color32) {
         EventKind::UpdateInstalled => ("update", OK),
         EventKind::UpdateFailed => ("update", ALARM),
         EventKind::Error => ("error", ALARM),
+        EventKind::ActivityCleared => ("cleared", ATTENTION),
     }
 }
 

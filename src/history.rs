@@ -24,6 +24,8 @@ pub enum EventKind {
     UpdateInstalled,
     UpdateFailed,
     Error,
+    /// The history was cleared; the first entry afterwards, naming who cleared it.
+    ActivityCleared,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

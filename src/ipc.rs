@@ -135,7 +135,6 @@ enum RpcCommand {
     ClearActivity,
     RequestUpdate,
     RunSelfTest,
-    CheckForUpdates,
     GetFreshClamStatus,
 }
 
@@ -160,8 +159,6 @@ fn component_allows_command(component: TrustedClientComponent, command: &RpcComm
                 | ListQuarantine
                 | RecentActivity { .. }
                 | RequestUpdate
-                | RunSelfTest
-                | CheckForUpdates
                 | GetFreshClamStatus
         ),
         TrustedClientComponent::ElevatedHelper => true,
@@ -441,6 +438,9 @@ fn requires_elevated_admin(command: &RpcCommand) -> bool {
             | RpcCommand::RestoreQuarantine { .. }
             | RpcCommand::DeleteQuarantine { .. }
             | RpcCommand::ClearActivity
+            // Starts a process as SYSTEM to provoke a block; not something every user should be
+            // able to set off in a loop.
+            | RpcCommand::RunSelfTest
     )
 }
 
@@ -1599,6 +1599,12 @@ mod windows_transport {
                     code: RpcErrorCode::Internal,
                     message: format!("could not clear activity history: {error}"),
                 })?;
+                // Clearing erases the evidence of everything before it, so who did it is the one
+                // thing kept.
+                let mut event =
+                    SecurityEvent::new(EventKind::ActivityCleared, "Activity history cleared");
+                event.details = Some(format!("cleared_by={}", sid_string(&caller.sid)));
+                let _ = resources.history.append(&event);
                 Ok(RpcResponse::Acknowledged {
                     message: "Activity history cleared.".to_owned(),
                 })
@@ -1620,16 +1626,36 @@ mod windows_transport {
                     }),
                 }
             }
-            RpcCommand::RunSelfTest => match crate::self_test::run_self_test() {
-                Ok(message) => Ok(RpcResponse::Acknowledged { message }),
-                Err(error) => Err(RpcFailure {
+            RpcCommand::RunSelfTest => {
+                {
+                    let mut last = LAST_SELF_TEST
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if last.is_some_and(|at| at.elapsed() < SELF_TEST_INTERVAL) {
+                        return Err(RpcFailure {
+                            code: RpcErrorCode::Busy,
+                            message: "a self-test ran moments ago; try again shortly".to_owned(),
+                        });
+                    }
+                    *last = Some(Instant::now());
+                }
+                // The kernel test needs the driver to block an open; without one it would always
+                // fail, so the userland tier checks what it can: that the engine convicts.
+                let engine = resources
+                    .engine
+                    .read()
+                    .map_err(|_| internal("engine lock"))?
+                    .clone();
+                crate::self_test::run_tiered_self_test(
+                    crate::readiness::detect_protection_tier(),
+                    &engine,
+                )
+                .map(|message| RpcResponse::Acknowledged { message })
+                .map_err(|error| RpcFailure {
                     code: RpcErrorCode::Internal,
                     message: error,
-                }),
-            },
-            RpcCommand::CheckForUpdates => Ok(RpcResponse::Acknowledged {
-                message: "Update check queued.".to_owned(),
-            }),
+                })
+            }
             RpcCommand::GetFreshClamStatus => {
                 let data_root = std::env::var_os("PROGRAMDATA")
                     .map(PathBuf::from)
@@ -1743,7 +1769,6 @@ mod windows_transport {
             RpcCommand::ClearActivity => "clearing machine activity",
             RpcCommand::RequestUpdate => "requesting an update",
             RpcCommand::RunSelfTest => "running protection self-test",
-            RpcCommand::CheckForUpdates => "checking for freshclam updates",
             RpcCommand::GetFreshClamStatus => "getting freshclam status",
         }
     }
@@ -1806,10 +1831,59 @@ mod windows_transport {
         let _ = history.append(&event);
     }
 
+    /// One kernel-level self-test at a time, and not more often than this.
+    const SELF_TEST_INTERVAL: Duration = Duration::from_secs(30);
+    static LAST_SELF_TEST: Mutex<Option<Instant>> = Mutex::new(None);
+
+    /// History keeps one denial per interval, with a count of the rest; every denial still goes to
+    /// the service log. A client repeating a refused command used to append an entry each time,
+    /// until real detections rotated out of the history.
+    const DENIAL_HISTORY_INTERVAL: Duration = Duration::from_secs(60);
+    static DENIALS: Mutex<(Option<Instant>, u64)> = Mutex::new((None, 0));
+
     fn append_rpc_access_denied(history: &EventHistory, message: &str) {
+        log::warn!("Local control action denied: {message}");
+        let suppressed = {
+            let mut denials = DENIALS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if denials
+                .0
+                .is_some_and(|last| last.elapsed() < DENIAL_HISTORY_INTERVAL)
+            {
+                denials.1 += 1;
+                return;
+            }
+            denials.0 = Some(Instant::now());
+            std::mem::take(&mut denials.1)
+        };
+        let mut details = bounded_string(message, MAX_WIRE_TEXT_CHARS - 64);
+        if suppressed > 0 {
+            details.push_str(&format!("; {suppressed} more denied since the last entry"));
+        }
         let mut event = SecurityEvent::new(EventKind::Error, "Local control action denied");
-        event.details = Some(bounded_string(message, MAX_WIRE_TEXT_CHARS));
+        event.details = Some(details);
         let _ = history.append(&event);
+    }
+
+    /// A SID in its `S-1-5-21-...` form, for the audit trail.
+    fn sid_string(sid: &[u8]) -> String {
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+
+        if sid.is_empty() {
+            return "<unknown>".to_owned();
+        }
+        let mut text: *mut u16 = null_mut();
+        if unsafe { ConvertSidToStringSidW(sid.as_ptr() as *mut c_void, &mut text) } == 0
+            || text.is_null()
+        {
+            return "<unknown>".to_owned();
+        }
+        let length = (0..).take_while(|&i| unsafe { *text.add(i) } != 0).count();
+        let value = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, length) });
+        unsafe { LocalFree(text as _) };
+        value
     }
 
     #[derive(Debug, Clone, Default)]
@@ -2734,6 +2808,7 @@ mod tests {
             limit: 10,
         }));
         assert!(requires_elevated_admin(&RpcCommand::ClearActivity));
+        assert!(requires_elevated_admin(&RpcCommand::RunSelfTest));
         assert!(!requires_elevated_admin(&RpcCommand::StartScan {
             kind: ScanRequestKind::Quick,
             roots: vec![r"C:\Users\Example\Downloads".to_owned()],
