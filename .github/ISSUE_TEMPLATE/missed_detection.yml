@@ -1,0 +1,32 @@
+name: Missed detection or false positive
+description: Malware blackshard let through, or a clean file it flagged
+labels: [detection]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please never attach a live sample here. A SHA-256 is enough to look it up.
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Which is it?
+      options:
+        - Missed malware
+        - False positive
+    validations:
+      required: true
+  - type: input
+    id: sha256
+    attributes:
+      label: SHA-256 of the file
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: blackshard version
+  - type: textarea
+    id: details
+    attributes:
+      label: Details
+      description: Threat name shown, where the file came from, VirusTotal link if public.

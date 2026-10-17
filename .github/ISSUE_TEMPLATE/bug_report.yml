@@ -1,0 +1,44 @@
+name: Bug report
+description: Something blackshard does wrong, or a crash
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Found a security problem? Please don't file it here; report it privately instead (see SECURITY.md).
+  - type: input
+    id: version
+    attributes:
+      label: blackshard version
+      description: Shown in the UI, or in version.txt next to the binaries.
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      placeholder: Windows 11 23H2, VM
+  - type: dropdown
+    id: tier
+    attributes:
+      label: Installed with the driver?
+      options:
+        - "Yes"
+        - "No (-SkipDriver)"
+        - "Not sure"
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+  - type: textarea
+    id: log
+    attributes:
+      label: Service log
+      description: The end of C:\ProgramData\blackshard\State\logs\service.log (readable as administrator). Remove any paths you'd rather not share.
+      render: text
