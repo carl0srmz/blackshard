@@ -287,20 +287,23 @@ impl RealtimeProtection {
         let worker_stop = Arc::clone(&stop);
         let worker_port = Arc::clone(&port);
         let worker_counters = Arc::clone(&counters);
-        let worker = thread::spawn(move || {
-            connection_supervisor::connection_loop(
-                engine,
-                quarantine,
-                history,
-                settings,
-                events,
-                worker_counters,
-                worker_stop,
-                worker_port,
-                verdict_cache,
-                definition_generation,
-            )
-        });
+        let worker = thread::Builder::new()
+            .name("realtime-connection".to_owned())
+            .spawn(move || {
+                connection_supervisor::connection_loop(
+                    engine,
+                    quarantine,
+                    history,
+                    settings,
+                    events,
+                    worker_counters,
+                    worker_stop,
+                    worker_port,
+                    verdict_cache,
+                    definition_generation,
+                )
+            })
+            .expect("failed to spawn the real-time connection thread");
 
         Self {
             stop,

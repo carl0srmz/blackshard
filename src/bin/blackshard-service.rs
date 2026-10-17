@@ -390,7 +390,12 @@ fn driver_change_exit_code(install: bool) -> i32 {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    if requested_mode().as_deref() == Some(SERVICE_ARGUMENT) {
+        // Started by the service control manager: there is no console, so stderr goes nowhere.
+        service_log::init(service_log::default_path())?;
+    } else {
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    }
 
     if let Some(exit_code) = self_test_probe_exit_code() {
         std::process::exit(exit_code);

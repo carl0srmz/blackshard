@@ -405,10 +405,10 @@ impl QuarantineStore {
                     records.push(record)
                 }
                 Err(error) => {
-                    eprintln!("blackshard ignored corrupt quarantine metadata {path:?}: {error}");
+                    log::warn!("Ignored corrupt quarantine metadata {path:?}: {error}");
                 }
                 Ok(_) => {
-                    eprintln!("blackshard ignored mismatched quarantine metadata {path:?}");
+                    log::warn!("Ignored mismatched quarantine metadata {path:?}");
                 }
             }
         }

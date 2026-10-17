@@ -22,6 +22,7 @@ pub mod rules;
 pub mod scan_manager;
 pub mod self_test;
 pub mod service;
+pub mod service_log;
 pub mod shards;
 pub mod similarity;
 pub mod trust;

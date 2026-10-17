@@ -173,7 +173,7 @@ pub fn connection_loop(
         let (sender, receiver) = mpsc::sync_channel::<WorkItem>(worker_count * 16);
         let receiver = Arc::new(Mutex::new(receiver));
         let mut scan_workers = Vec::with_capacity(worker_count);
-        for _ in 0..worker_count {
+        for index in 0..worker_count {
             let receiver = Arc::clone(&receiver);
             let engine = Arc::clone(&engine);
             let quarantine = Arc::clone(&quarantine);
@@ -186,22 +186,26 @@ pub fn connection_loop(
             let process_trust_cache = Arc::clone(&process_trust_cache);
             let worker_verdict_cache = Arc::clone(&verdict_cache);
             let worker_definition_generation = Arc::clone(&definition_generation);
-            scan_workers.push(thread::spawn(move || {
-                realtime_worker(
-                    receiver,
-                    engine,
-                    quarantine,
-                    history,
-                    settings,
-                    events,
-                    counters,
-                    worker_stop,
-                    ransomware_monitor,
-                    process_trust_cache,
-                    worker_verdict_cache,
-                    worker_definition_generation,
-                )
-            }));
+            // Named, so a panic in the service log says which thread it took down.
+            let spawned = thread::Builder::new()
+                .name(format!("realtime-worker-{index}"))
+                .spawn(move || {
+                    realtime_worker(
+                        receiver,
+                        engine,
+                        quarantine,
+                        history,
+                        settings,
+                        events,
+                        counters,
+                        worker_stop,
+                        ransomware_monitor,
+                        process_trust_cache,
+                        worker_verdict_cache,
+                        worker_definition_generation,
+                    )
+                });
+            scan_workers.push(spawned.expect("failed to spawn a real-time worker thread"));
         }
         let disconnect_reason = loop {
             if stop.load(Ordering::Acquire) {
