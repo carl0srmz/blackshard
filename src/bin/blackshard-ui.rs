@@ -1,3 +1,7 @@
+// A GUI program: started from the Start menu it used to open a console window beside itself.
+// Tests keep the console subsystem so their output is visible.
+#![cfg_attr(not(test), windows_subsystem = "windows")]
+
 use blackshard::*;
 
 use blackshard::ipc::IpcClient;
@@ -634,6 +638,16 @@ fn run_ui() -> Result<(), Box<dyn Error>> {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    if matches!(
+        std::env::args().nth(1).as_deref(),
+        Some(
+            VALIDATE_RELEASE_CONFIGURATION_ARGUMENT
+                | VERIFY_DEFINITION_UPDATE_ARGUMENT
+                | EVALUATE_CORPUS_ARGUMENT
+        )
+    ) {
+        attach_parent_console();
+    }
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     if let Some(exit_code) = self_test_probe_exit_code() {
@@ -651,7 +665,45 @@ fn main() -> Result<(), Box<dyn Error>> {
     if let Some(exit_code) = corpus_evaluation_exit_code() {
         std::process::exit(exit_code);
     }
-    run_ui()
+    run_ui().inspect_err(|error| show_startup_error(&error.to_string()))
+}
+
+/// The command-line modes write to the terminal they were started from; a GUI program has no
+/// console of its own.
+#[cfg(windows)]
+fn attach_parent_console() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn AttachConsole(process_id: u32) -> i32;
+    }
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+    // Fails harmlessly when there is no parent console, as when started from Explorer.
+    unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+}
+
+#[cfg(not(windows))]
+fn attach_parent_console() {}
+
+/// Without a console, a window that fails to open (no usable graphics adapter, say) would leave
+/// nothing behind at all.
+#[cfg(windows)]
+fn show_startup_error(message: &str) {
+    #[link(name = "user32")]
+    extern "system" {
+        fn MessageBoxW(window: isize, text: *const u16, caption: *const u16, kind: u32) -> i32;
+    }
+    const MB_OK_ICONERROR: u32 = 0x0000_0010;
+    let wide = |text: &str| text.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    let text = wide(&format!(
+        "blackshard could not open its window.\n\n{message}"
+    ));
+    let caption = wide("blackshard");
+    unsafe { MessageBoxW(0, text.as_ptr(), caption.as_ptr(), MB_OK_ICONERROR) };
+}
+
+#[cfg(not(windows))]
+fn show_startup_error(message: &str) {
+    eprintln!("blackshard could not open its window: {message}");
 }
 
 #[cfg(test)]
