@@ -915,6 +915,7 @@ mod windows_http {
     const WINHTTP_OPTION_MAX_RESPONSE_HEADER_SIZE: u32 = 91;
     const WINHTTP_ENABLE_SSL_REVOCATION: u32 = 1;
     const WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2: u32 = 0x0000_0800;
+    const WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3: u32 = 0x0000_2000;
     const WINHTTP_OPTION_REDIRECT_POLICY_NEVER: u32 = 0;
     const MAX_RESPONSE_HEADER_BYTES: u32 = 64 * 1024;
     const WINHTTP_QUERY_STATUS_CODE: u32 = 19;
@@ -1040,15 +1041,18 @@ mod windows_http {
             return Err(last_http_error("timeout configuration"));
         }
 
-        let mut secure_protocols = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
-        if unsafe {
+        // TLS 1.2 or 1.3, never older. Windows 10 builds whose WinHTTP predates TLS 1.3 reject the
+        // flag outright, so those fall back to 1.2 alone rather than failing every update.
+        let set_protocols = |mut protocols: u32| unsafe {
             WinHttpSetOption(
                 session.0,
                 WINHTTP_OPTION_SECURE_PROTOCOLS,
-                (&mut secure_protocols as *mut u32).cast(),
+                (&mut protocols as *mut u32).cast(),
                 std::mem::size_of::<u32>() as u32,
-            )
-        } == 0
+            ) != 0
+        };
+        if !set_protocols(WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3)
+            && !set_protocols(WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2)
         {
             return Err(last_http_error("TLS policy configuration"));
         }
