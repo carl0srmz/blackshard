@@ -2,6 +2,10 @@
 name = "blackshard-amsi"
 version = "0.1.0"
 edition = "2021"
+description = "blackshard's AMSI provider, loaded into script hosts"
+license-file = "../LICENSE"
+repository = "https://github.com/carlosrmz009/blackshard"
+publish = false
 
 [lib]
 crate-type = ["cdylib"]

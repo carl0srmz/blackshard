@@ -33,6 +33,67 @@ open-source adaptive antivirus agent
 blackshard is currently in really early stages of development, so no stable download is offered. If you're really brave, though, you can try compiling your own binaries, or grab `blackshard-setup.exe` from the [testing candidate](https://github.com/carlosrmz009/blackshard/releases/tag/veryveryunstable) release, rebuilt from every commit to main (NOT RECOMMENDED, NOT SIGNED AND UNSTABLE! try it in a VM).
 
 
+## Architecture
+
+```
+            kernel                              user mode
+ ┌─────────────────────────┐   filter port   ┌──────────────────────────────┐
+ │ blackshard.sys          │ ──────────────► │ blackshard-service (SYSTEM)  │
+ │ minifilter: opens,      │ ◄────────────── │ detection engine: hashes,    │
+ │ image loads, writes,    │  allow / block  │ ClamAV databases, YARA-X,    │
+ │ renames                 │                 │ similarity, learned shards   │
+ └─────────────────────────┘                 │ quarantine, history, updates │
+                                             └──────────────▲───────────────┘
+ ┌─────────────────────────┐   AMSI pipe                    │ control pipe
+ │ blackshard-amsi.dll     │ ───────────────────────────────┤
+ │ inside PowerShell,      │                                │
+ │ Office, and other hosts │                 ┌──────────────┴───────────────┐
+ └─────────────────────────┘                 │ blackshard-ui (the user)     │
+                                             └──────────────────────────────┘
+```
+
+- **the driver** sees every file a program opens, every image it maps, and writes and renames in
+  user folders, and waits for the service's verdict before letting the operation through.
+- **the service** does all the scanning, quarantines what it convicts, keeps the activity history,
+  and downloads signed definition updates. Settings and history live in
+  `ProgramData\blackshard\State`, which only administrators can read; the log is in
+  `State\logs\service.log`.
+- **the AMSI provider** hands scripts to the service right before they run, after the host has
+  deobfuscated them.
+- **the UI** talks to the service over a local pipe. The service checks that it is the genuine
+  signed binary from the install folder, and changing settings needs an elevated helper.
+
+Without the driver (`install.ps1 -SkipDriver`), real-time coverage comes from AMSI alone.
+
+
+## Building from source
+
+you'll need Windows 10/11 x64 with:
+
+- **Visual Studio 2022 Build Tools** with the C++ workload. The driver also needs the **Windows
+  Driver Kit**; if it isn't installed, `build-driver.ps1` downloads a pinned, hash-checked WDK
+  package instead.
+- **Rust** through [rustup](https://rustup.rs). The exact release, components and targets are
+  pinned in `rust-toolchain.toml`, so `rustup toolchain install` in the repository sets
+  everything up.
+
+```powershell
+.\deploy.ps1     # driver, service, UI and both AMSI providers, collected into dist\
+cargo test --workspace --all-targets
+```
+
+`installer\build-development-vm-installer.ps1` wraps `dist\` into the single-file setup used for
+the testing builds; it needs the .NET Framework C# compiler that ships with Windows.
+
+the driver is test-signed, so installing it needs test-signing mode (`enable-test-signing.ps1`)
+and Secure Boot off. please only do that in a VM.
+
+
+## Security
+
+found a vulnerability? please read [SECURITY.md](SECURITY.md) and report it privately.
+
+
 ## FAQ
 
 ### What is blackshard?
