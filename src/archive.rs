@@ -46,7 +46,13 @@ pub struct ContainerInspection {
     pub executable_attachments: usize,
     pub external_relationships: usize,
     pub rejected_paths: usize,
+    /// Structure typical of a decompression bomb: an extreme compression ratio, or archives
+    /// nested past `MAX_ARCHIVE_DEPTH`. Raises suspicion on its own.
     pub limit_triggered: bool,
+    /// Not everything was inspected: too many entries, an entry or the total too large, or the
+    /// time budget spent. Ordinary large archives end up here, so it raises no suspicion; the
+    /// result is reported as incomplete instead and is not cached as a clean verdict.
+    pub incomplete: bool,
     pub malformed: bool,
     pub findings: Vec<EmbeddedFinding>,
 }
@@ -123,18 +129,18 @@ where
         })
         .collect::<Vec<_>>();
     if entries.len() > MAX_ARCHIVE_ENTRIES {
-        report.limit_triggered = true;
+        report.incomplete = true;
     }
     let started = Instant::now();
     for (path, size, name) in entries.into_iter().take(MAX_ARCHIVE_ENTRIES) {
         if started.elapsed() > MAX_INSPECTION_TIME {
-            report.limit_triggered = true;
+            report.incomplete = true;
             break;
         }
         report.scanned_entries += 1;
         if size > MAX_ENTRY_BYTES || report.expanded_bytes.saturating_add(size) > max_expanded_bytes
         {
-            report.limit_triggered = true;
+            report.incomplete = true;
             continue;
         }
         let path_text = path.to_string_lossy().replace('\\', "/");
@@ -213,7 +219,7 @@ where
     {
         Ok(_) if contents.len() as u64 <= MAX_ENTRY_BYTES => {}
         Ok(_) => {
-            report.limit_triggered = true;
+            report.incomplete = true;
             return report;
         }
         Err(_) => {
@@ -263,8 +269,12 @@ fn walk_zip<F>(
 ) where
     F: FnMut(&[u8]) -> DetectionReport,
 {
-    if depth > MAX_ARCHIVE_DEPTH || state.started.elapsed() > MAX_INSPECTION_TIME {
+    if depth > MAX_ARCHIVE_DEPTH {
         state.report.limit_triggered = true;
+        return;
+    }
+    if state.started.elapsed() > MAX_INSPECTION_TIME {
+        state.report.incomplete = true;
         return;
     }
     let mut archive = match ZipArchive::new(Cursor::new(bytes)) {
@@ -275,14 +285,14 @@ fn walk_zip<F>(
         }
     };
     if archive.len() > MAX_ARCHIVE_ENTRIES.saturating_sub(state.report.scanned_entries) {
-        state.report.limit_triggered = true;
+        state.report.incomplete = true;
     }
 
     for index in 0..archive.len() {
         if state.report.scanned_entries >= MAX_ARCHIVE_ENTRIES
             || state.started.elapsed() > MAX_INSPECTION_TIME
         {
-            state.report.limit_triggered = true;
+            state.report.incomplete = true;
             break;
         }
         let mut entry = match archive.by_index(index) {
@@ -320,11 +330,14 @@ fn walk_zip<F>(
         let compressed = entry.compressed_size();
         let ratio_exceeded = expanded > 1024 * 1024
             && (compressed == 0 || expanded / compressed.max(1) > MAX_COMPRESSION_RATIO);
+        if ratio_exceeded {
+            state.report.limit_triggered = true;
+            continue;
+        }
         if expanded > MAX_ENTRY_BYTES
             || state.report.expanded_bytes.saturating_add(expanded) > MAX_TOTAL_EXPANDED_BYTES
-            || ratio_exceeded
         {
-            state.report.limit_triggered = true;
+            state.report.incomplete = true;
             continue;
         }
 
@@ -360,7 +373,7 @@ fn walk_zip<F>(
         } else if contents.starts_with(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1") {
             let remaining = MAX_TOTAL_EXPANDED_BYTES.saturating_sub(state.report.expanded_bytes);
             if remaining == 0 {
-                state.report.limit_triggered = true;
+                state.report.incomplete = true;
             } else {
                 let nested = inspect_ole_with_limit(&contents, scan_leaf, remaining);
                 merge_nested_inspection(&full_name, depth, nested, &mut state.report);
@@ -391,6 +404,7 @@ fn merge_nested_inspection(
         .saturating_add(nested.external_relationships);
     report.rejected_paths = report.rejected_paths.saturating_add(nested.rejected_paths);
     report.limit_triggered |= nested.limit_triggered;
+    report.incomplete |= nested.incomplete;
     report.malformed |= nested.malformed;
     for mut finding in nested.findings {
         if report.findings.len() >= MAX_FINDINGS {
@@ -467,6 +481,31 @@ mod tests {
                 .as_ref()
                 .map(|inspection| inspection.findings.len()),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn a_large_ordinary_archive_is_incomplete_not_suspicious() {
+        let names: Vec<String> = (0..MAX_ARCHIVE_ENTRIES + 10)
+            .map(|index| format!("src/file{index}.txt"))
+            .collect();
+        let entries: Vec<(&str, &[u8])> = names
+            .iter()
+            .map(|name| (name.as_str(), b"plain text".as_slice()))
+            .collect();
+        let zip = make_zip(&entries);
+        let engine = DetectionEngine::builtin().unwrap();
+
+        let result = inspect_zip(&zip, |bytes| engine.scan_leaf_bytes(bytes));
+        assert!(result.incomplete);
+        assert!(!result.limit_triggered);
+        assert_eq!(result.structural_risk_score(), 0);
+
+        let report = engine.scan_bytes(&zip);
+        assert_eq!(report.verdict, DetectionVerdict::Clean);
+        assert_eq!(
+            report.analysis_completeness,
+            crate::engine::AnalysisCompleteness::ResourceLimitReached
         );
     }
 

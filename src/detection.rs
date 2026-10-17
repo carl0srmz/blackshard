@@ -557,6 +557,13 @@ impl DetectionEngine {
                 "Office.MacroWithExternalContent".to_owned()
             });
         }
+        if inspection.incomplete
+            && report.analysis_completeness == crate::engine::AnalysisCompleteness::Complete
+        {
+            // Part of the container went unread, so a clean result says less than it seems to.
+            report.analysis_completeness =
+                crate::engine::AnalysisCompleteness::ResourceLimitReached;
+        }
         report.container_inspection = Some(inspection);
         report.elapsed = started.elapsed();
         report
