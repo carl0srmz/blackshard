@@ -65,11 +65,10 @@ impl EventHistory {
         }
     }
 
+    /// In the private `State` folder: it holds full paths from every profile on the machine.
+    /// Clients read it through the service, which trims what a standard user sees.
     pub fn default_for_machine() -> Self {
-        let base = std::env::var_os("PROGRAMDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
-        Self::new(base.join("blackshard").join("history.jsonl"))
+        Self::new(crate::paths::state_dir().join("history.jsonl"))
     }
 
     pub fn append(&self, event: &SecurityEvent) -> io::Result<()> {

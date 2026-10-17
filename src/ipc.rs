@@ -36,6 +36,8 @@ const MAX_ACTIVITY_RESULTS: usize = 200;
 const MAX_SCAN_FINDINGS: usize = 128;
 const MAX_WIRE_PATH_CHARS: usize = 768;
 const MAX_WIRE_TEXT_CHARS: usize = 512;
+/// Written into a detection's details when the driver accepted a block; see `sanitize_event`.
+pub const BLOCK_ACCEPTED_TOKEN: &str = "block_reply_accepted=true";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -163,8 +165,9 @@ fn component_allows_command(component: TrustedClientComponent, command: &RpcComm
                 | GetFreshClamStatus
         ),
         TrustedClientComponent::ElevatedHelper => true,
+        // GetSettings for `notify_on_detection`; the handler clears the exclusions it returns.
         TrustedClientComponent::NotificationAgent => {
-            matches!(command, Ping | RecentActivity { .. })
+            matches!(command, Ping | GetSettings | RecentActivity { .. })
         }
         TrustedClientComponent::AmsiHost => false,
         TrustedClientComponent::Unknown => false,
@@ -1407,13 +1410,16 @@ mod windows_transport {
         match command {
             RpcCommand::Ping => Ok(RpcResponse::Pong),
             RpcCommand::GetSettings => {
-                let settings = resources
+                let mut settings = resources
                     .settings
                     .read()
-                    .map_err(|_| internal("settings lock"))?;
-                Ok(RpcResponse::Settings {
-                    settings: settings.clone(),
-                })
+                    .map_err(|_| internal("settings lock"))?
+                    .clone();
+                if caller.component == TrustedClientComponent::NotificationAgent {
+                    // It runs in every session and only needs to know whether to show toasts.
+                    settings.exclusions.clear();
+                }
+                Ok(RpcResponse::Settings { settings })
             }
             RpcCommand::SaveSettings { settings } => {
                 settings
@@ -1693,9 +1699,11 @@ mod windows_transport {
                 )));
             }
             let path = PathBuf::from(root);
+            // The existence check runs as SYSTEM, so naming the path in the error, or telling
+            // "missing" apart from anything else, would let a standard user probe other profiles.
             if !path.is_absolute() || !path.exists() {
                 return Err(invalid(format!(
-                    "{label} scan root is not an existing absolute path: {root}"
+                    "a {label} scan root is not an existing absolute path"
                 )));
             }
             paths.push(path);
@@ -1752,13 +1760,18 @@ mod windows_transport {
             }
         });
         event.threat_name = event.threat_name.map(|value| bounded_string(value, 128));
-        event.details = include_sensitive_paths
-            .then(|| {
-                event
-                    .details
-                    .map(|value| bounded_string(value, MAX_WIRE_TEXT_CHARS))
-            })
-            .flatten();
+        event.details = if include_sensitive_paths {
+            event
+                .details
+                .map(|value| bounded_string(value, MAX_WIRE_TEXT_CHARS))
+        } else {
+            // Details carry process IDs and paths. The one fact a standard user's session needs
+            // from them is whether a launch was blocked, which decides the notification.
+            event
+                .details
+                .filter(|details| details.contains(BLOCK_ACCEPTED_TOKEN))
+                .map(|_| BLOCK_ACCEPTED_TOKEN.to_owned())
+        };
         event
     }
 
@@ -2396,6 +2409,29 @@ mod windows_transport {
         use crate::realtime::new_shared_detection_engine;
         use std::sync::Barrier;
 
+        #[test]
+        fn a_standard_user_sees_file_names_and_whether_a_launch_was_blocked() {
+            let mut event = SecurityEvent::new(EventKind::Detection, "Real-time block");
+            event.path = Some(PathBuf::from(r"C:\Users\Other\Downloads\payload.exe"));
+            event.details = Some(format!(
+                "{BLOCK_ACCEPTED_TOKEN}; pid=4242; parent=C:\\x.exe"
+            ));
+
+            let trimmed = sanitize_event(event.clone(), false);
+            assert_eq!(trimmed.path, Some(PathBuf::from("payload.exe")));
+            assert_eq!(trimmed.details.as_deref(), Some(BLOCK_ACCEPTED_TOKEN));
+
+            event.details = Some("block_reply_accepted=false; pid=4242".to_owned());
+            assert_eq!(sanitize_event(event.clone(), false).details, None);
+
+            let full = sanitize_event(event, true);
+            assert_eq!(
+                full.path,
+                Some(PathBuf::from(r"C:\Users\Other\Downloads\payload.exe"))
+            );
+            assert!(full.details.unwrap().contains("pid=4242"));
+        }
+
         /// Starts a real server on the machine-wide pipe names, or returns `None` when an
         /// installed service already owns them.
         fn start_test_server(root: &Path) -> Option<RpcServer> {
@@ -2727,6 +2763,14 @@ mod tests {
         assert!(component_allows_command(
             TrustedClientComponent::NotificationAgent,
             &read_activity
+        ));
+        assert!(component_allows_command(
+            TrustedClientComponent::NotificationAgent,
+            &RpcCommand::GetSettings
+        ));
+        assert!(!component_allows_command(
+            TrustedClientComponent::NotificationAgent,
+            &save
         ));
         assert!(!component_allows_command(
             TrustedClientComponent::NotificationAgent,

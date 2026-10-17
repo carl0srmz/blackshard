@@ -1,6 +1,6 @@
 use crate::atomic_file;
-use crate::config::Settings;
-use crate::history::{EventHistory, EventKind, SecurityEvent};
+use crate::history::{EventKind, SecurityEvent};
+use crate::ipc::BLOCK_ACCEPTED_TOKEN;
 use crate::notifications::{notify_blocked, notify_detection};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -12,6 +12,8 @@ use std::thread;
 use std::time::Duration;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// The most events the service returns per request (`MAX_ACTIVITY_RESULTS`).
+const EVENTS_PER_POLL: usize = 200;
 const CURSOR_SCHEMA_VERSION: u32 = 1;
 /// One toast per file in this window: a blocked launch is followed by its quarantine.
 const SAME_PATH_QUIET_SECONDS: i64 = 30;
@@ -25,7 +27,6 @@ struct NotificationCursor {
 
 pub fn run() -> Result<(), String> {
     let _single_instance = SingleInstance::acquire()?;
-    let history = EventHistory::default_for_machine();
     let cursor_path = cursor_path();
     let mut last_seen = load_cursor(&cursor_path).unwrap_or_else(|_| Utc::now());
     save_cursor(&cursor_path, last_seen)
@@ -33,11 +34,11 @@ pub fn run() -> Result<(), String> {
     let mut last_toast_by_path = HashMap::<PathBuf, DateTime<Utc>>::new();
 
     loop {
-        if let Ok(mut events) = history.recent(512) {
+        // Through the service rather than the files: history and settings live in the private
+        // State folder, and this runs as whoever is signed in. A service that is not running
+        // has nothing new to report; the next poll picks up where this one left off.
+        if let Ok((mut events, enabled)) = fetch_from_service() {
             events.sort_by_key(|event| event.timestamp);
-            let enabled = Settings::load(&Settings::default_machine_path())
-                .map(|settings| settings.notify_on_detection)
-                .unwrap_or(true);
             for event in events.into_iter() {
                 if event.timestamp <= last_seen {
                     continue;
@@ -71,6 +72,21 @@ pub fn run() -> Result<(), String> {
     }
 }
 
+/// Recent events, as the service trims them for a standard user (file names, no details beyond
+/// whether a launch was blocked), and whether detection notifications are on.
+#[cfg(windows)]
+fn fetch_from_service() -> Result<(Vec<SecurityEvent>, bool), crate::ipc::RpcFailure> {
+    let client = crate::ipc::IpcClient;
+    let events = client.recent_activity(EVENTS_PER_POLL)?;
+    let enabled = client.get_settings()?.notify_on_detection;
+    Ok((events, enabled))
+}
+
+#[cfg(not(windows))]
+fn fetch_from_service() -> Result<(Vec<SecurityEvent>, bool), String> {
+    Err("the protection service is only reachable on Windows".to_owned())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Toast {
     Removed,
@@ -88,7 +104,7 @@ fn toast_for(event: &SecurityEvent) -> Option<Toast> {
             if event
                 .details
                 .as_deref()
-                .is_some_and(|details| details.contains("block_reply_accepted=true")) =>
+                .is_some_and(|details| details.contains(BLOCK_ACCEPTED_TOKEN)) =>
         {
             Some(Toast::Blocked)
         }
@@ -194,6 +210,9 @@ mod tests {
         event.details = Some("block_reply_accepted=false; pid=4".to_owned());
         assert_eq!(toast_for(&event), None);
         event.details = Some("block_reply_accepted=true; pid=4".to_owned());
+        assert_eq!(toast_for(&event), Some(Toast::Blocked));
+        // What the service hands a standard user's session after trimming the details.
+        event.details = Some(BLOCK_ACCEPTED_TOKEN.to_owned());
         assert_eq!(toast_for(&event), Some(Toast::Blocked));
         event.kind = EventKind::Quarantined;
         assert_eq!(toast_for(&event), Some(Toast::Removed));

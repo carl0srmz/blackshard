@@ -12,6 +12,7 @@ pub mod history;
 pub mod ipc;
 pub mod notification_agent;
 pub mod notifications;
+pub mod paths;
 #[cfg(windows)]
 pub mod persistence;
 pub mod quarantine;

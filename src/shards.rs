@@ -42,11 +42,7 @@ fn store() -> &'static RwLock<Store> {
 }
 
 pub fn default_machine_path() -> PathBuf {
-    std::env::var_os("PROGRAMDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
-        .join("blackshard")
-        .join("shards.json")
+    crate::paths::state_dir().join("shards.json")
 }
 
 /// Loads the shards persisted at `path` and persists every later one there.

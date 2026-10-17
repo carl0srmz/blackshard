@@ -73,11 +73,9 @@ impl Settings {
         atomic_file::write(path, &bytes)
     }
 
+    /// In the private `State` folder: the exclusions say exactly where blackshard does not look.
     pub fn default_machine_path() -> PathBuf {
-        let base = std::env::var_os("PROGRAMDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
-        base.join("blackshard").join("settings.json")
+        crate::paths::state_dir().join("settings.json")
     }
 
     /// Whether `path` is an exclusion or lies inside one.

@@ -389,6 +389,19 @@ mod windows_service_host {
         report_state(BodyState::StartPending)?;
         log::info!("blackshard service is starting");
 
+        // Earlier builds kept settings, history and shards where every user could read them.
+        match crate::paths::migrate_into_state(
+            &crate::paths::data_root(),
+            &crate::paths::state_dir(),
+            &crate::paths::FILES_MOVED_TO_STATE,
+        ) {
+            Ok(moved) if !moved.is_empty() => {
+                log::info!("Moved {moved:?} into the private State folder")
+            }
+            Ok(_) => {}
+            Err(error) => log::warn!("Could not move data into the private State folder: {error}"),
+        }
+
         let health_path = default_service_health_path();
         let started_at = Utc::now();
         let history = Arc::new(EventHistory::default_for_machine());
