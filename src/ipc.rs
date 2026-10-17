@@ -2214,7 +2214,7 @@ mod windows_transport {
         pub fn snapshot(&self) -> ScanProgressView {
             self.snapshot
                 .lock()
-                .expect("scan progress lock was poisoned")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone()
         }
 

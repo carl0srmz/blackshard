@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 pub const SETTINGS_SCHEMA_VERSION: u32 = 1;
+/// Far more than any real exclusion list; the service reads this file before it has anything else.
+const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -57,10 +59,29 @@ impl Default for Settings {
 
 impl Settings {
     pub fn load(path: &Path) -> io::Result<Self> {
-        if !path.exists() {
-            return Ok(Self::default());
+        // Not following links, and bounded, like every other file the service reads at startup.
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error) => return Err(error),
+        };
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the settings file is not a regular file",
+            ));
         }
-        let bytes = fs::read(path)?;
+        let mut bytes = Vec::new();
+        io::Read::read_to_end(
+            &mut io::Read::take(fs::File::open(path)?, MAX_SETTINGS_BYTES + 1),
+            &mut bytes,
+        )?;
+        if bytes.len() as u64 > MAX_SETTINGS_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the settings file exceeds its size limit",
+            ));
+        }
         let mut settings: Self = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
         settings.validate();
         Ok(settings)
@@ -240,6 +261,26 @@ mod tests {
         let actual = Settings::load(&path).unwrap();
         assert!(!actual.real_time_protection);
         assert_eq!(actual.schema_version, SETTINGS_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn oversized_or_missing_settings_files_are_handled() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("settings.json");
+        assert!(Settings::load(&path).unwrap().real_time_protection);
+
+        fs::write(&path, vec![b' '; MAX_SETTINGS_BYTES as usize + 1]).unwrap();
+        assert_eq!(
+            Settings::load(&path).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert_eq!(
+            Settings::load(&path).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
 
     #[test]

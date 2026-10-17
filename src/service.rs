@@ -603,9 +603,9 @@ mod windows_service_host {
                 let active = match update {
                     Ok(active) => active,
                     Err(error) => {
-                        snapshot.last_error =
-                            Some(format!("ClamAV definition download failed: {error}"));
-                        append_error(&history, snapshot.last_error.as_deref().unwrap());
+                        let message = format!("ClamAV definition download failed: {error}");
+                        append_error(&history, &message);
+                        snapshot.last_error = Some(message);
                         changed = true;
                         continue;
                     }
@@ -620,9 +620,9 @@ mod windows_service_host {
                         changed = true;
                     }
                     Err(error) => {
-                        snapshot.last_error =
-                            Some(format!("FreshClam index activation failed: {error}"));
-                        append_error(&history, snapshot.last_error.as_deref().unwrap());
+                        let message = format!("FreshClam index activation failed: {error}");
+                        append_error(&history, &message);
+                        snapshot.last_error = Some(message);
                         changed = true;
                     }
                 }
@@ -1233,15 +1233,23 @@ mod windows_service_host {
                 SDDL_REVISION_1,
                 &mut descriptor,
                 std::ptr::null_mut(),
-            ) != 0
+            ) == 0
             {
-                let _ = SetKernelObjectSecurity(
-                    GetCurrentProcess(),
-                    DACL_SECURITY_INFORMATION,
-                    descriptor,
+                log::warn!(
+                    "Could not build the service's process DACL: {}",
+                    std::io::Error::last_os_error()
                 );
-                LocalFree(descriptor);
+                return;
+            }
+            let applied =
+                SetKernelObjectSecurity(GetCurrentProcess(), DACL_SECURITY_INFORMATION, descriptor);
+            // Read before LocalFree, which can overwrite the thread's last error.
+            let error = std::io::Error::last_os_error();
+            LocalFree(descriptor);
+            if applied != 0 {
                 log::info!("Applied hardened process DACL self-defense to service");
+            } else {
+                log::warn!("Could not apply the service's process DACL: {error}");
             }
         }
     }

@@ -217,12 +217,18 @@ impl ReadinessMonitor {
             !matches!(new_state, ReadinessState::Ready),
             "Ready must be derived from ProtectionComponents"
         );
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.transition(new_state);
     }
 
     pub fn report_components(&self, components: &ProtectionComponents) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         inner.consecutive_successes = components.consecutive_health_successes;
         inner.consecutive_failures = components.consecutive_health_failures;
         let derived = derive_readiness(components);
@@ -245,7 +251,10 @@ impl ReadinessMonitor {
     }
 
     pub fn diagnostics(&self) -> Diagnostics {
-        let inner = self.inner.lock().unwrap();
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         Diagnostics {
             current_state: inner.current_state.clone(),
             state_entered_at: inner.state_entered_at,

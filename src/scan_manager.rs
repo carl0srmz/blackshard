@@ -141,10 +141,8 @@ impl ScanJob {
     }
 
     pub fn snapshot(&self) -> ScanProgress {
-        self.progress
-            .lock()
-            .expect("scan progress lock was poisoned")
-            .clone()
+        // A panic elsewhere while holding the lock leaves progress that is still worth showing.
+        lock_progress(&self.progress).clone()
     }
 
     pub fn cancel(&self) {
@@ -614,7 +612,9 @@ fn finish_failed(progress: &Arc<Mutex<ScanProgress>>, started: Instant, error: i
 }
 
 fn lock_progress(progress: &Arc<Mutex<ScanProgress>>) -> std::sync::MutexGuard<'_, ScanProgress> {
-    progress.lock().expect("scan progress lock was poisoned")
+    progress
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]
