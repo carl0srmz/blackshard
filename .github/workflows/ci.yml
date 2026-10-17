@@ -482,27 +482,35 @@ jobs:
         with:
           tool: cargo-fuzz
 
-      - name: Fuzz byte scanner
-        id: fuzz_byte_scanner
-        continue-on-error: true
-        shell: cmd
+      # Every target runs even when an earlier one fails, so one report covers them all.
+      - name: Fuzz every target
+        id: fuzz
+        shell: pwsh
         run: |
-          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=x64
-          cargo +nightly fuzz run scan_bytes -- -runs=10000 -max_len=1048576 -timeout=10 -print_final_stats=1
-
-      - name: Fuzz VBA decompressor
-        id: fuzz_vba_decompressor
-        continue-on-error: true
-        shell: cmd
-        run: |
-          call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\Common7\Tools\VsDevCmd.bat" -arch=x64
-          cargo +nightly fuzz run vba_decompress -- -runs=10000 -max_len=1048576 -timeout=10 -print_final_stats=1
+          # cargo-fuzz builds with MSVC's address sanitizer, so it needs the Visual Studio developer
+          # environment. vswhere finds the installation whatever its edition, and the environment
+          # is loaded into this session once instead of being re-entered per target.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          $loader = Join-Path $env:RUNNER_TEMP "vs-environment.cmd"
+          Set-Content -LiteralPath $loader -Encoding ascii -Value @(
+            "@call `"$(Join-Path $vs 'Common7\Tools\VsDevCmd.bat')`" -arch=x64 >nul",
+            "@set"
+          )
+          & cmd.exe /c $loader | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($Matches[1], $Matches[2]) }
+          }
+          $failed = @()
+          foreach ($target in @("scan_bytes", "vba_decompress", "cvd_header", "detection_pipeline")) {
+            cargo +nightly fuzz run $target -- -runs=10000 -max_len=1048576 -timeout=10 -print_final_stats=1
+            if ($LASTEXITCODE -ne 0) { $failed += $target }
+          }
+          "failed=$($failed -join ', ')" >> $env:GITHUB_OUTPUT
+          # The report step below fails the job; the last target's exit code must not decide it here.
+          exit 0
 
       - name: Upload fuzz failure reproducers
-        if: >-
-          always() &&
-          (steps.fuzz_byte_scanner.outcome == 'failure' ||
-          steps.fuzz_vba_decompressor.outcome == 'failure')
+        if: always() && steps.fuzz.outputs.failed != ''
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: fuzz-failure-${{ github.run_id }}-${{ github.run_attempt }}
@@ -511,18 +519,9 @@ jobs:
           retention-days: 30
 
       - name: Report fuzz failure
-        if: >-
-          always() &&
-          (steps.fuzz_byte_scanner.outcome == 'failure' ||
-          steps.fuzz_vba_decompressor.outcome == 'failure')
+        if: always() && steps.fuzz.outputs.failed != ''
         shell: pwsh
+        env:
+          FAILED: ${{ steps.fuzz.outputs.failed }}
         run: |
-          $failedTargets = @()
-          if ("${{ steps.fuzz_byte_scanner.outcome }}" -eq "failure") {
-            $failedTargets += "scan_bytes"
-          }
-          if ("${{ steps.fuzz_vba_decompressor.outcome }}" -eq "failure") {
-            $failedTargets += "vba_decompress"
-          }
-
-          throw "Fuzzing failed for: $($failedTargets -join ', '). Download the fuzz-failure artifact for reproducers."
+          throw "Fuzzing failed for: $env:FAILED. Download the fuzz-failure artifact for reproducers."

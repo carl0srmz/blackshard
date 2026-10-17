@@ -25,4 +25,18 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "cvd_header"
+path = "fuzz_targets/cvd_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "detection_pipeline"
+path = "fuzz_targets/detection_pipeline.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
