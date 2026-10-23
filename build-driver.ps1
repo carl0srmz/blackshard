@@ -132,7 +132,18 @@ $compileArguments = @(
 if ($Analyze) {
     Write-Host "[*] Analyzing blackshard minifilter with WDK $wdkVersion..." -ForegroundColor Cyan
     $analysisArguments = $compileArguments | Where-Object { $_ -ne "/WX" -and $_ -ne "/Fo:$object" }
-    & $compiler @analysisArguments "/analyze" "/analyze:WX-" "/Fo:$object.analysis"
+    $analysisOutput = & $compiler @analysisArguments "/analyze" "/analyze:WX-" "/Fo:$object.analysis" 2>&1 | ForEach-Object { "$_" }
+    $analysisOutput | ForEach-Object { Write-Host $_ }
+    # The WDK's own headers raise a fixed set of warnings; only findings in this driver's source
+    # count. C6320 is the documented way to guard a copy from a caller's buffer with SEH.
+    $findings = @($analysisOutput | Where-Object {
+        $_ -match 'blackshard_driver\.c\(\d+\)\s*: (warning|error) (C\d+)' -and $Matches[2] -ne 'C6320'
+    })
+    if ($findings.Count -gt 0) {
+        Write-Host "[!] $($findings.Count) analyzer finding(s) in the driver source." -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "[+] No analyzer findings in the driver source." -ForegroundColor Green
     exit 0
 }
 
