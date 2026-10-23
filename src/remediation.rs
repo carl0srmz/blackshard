@@ -35,8 +35,10 @@ fn decode_text(bytes: &[u8]) -> String {
 
 fn decode_utf16(bytes: &[u8], unit: fn([u8; 2]) -> u16) -> String {
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|pair| unit([pair[0], pair[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| unit(*pair))
         .collect();
     String::from_utf16_lossy(&units)
 }
