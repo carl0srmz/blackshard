@@ -669,7 +669,7 @@ impl QuarantineStore {
 
 /// A restore folder held open, so it cannot be renamed, deleted or swapped for a junction (nor can
 /// any folder above it) until this is dropped.
-struct PinnedDirectory {
+pub(crate) struct PinnedDirectory {
     #[cfg(windows)]
     _handle: File,
 }
@@ -677,7 +677,7 @@ struct PinnedDirectory {
 /// Opens `directory` following any links, and refuses it unless it resolves to the folder its
 /// path names. A junction, symbolic link or mount point anywhere in the path changes where it
 /// resolves; cloud-file placeholders such as OneDrive folders do not.
-fn pin_restore_directory(directory: &Path) -> io::Result<PinnedDirectory> {
+pub(crate) fn pin_restore_directory(directory: &Path) -> io::Result<PinnedDirectory> {
     let expected = std::path::absolute(directory)?;
     let (pinned, resolved, expected) = open_and_resolve_directory(&expected)?;
     if !same_directory(&resolved, &expected) {

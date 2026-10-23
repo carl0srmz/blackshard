@@ -222,6 +222,7 @@ mod windows_service_host {
     const STOP_WAIT_HINT: Duration = Duration::from_secs(30);
     const MANUAL_UPDATE_COOLDOWN: Duration = Duration::from_secs(5 * 60);
     /// How often an expired bundle is looked at again for a newer one that was installed meanwhile.
+    const VAULT_PURGE_INTERVAL: Duration = Duration::from_secs(10 * 60);
     const EXPIRED_RELOAD_INTERVAL: Duration = Duration::from_secs(10 * 60);
     const REALTIME_EVENT_CHANNEL_CAPACITY: usize = 256;
     const UPDATE_MANIFEST_URL: Option<&str> = option_env!("BLACKSHARD_UPDATE_MANIFEST_URL");
@@ -404,6 +405,12 @@ mod windows_service_host {
             Err(error) => log::warn!("Could not move data into the private State folder: {error}"),
         }
 
+        // The safety copies ransomware rollback depends on. Without them protection still works,
+        // it just cannot undo damage.
+        if let Err(error) = crate::rollback::init(crate::paths::state_dir().join("Rollback")) {
+            log::warn!("Ransomware rollback is unavailable: {error}");
+        }
+
         let health_path = default_service_health_path();
         let started_at = Utc::now();
         let history = Arc::new(EventHistory::default_for_machine());
@@ -549,6 +556,7 @@ mod windows_service_host {
         };
         let mut last_manual_update = None::<Instant>;
         let mut last_expired_reload = None::<Instant>;
+        let mut last_vault_purge = Instant::now();
         let mut expiry_reported = false;
 
         readiness.update_state(crate::readiness::ReadinessState::ConnectingDriver);
@@ -717,6 +725,13 @@ mod windows_service_host {
                             changed = true;
                         }
                     }
+                }
+            }
+
+            if last_vault_purge.elapsed() >= VAULT_PURGE_INTERVAL {
+                last_vault_purge = Instant::now();
+                if let Some(vault) = crate::rollback::global() {
+                    vault.purge_expired();
                 }
             }
 

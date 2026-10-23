@@ -819,6 +819,21 @@ fn handle_protected_modification(
         OPERATION_PROTECTED_METADATA => Some(crate::behavior::FileAction::Rename),
         _ => None,
     };
+    // Save the original before the driver lets the operation through; the notification arrives
+    // ahead of the write, rename or delete. Signed programs are skipped: they edit documents all
+    // day, and a hijacked one is rarer than the cost of copying everything they touch.
+    if process_trust != ProcessTrust::Trusted
+        && action.is_some()
+        && notification.process_id != 0
+        && notification.process_start_key != 0
+    {
+        if let Some(vault) = crate::rollback::global() {
+            vault.preserve(
+                (notification.process_id, notification.process_start_key),
+                path,
+            );
+        }
+    }
     let decision = monitor
         .lock()
         .map(|mut monitor| {
@@ -854,6 +869,10 @@ fn handle_protected_modification(
         let terminated = (notification.process_id != 0)
             .then(|| terminate_ransomware_process(notification.process_id, observed_at))
             .flatten();
+        undo_ransomware_damage(
+            (notification.process_id, notification.process_start_key),
+            history,
+        );
         // Only an unsigned writer is learned. A signed program doing this is far more likely
         // hijacked than malicious itself, and a shard for powershell.exe would break the machine.
         if let (Some(image), ProcessTrust::Untrusted) = (terminated, process_trust) {
@@ -900,6 +919,37 @@ fn handle_protected_modification(
         quarantine: None,
         action_error: None,
     })));
+}
+
+/// Puts back the documents a convicted program changed, from the copies saved before it touched
+/// them. The program has just been terminated, so nothing is writing to them.
+fn undo_ransomware_damage(process: crate::rollback::ProcessKey, history: &EventHistory) {
+    let Some(vault) = crate::rollback::global() else {
+        return;
+    };
+    let summary = vault.restore(process, |folder| {
+        crate::quarantine::pin_restore_directory(folder).map(drop)
+    });
+    if summary.restored + summary.failed == 0 {
+        return;
+    }
+    let mut event = SecurityEvent::new(
+        if summary.failed == 0 {
+            EventKind::Restored
+        } else {
+            EventKind::Error
+        },
+        if summary.failed == 0 {
+            "Ransomware damage undone"
+        } else {
+            "Ransomware damage only partly undone"
+        },
+    );
+    event.details = Some(format!(
+        "pid={}; files_restored={}; files_unchanged={}; files_not_restored={}",
+        process.0, summary.restored, summary.unchanged, summary.failed
+    ));
+    let _ = history.append(&event);
 }
 
 /// Turns a behavioural conviction into a shard, so the program is blocked on sight from now on,
