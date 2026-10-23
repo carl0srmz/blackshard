@@ -25,7 +25,7 @@ $sources = @(
 $extensions = '.exe', '.dll', '.sys', '.ps1', '.psm1', '.vbs', '.js', '.bat', '.cmd'
 foreach ($source in $sources) {
     if (-not (Test-Path -LiteralPath $source.Path)) { continue }
-    $files = Get-ChildItem -LiteralPath $source.Path -File -Recurse:([bool]$source.Recurse) -ErrorAction SilentlyContinue |
+    $files = Get-ChildItem -LiteralPath $source.Path -File -Recurse:($source.ContainsKey('Recurse')) -ErrorAction SilentlyContinue |
         Where-Object { $_.Extension -in $extensions -and $_.Length -lt 64MB } |
         Sort-Object FullName | Select-Object -First $source.Count
     $index = 0
