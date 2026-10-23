@@ -7,8 +7,9 @@
 //! What is understood: target types any, PE, OLE2, ELF and PDF; offsets `*`, absolute, and
 //! `EOF-n`, `EP+n`/`EP-n` and `Sx+n`/`SL+n` (relative to the entry point or a PE section), each
 //! optionally followed by `,shift`; bytes, `??` for any byte, `*` for any run of bytes, and `{n}`, `{n-m}`, `{-m}` and
-//! `{n-}` for a run of bounded length. Anything else (alternatives, nibble wildcards, normalized
-//! text targets) is counted and skipped, never guessed at.
+//! `{n-}` for a run of bounded length. In `.ldb` pieces that are plain byte runs, the modifiers
+//! `i`, `w`, `a` and `f` are understood too. Anything else (alternatives, nibble wildcards,
+//! normalized text targets) is counted and skipped, never guessed at.
 //!
 //! Matching is two stage. Every signature contributes its longest run of fixed bytes to one
 //! Aho-Corasick automaton, which finds candidates in a single pass; only a candidate is checked
@@ -168,6 +169,10 @@ struct Signature {
     /// Set for a sub-signature of a logical signature: which one, and which slot of it. Such a
     /// match only counts toward the logical signature's expression.
     logical: Option<(u32, u16)>,
+    /// ASCII letters match in either case (`::i`).
+    fold: bool,
+    /// The match must not touch a letter or digit on either side (`::f`).
+    fullword: bool,
 }
 
 /// A `.ldb` signature: sub-signatures and the expression over how often each matched.
@@ -194,9 +199,12 @@ pub struct PatternStats {
 pub struct PatternSet {
     signatures: Vec<Signature>,
     logicals: Vec<Logical>,
-    /// Anchors waiting for [`PatternSet::build`].
-    pending: Vec<Vec<u8>>,
-    automaton: Option<AhoCorasick>,
+    /// Finds the anchors of case-sensitive signatures; `plain_ids` maps its patterns back to
+    /// `signatures`. Case-folded signatures have an automaton of their own.
+    plain: Option<AhoCorasick>,
+    plain_ids: Vec<usize>,
+    folded: Option<AhoCorasick>,
+    folded_ids: Vec<usize>,
 }
 
 impl std::fmt::Debug for PatternSet {
@@ -215,8 +223,10 @@ impl Clone for PatternSet {
         let mut clone = Self {
             signatures: self.signatures.clone(),
             logicals: self.logicals.clone(),
-            pending: self.signatures.iter().map(Signature::anchor).collect(),
-            automaton: None,
+            plain: None,
+            plain_ids: Vec::new(),
+            folded: None,
+            folded_ids: Vec::new(),
         };
         clone.build();
         clone
@@ -253,7 +263,6 @@ impl PatternSet {
     pub fn ingest(&mut self, line: &str, stats: &mut PatternStats) -> bool {
         match parse_line(line) {
             Parsed::Kept(signature) => {
-                self.pending.push(signature.anchor());
                 self.signatures.push(signature);
                 stats.loaded += 1;
                 true
@@ -318,16 +327,13 @@ impl PatternSet {
             return Err(Parsed::Unsupported("ldb: pieces and expression disagree"));
         }
 
-        let mut built = Vec::with_capacity(subsignatures);
+        // A piece can stand for several signatures (ascii and wide); they share one slot.
+        let mut built: Vec<Vec<Signature>> = Vec::with_capacity(subsignatures);
         let mut fixed = Vec::with_capacity(subsignatures);
         for field in &fields[3..] {
-            match parse_subsignature(name, target, field.trim()) {
-                Parsed::Kept(signature) => {
-                    fixed.push(fixed_bytes(&signature));
-                    built.push(signature);
-                }
-                other => return Err(other),
-            }
+            let variants = parse_piece(name, target, field.trim())?;
+            fixed.push(variants.first().map_or(0, fixed_bytes_narrow));
+            built.push(variants);
         }
         let needed = expression.required_bytes(&fixed);
         let floor = if matches!(expression, Expr::Seen(_)) {
@@ -340,10 +346,11 @@ impl PatternSet {
         }
 
         let index = self.logicals.len() as u32;
-        for (slot, mut signature) in built.into_iter().enumerate() {
-            signature.logical = Some((index, slot as u16));
-            self.pending.push(signature.anchor());
-            self.signatures.push(signature);
+        for (slot, variants) in built.into_iter().enumerate() {
+            for mut signature in variants {
+                signature.logical = Some((index, slot as u16));
+                self.signatures.push(signature);
+            }
         }
         self.logicals.push(Logical {
             name: name.to_owned(),
@@ -354,17 +361,34 @@ impl PatternSet {
         Ok(())
     }
 
-    /// Builds the automaton once everything is loaded. Idempotent.
+    /// Builds the automata once everything is loaded. Idempotent.
     pub fn build(&mut self) {
-        if self.pending.len() != self.signatures.len() || self.signatures.is_empty() {
-            self.automaton = None;
-            return;
+        let (mut plain, mut folded) = (Vec::new(), Vec::new());
+        self.plain_ids.clear();
+        self.folded_ids.clear();
+        for (index, signature) in self.signatures.iter().enumerate() {
+            if signature.fold {
+                folded.push(signature.anchor());
+                self.folded_ids.push(index);
+            } else {
+                plain.push(signature.anchor());
+                self.plain_ids.push(index);
+            }
         }
-        self.automaton = AhoCorasick::builder()
-            .match_kind(MatchKind::Standard)
-            .kind(Some(AhoCorasickKind::ContiguousNFA))
-            .build(&self.pending)
-            .ok();
+        let build = |anchors: &[Vec<u8>], fold: bool| {
+            (!anchors.is_empty())
+                .then(|| {
+                    AhoCorasick::builder()
+                        .match_kind(MatchKind::Standard)
+                        .kind(Some(AhoCorasickKind::ContiguousNFA))
+                        .ascii_case_insensitive(fold)
+                        .build(anchors)
+                        .ok()
+                })
+                .flatten()
+        };
+        self.plain = build(&plain, false);
+        self.folded = build(&folded, true);
     }
 
     /// The name of the first signature `text` matches.
@@ -373,12 +397,24 @@ impl PatternSet {
     /// signatures anchored to the end of the file cannot be judged, and neither can a logical
     /// signature, whose expression may depend on something not being there.
     pub fn scan(&self, text: &[u8], file_size: u64, truncated: bool) -> Option<&str> {
-        let automaton = self.automaton.as_ref()?;
+        if self.plain.is_none() && self.folded.is_none() {
+            return None;
+        }
         let mut steps = 0usize;
         let mut layout: Option<PeLayout> = None;
         let mut tallies: HashMap<u32, Vec<u32>> = HashMap::new();
-        for found in automaton.find_overlapping_iter(text) {
-            let signature = &self.signatures[found.pattern().as_usize()];
+        let plain = self.plain.iter().flat_map(|automaton| {
+            automaton
+                .find_overlapping_iter(text)
+                .map(|found| (self.plain_ids[found.pattern().as_usize()], found.start()))
+        });
+        let folded = self.folded.iter().flat_map(|automaton| {
+            automaton
+                .find_overlapping_iter(text)
+                .map(|found| (self.folded_ids[found.pattern().as_usize()], found.start()))
+        });
+        for (index, start) in plain.chain(folded) {
+            let signature = &self.signatures[index];
             if !signature.target.applies_to(text) {
                 continue;
             }
@@ -393,7 +429,7 @@ impl PatternSet {
                 truncated,
                 layout,
             };
-            if verify(signature, &context, found.start(), &mut steps) {
+            if verify(signature, &context, start, &mut steps) {
                 let Some((logical, slot)) = signature.logical else {
                     return Some(&signature.name);
                 };
@@ -516,11 +552,26 @@ fn build_signature(
         anchor_part,
         anchor_start,
         logical: None,
+        fold: false,
+        fullword: false,
     })
 }
 
 /// How many pieces a logical signature may have.
 const MAX_LOGICAL_SUBSIGNATURES: usize = 64;
+
+/// Fixed bytes of a piece that may be wide: the zeros between characters say nothing.
+fn fixed_bytes_narrow(signature: &Signature) -> usize {
+    let bytes = fixed_bytes(signature);
+    match signature.parts.first() {
+        Some(Part::Bytes(run))
+            if run.len() >= 2 && run.iter().skip(1).step_by(2).all(|b| *b == Some(0)) =>
+        {
+            bytes / 2
+        }
+        _ => bytes,
+    }
+}
 
 fn fixed_bytes(signature: &Signature) -> usize {
     signature
@@ -565,36 +616,107 @@ fn parse_target_block(text: &str) -> Option<(Target, Option<(u64, u64)>)> {
 
 /// One piece of a logical signature: `hex`, or `offset:hex`. Modifiers (`::i`, `::w`, ...),
 /// regular expressions, macros and alternatives are not modelled.
-fn parse_subsignature(name: &str, target: Target, text: &str) -> Parsed {
+/// One piece of a logical signature: `hex`, `offset:hex`, either followed by `::modifiers`.
+/// Regular expressions and macros are not modelled. The modifiers `i` (either case), `w` (wide,
+/// each byte followed by a zero), `a` (ascii, the default; with `w`, both) and `f` (fullword) are,
+/// but only on a piece that is a plain run of bytes. A wide and ascii piece is two signatures.
+fn parse_piece(name: &str, target: Target, text: &str) -> Result<Vec<Signature>, Parsed> {
     if text.is_empty() {
-        return Parsed::Unsupported("ldb: empty piece");
+        return Err(Parsed::Unsupported("ldb: empty piece"));
     }
     if text.starts_with('/') {
-        return Parsed::Unsupported("ldb piece: regular expression");
-    }
-    if text.contains("::") {
-        return Parsed::Unsupported("ldb piece: modifier (::i, ::w, ::f, ...)");
+        return Err(Parsed::Unsupported("ldb piece: regular expression"));
     }
     if text.contains('$') {
-        return Parsed::Unsupported("ldb piece: macro");
+        return Err(Parsed::Unsupported("ldb piece: macro"));
     }
-    let (offset, hex) = match text.split_once(':') {
+    let (body, modifiers) = match text.split_once("::") {
+        Some((body, modifiers)) => (body, Some(modifiers)),
+        None => (text, None),
+    };
+    let (offset, hex) = match body.split_once(':') {
         Some((offset, hex)) => match parse_offset(offset) {
             Some(offset) => (offset, hex),
-            None => return Parsed::Unsupported("ldb piece: offset form"),
+            None => return Err(Parsed::Unsupported("ldb piece: offset form")),
         },
         None => (
             Offset {
                 base: Base::Anywhere,
                 shift: 0,
             },
-            text,
+            body,
         ),
     };
     if matches!(offset.base, Base::EntryPoint(_) | Base::Section { .. }) && target != Target::Pe {
-        return Parsed::Unsupported("ldb piece: PE offset on a non-PE target");
+        return Err(Parsed::Unsupported(
+            "ldb piece: PE offset on a non-PE target",
+        ));
     }
-    build_signature(name, target, offset, hex, MIN_ANCHOR)
+    let Some(modifiers) = modifiers else {
+        return match build_signature(name, target, offset, hex, MIN_ANCHOR) {
+            Parsed::Kept(signature) => Ok(vec![signature]),
+            other => Err(other),
+        };
+    };
+
+    let (mut fold, mut wide, mut ascii, mut fullword) = (false, false, false, false);
+    for modifier in modifiers.chars() {
+        match modifier {
+            'i' => fold = true,
+            'w' => wide = true,
+            'a' => ascii = true,
+            'f' => fullword = true,
+            _ => {
+                return Err(Parsed::Unsupported(
+                    "ldb piece: modifier other than i, w, a, f",
+                ))
+            }
+        }
+    }
+    let Some(literal) = parse_literal(hex) else {
+        return Err(Parsed::Unsupported(
+            "ldb piece: modifier on a pattern with wildcards",
+        ));
+    };
+    if literal.len() < MIN_ANCHOR {
+        return Err(Parsed::TooWeak);
+    }
+    if wide && fullword {
+        return Err(Parsed::Unsupported("ldb piece: fullword on wide text"));
+    }
+    // `w` alone is wide only; `wa` is both; no `w` is ascii.
+    let mut forms = Vec::new();
+    if !wide || ascii {
+        forms.push(literal.clone());
+    }
+    if wide {
+        forms.push(literal.iter().flat_map(|byte| [*byte, 0]).collect());
+    }
+    Ok(forms
+        .into_iter()
+        .map(|bytes| Signature {
+            name: name.to_owned(),
+            target,
+            offset,
+            parts: vec![Part::Bytes(bytes.into_iter().map(Some).collect())],
+            anchor_part: 0,
+            anchor_start: 0,
+            logical: None,
+            fold,
+            fullword,
+        })
+        .collect())
+}
+
+/// Hex digits only: a plain run of bytes.
+fn parse_literal(hex: &str) -> Option<Vec<u8>> {
+    if hex.is_empty() || !hex.len().is_multiple_of(2) || hex.len() > MAX_SIGNATURE_BYTES * 2 {
+        return None;
+    }
+    hex.as_bytes()
+        .chunks(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
+        .collect()
 }
 
 /// Why `parse_hex` refused `text`, for the report of what to build next.
@@ -748,6 +870,21 @@ fn bytes_match(pattern: &[Option<u8>], text: &[u8]) -> bool {
             .all(|(wanted, actual)| wanted.is_none_or(|wanted| wanted == *actual))
 }
 
+fn bytes_match_folded(pattern: &[Option<u8>], text: &[u8]) -> bool {
+    pattern.len() == text.len()
+        && pattern
+            .iter()
+            .zip(text)
+            .all(|(wanted, actual)| wanted.is_none_or(|wanted| wanted.eq_ignore_ascii_case(actual)))
+}
+
+/// Whether the bytes just outside `start..end` are not letters or digits.
+fn on_word_boundaries(text: &[u8], start: usize, end: usize) -> bool {
+    let before = start.checked_sub(1).and_then(|index| text.get(index));
+    let after = text.get(end);
+    !before.is_some_and(u8::is_ascii_alphanumeric) && !after.is_some_and(u8::is_ascii_alphanumeric)
+}
+
 struct Context<'a> {
     text: &'a [u8],
     file_size: u64,
@@ -775,7 +912,15 @@ fn verify(
         return false;
     };
     let part_end = part_start + anchor_bytes.len();
-    if part_end > text.len() || !bytes_match(anchor_bytes, &text[part_start..part_end]) {
+    if part_end > text.len() {
+        return false;
+    }
+    let anchor_matches = if signature.fold {
+        bytes_match_folded(anchor_bytes, &text[part_start..part_end])
+    } else {
+        bytes_match(anchor_bytes, &text[part_start..part_end])
+    };
+    if !anchor_matches {
         return false;
     }
     let before = &signature.parts[..signature.anchor_part];
@@ -786,6 +931,9 @@ fn verify(
     let Some(end) = match_right(after, text, part_end, steps) else {
         return false;
     };
+    if signature.fullword && !on_word_boundaries(text, start, end) {
+        return false;
+    }
     let offset = signature.offset;
     if offset.base == Base::Anywhere {
         return true;
@@ -1196,5 +1344,71 @@ mod tests {
         );
         // Only the start was read, so the second piece might be in the part not read.
         assert_eq!(set.scan(&text, text.len() as u64 + 100, true), None);
+    }
+
+    #[test]
+    fn case_insensitive_wide_and_fullword_pieces() {
+        // "evilpayload" in hex; the other piece anchors the combination.
+        let evil = "6576696c7061796c6f6164";
+        let (set, stats) = logical_set(&[
+            &format!("Win.Test.Fold;Target:0;0&1;{evil}::i;aabbccddeeff1122"),
+            &format!("Win.Test.Wide;Target:0;0&1;{evil}::w;1122334455667788"),
+            &format!("Win.Test.Both;Target:0;0&1;{evil}::wa;8877665544332211"),
+            &format!("Win.Test.Word;Target:0;0&1;{evil}::f;99aabbccddeeff00"),
+        ]);
+        assert_eq!(stats.loaded, 4);
+
+        let with = |first: &[u8], second: &[u8]| {
+            let mut text = vec![0x20u8; 6];
+            text.extend_from_slice(first);
+            text.extend_from_slice(&[0x20; 4]);
+            text.extend_from_slice(second);
+            text
+        };
+        let wide = |word: &str| word.bytes().flat_map(|byte| [byte, 0]).collect::<Vec<u8>>();
+        let a: &[u8] = &[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x11, 0x22];
+        let b: &[u8] = &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let c: &[u8] = &[0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11];
+        let d: &[u8] = &[0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00];
+
+        // Either case, but ascii only.
+        assert_eq!(scan(&set, &with(b"EvilPayLOAD", a)), Some("Win.Test.Fold"));
+        assert_eq!(scan(&set, &with(&wide("evilpayload"), a)), None);
+        // Wide only: the narrow text is not enough, the wide text is, and case matters.
+        assert_eq!(
+            scan(&set, &with(&wide("evilpayload"), b)),
+            Some("Win.Test.Wide")
+        );
+        assert_eq!(scan(&set, &with(b"evilpayload", b)), None);
+        assert_eq!(scan(&set, &with(&wide("EVILPAYLOAD"), b)), None);
+        // Both forms.
+        assert_eq!(scan(&set, &with(b"evilpayload", c)), Some("Win.Test.Both"));
+        assert_eq!(
+            scan(&set, &with(&wide("evilpayload"), c)),
+            Some("Win.Test.Both")
+        );
+        // Fullword: a letter or digit on either side defeats it.
+        assert_eq!(scan(&set, &with(b"evilpayload", d)), Some("Win.Test.Word"));
+        assert_eq!(scan(&set, &with(b"xevilpayload", d)), None);
+        assert_eq!(scan(&set, &with(b"evilpayload9", d)), None);
+        assert_eq!(
+            scan(&set, &with(b"-evilpayload.", d)),
+            Some("Win.Test.Word")
+        );
+    }
+
+    #[test]
+    fn modifiers_on_anything_but_plain_bytes_are_refused() {
+        for line in [
+            // Wildcards, an unknown modifier, fullword on wide text, a piece too short.
+            "A;Target:0;0&1;aabb??ccddeeff::i;1122334455667788",
+            "A;Target:0;0&1;aabbccddeeff0011::q;1122334455667788",
+            "A;Target:0;0&1;aabbccddeeff0011::wf;1122334455667788",
+            "A;Target:0;0&1;aabb::i;1122334455667788",
+        ] {
+            let (set, stats) = logical_set(&[line]);
+            assert_eq!(stats.loaded, 0, "{line}");
+            assert!(set.is_empty(), "{line}");
+        }
     }
 }
