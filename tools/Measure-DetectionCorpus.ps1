@@ -6,7 +6,9 @@ param(
     [string]$CorpusDirectory,
     [Parameter(Mandatory = $true)]
     [string]$ReportPath,
-    [string]$blackshardPath = (Join-Path $PSScriptRoot '..\target\release\blackshard-service.exe')
+    [string]$blackshardPath = (Join-Path $PSScriptRoot '..\target\release\blackshard-service.exe'),
+    # The unpacked ClamAV databases to evaluate with, on top of the built-in rules.
+    [string]$SignaturesPath
 )
 
 Set-StrictMode -Version Latest
@@ -19,6 +21,9 @@ $corpus = (Resolve-Path -LiteralPath $CorpusDirectory).Path
 $binary = (Resolve-Path -LiteralPath $blackshardPath).Path
 $report = [IO.Path]::GetFullPath($ReportPath)
 $arguments = "--evaluate-corpus `"$corpus`" `"$report`""
+if ($SignaturesPath) {
+    $arguments += " `"$((Resolve-Path -LiteralPath $SignaturesPath).Path)`""
+}
 $process = Start-Process -FilePath $binary -ArgumentList $arguments -PassThru -WindowStyle Hidden
 if (-not $process.WaitForExit(24 * 60 * 60 * 1000)) {
     $process.Kill()

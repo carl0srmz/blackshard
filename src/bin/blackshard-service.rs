@@ -199,18 +199,31 @@ fn corpus_evaluation_exit_code() -> Option<i32> {
     let (Some(root), Some(output)) = (arguments.next(), arguments.next()) else {
         return Some(2);
     };
+    // Optionally the unpacked ClamAV databases to evaluate with, as `--update-definitions` reports.
+    let signatures = arguments.next();
     if arguments.next().is_some() {
         return Some(2);
     }
     Some(
-        match evaluate_corpus(std::path::Path::new(&root), std::path::Path::new(&output)) {
+        match evaluate_corpus(
+            std::path::Path::new(&root),
+            std::path::Path::new(&output),
+            signatures.as_deref().map(std::path::Path::new),
+        ) {
             Ok(()) => 0,
-            Err(_) => 1,
+            Err(error) => {
+                eprintln!("corpus evaluation failed: {error}");
+                1
+            }
         },
     )
 }
 
-fn evaluate_corpus(root: &std::path::Path, output: &std::path::Path) -> Result<(), String> {
+fn evaluate_corpus(
+    root: &std::path::Path,
+    output: &std::path::Path,
+    signatures: Option<&std::path::Path>,
+) -> Result<(), String> {
     const MAX_CORPUS_FILES: usize = 100_000;
     const MAX_CORPUS_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
     let root = fs::canonicalize(root).map_err(|error| error.to_string())?;
@@ -228,7 +241,18 @@ fn evaluate_corpus(root: &std::path::Path, output: &std::path::Path) -> Result<(
         return Err("corpus report must be written outside the corpus root".to_owned());
     }
 
-    let engine = detection::DetectionEngine::builtin()?;
+    let mut engine = detection::DetectionEngine::builtin()?;
+    if let Some(signatures) = signatures {
+        let mut index = clamdb::native_index::NativeIndex::new();
+        let loaded = index
+            .load_from_directory(signatures, clamdb::native_index::LoadOptions::default())
+            .map_err(|error| error.to_string())?;
+        println!(
+            "Evaluating with {} file hashes, {} section hashes and {} body signatures",
+            loaded.file_hashes, loaded.section_hashes, loaded.patterns
+        );
+        engine = engine.with_native_index(index);
+    }
     let wall_started = std::time::Instant::now();
     let mut results = Vec::new();
     let mut total_bytes = 0u64;
@@ -467,6 +491,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "Indexed {} file hashes, {} PE section hashes and {} allowlist entries",
                 stats.file_hashes, stats.section_hashes, stats.allowlist_entries
             );
+            println!(
+                "Indexed {} body and logical signatures; skipped {} that use features not yet modelled or are too weak",
+                stats.patterns, stats.patterns_skipped
+            );
+            println!("Unpacked databases at {}", active.unpacked_path.display());
             if stats.file_hashes == 0 {
                 return Err("the activated generation produced no usable file hashes".into());
             }

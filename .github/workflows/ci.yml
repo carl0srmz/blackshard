@@ -107,34 +107,10 @@ jobs:
       - name: Scan clean Windows files for false positives
         shell: pwsh
         run: |
-          $corpus = Join-Path $env:RUNNER_TEMP 'clean-corpus'
-          New-Item -ItemType Directory -Force -Path $corpus | Out-Null
-          $sources = @(
-            @{ Path = "$env:windir\System32"; Count = 1200 },
-            @{ Path = "$env:windir\SysWOW64"; Count = 400 },
-            @{ Path = "$env:windir\System32\drivers"; Count = 200 },
-            @{ Path = "${env:ProgramFiles}\Git"; Count = 300; Recurse = $true },
-            @{ Path = "${env:ProgramFiles}\PowerShell"; Count = 100; Recurse = $true },
-            @{ Path = "${env:ProgramFiles(x86)}\Microsoft Visual Studio"; Count = 400; Recurse = $true }
-          )
-          foreach ($source in $sources) {
-            if (-not (Test-Path -LiteralPath $source.Path)) { continue }
-            $files = Get-ChildItem -LiteralPath $source.Path -File -Recurse:([bool]$source.Recurse) -ErrorAction SilentlyContinue |
-              Where-Object { $_.Extension -in '.exe', '.dll', '.sys', '.ps1', '.psm1', '.vbs', '.js', '.bat', '.cmd' -and $_.Length -lt 64MB } |
-              Sort-Object FullName | Select-Object -First $source.Count
-            $index = 0
-            foreach ($file in $files) {
-              $name = '{0}-{1:D5}-{2}' -f ($source.Path -replace '[^A-Za-z0-9]', '_'), $index++, $file.Name
-              Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $corpus $name) -ErrorAction SilentlyContinue
-            }
-          }
+          $corpus = .\tools\New-CleanCorpus.ps1 -OutputDirectory (Join-Path $env:RUNNER_TEMP 'clean-corpus')
           $report = Join-Path $env:RUNNER_TEMP 'clean-corpus-report.json'
           .\tools\Measure-DetectionCorpus.ps1 -CorpusDirectory $corpus -ReportPath $report -blackshardPath .\dist\blackshard-service.exe
-          $result = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
-          if ([int]$result.files -lt 500) { throw "The clean corpus is too small to mean anything: $($result.files) files." }
-          $flagged = @($result.results | Where-Object { $_.verdict -in 'suspicious', 'malicious' })
-          $flagged | Select-Object path, verdict, risk_score, threat_name, sha256, reasons | Format-List
-          if ($flagged.Count -gt 0) { throw "$($flagged.Count) clean Windows files were flagged: false positives." }
+          .\tools\Assert-CleanCorpus.ps1 -ReportPath $report
 
       - name: Build the installer
         shell: pwsh
@@ -495,6 +471,23 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "The native definition pipeline failed with exit code $LASTEXITCODE."
           }
+
+      # The same clean files, now against every signature ClamAV publishes that blackshard
+      # understands: this is where a loose signature or a matcher bug would convict clean software.
+      - name: Scan clean Windows files against the live signatures
+        shell: pwsh
+        run: |
+          $data = Join-Path $env:RUNNER_TEMP "definitions"
+          # A second update finds the generation current and reports where it is unpacked.
+          $report = & .\target\release\blackshard-service.exe --update-definitions $data
+          if ($LASTEXITCODE -ne 0) { throw "The definition update failed with exit code $LASTEXITCODE." }
+          $report | Write-Host
+          $unpacked = ($report | Select-String -Pattern '^Unpacked databases at (.+)$' | Select-Object -First 1).Matches.Groups[1].Value
+          if (-not $unpacked) { throw "No unpacked ClamAV databases were found under $data." }
+          $corpus = .\tools\New-CleanCorpus.ps1 -OutputDirectory (Join-Path $env:RUNNER_TEMP 'clean-corpus')
+          $evidence = Join-Path $env:RUNNER_TEMP 'clean-corpus-clamav.json'
+          .\tools\Measure-DetectionCorpus.ps1 -CorpusDirectory $corpus -ReportPath $evidence -SignaturesPath $unpacked
+          .\tools\Assert-CleanCorpus.ps1 -ReportPath $evidence
 
       - name: Confirm no ClamAV runtime was required
         shell: pwsh
