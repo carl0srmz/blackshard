@@ -244,7 +244,11 @@ impl RollbackVault {
         let temporary = parent.join(format!(".blackshard-restore-{}.tmp", entry.id));
         let result = (|| -> io::Result<()> {
             fs::copy(&saved, &temporary)?;
-            File::open(&temporary)?.sync_all()?;
+            // FlushFileBuffers needs a handle opened for writing; a read-only one fails on Windows.
+            OpenOptions::new()
+                .write(true)
+                .open(&temporary)?
+                .sync_all()?;
             // Replaces the damaged file, or creates the file a program deleted or renamed away.
             fs::rename(&temporary, &entry.original)
         })();

@@ -579,7 +579,7 @@ mod tests {
         write(
             directory.path(),
             "main.ndb",
-            "Win.Test.Family:0:*:deadbeef00112233\nUnsupported.Sig:1:EP+0:11223344556677889900",
+            "Win.Test.Family:0:*:deadbeef00112233\nUnsupported.Sig:7:*:11223344556677889900",
         );
         let mut index = NativeIndex::new();
         let stats = index
