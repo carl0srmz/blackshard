@@ -36,6 +36,62 @@ pub fn remove_tasks_and_services_for(target: &Path) -> Vec<String> {
     }
     let mut removed = remove_tasks(&target);
     removed.extend(remove_services(&target));
+    removed.extend(remove_startup_items(&target));
+    removed
+}
+
+const STARTUP_EXTENSIONS: [&str; 6] = ["lnk", "bat", "cmd", "vbs", "url", "js"];
+const MAX_STARTUP_ITEM_BYTES: u64 = 1024 * 1024;
+
+/// Deletes shortcuts and scripts in the all-users and per-user Startup folders that name `target`.
+fn remove_startup_items(target: &str) -> Vec<String> {
+    let mut folders = Vec::new();
+    if let Some(data) = std::env::var_os("ProgramData") {
+        folders.push(PathBuf::from(data).join(r"Microsoft\Windows\Start Menu\Programs\StartUp"));
+    }
+    for sid in subkeys(HKEY_USERS, "") {
+        if sid.ends_with("_Classes") {
+            continue;
+        }
+        if let Some(profile) = profile_path(&sid) {
+            folders.push(
+                PathBuf::from(profile)
+                    .join(r"AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"),
+            );
+        }
+    }
+    let mut removed = Vec::new();
+    for folder in folders {
+        let Ok(entries) = std::fs::read_dir(&folder) else {
+            continue;
+        };
+        for entry in entries.flatten().take(MAX_TASK_FILES) {
+            let path = entry.path();
+            let known = path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    STARTUP_EXTENSIONS
+                        .iter()
+                        .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+                });
+            // A reparse point could aim the delete at a file elsewhere.
+            let plain = entry
+                .metadata()
+                .is_ok_and(|meta| meta.is_file() && meta.len() <= MAX_STARTUP_ITEM_BYTES);
+            if !known || !plain {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            if crate::remediation::item_launches(&bytes, target)
+                && std::fs::remove_file(&path).is_ok()
+            {
+                removed.push(format!("Startup folder: {}", path.display()));
+            }
+        }
+    }
     removed
 }
 

@@ -24,6 +24,27 @@ pub fn task_command_lines(definition: &[u8]) -> Vec<String> {
     lines
 }
 
+/// Whether a startup-folder item (a `.lnk` shortcut, or a `.bat`/`.cmd`/`.vbs`/`.url` script)
+/// names `target`. Shortcuts keep the target as ANSI and as UTF-16, scripts as plain text, so both
+/// encodings are searched, ignoring case. `target` must be a full path with at least a folder.
+pub fn item_launches(item: &[u8], target: &str) -> bool {
+    if target.len() < 4 || !target.contains('\\') {
+        return false;
+    }
+    let ascii = target.to_ascii_lowercase();
+    let wide: Vec<u8> = ascii.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let lowered = item.to_ascii_lowercase();
+    // UTF-16 text has a zero after every ASCII letter, so lowering bytes lowers it as well.
+    contains(&lowered, ascii.as_bytes()) || contains(&lowered, &wide)
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
 fn decode_text(bytes: &[u8]) -> String {
     match bytes {
         [0xFF, 0xFE, rest @ ..] => decode_utf16(rest, u16::from_le_bytes),
@@ -117,6 +138,20 @@ mod tests {
         assert!(task_command_lines(&[0xFF, 0xFE, 0x00]).is_empty());
         assert!(task_command_lines(b"<Exec><Command>unterminated").is_empty());
         assert!(task_command_lines(b"<Exec><Exec><Exec>").is_empty());
+    }
+
+    #[test]
+    fn startup_items_are_matched_in_both_encodings() {
+        let target = r"C:\Users\Alice\AppData\Roaming\evil\Evil.exe";
+        let wide: Vec<u8> = target.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let mut shortcut = b"L\0\0\0junk".to_vec();
+        shortcut.extend_from_slice(&wide);
+        assert!(item_launches(&shortcut, &target.to_lowercase()));
+        let script = format!("@echo off\r\nstart \"\" \"{}\"", target.to_uppercase());
+        assert!(item_launches(script.as_bytes(), target));
+        assert!(!item_launches(b"start notepad.exe", target));
+        assert!(!item_launches(b"anything", "evil"));
+        assert!(!item_launches(b"", target));
     }
 
     #[test]
