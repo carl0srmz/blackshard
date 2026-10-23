@@ -1,6 +1,9 @@
 [CmdletBinding()]
 param(
-    [switch]$NoNuGetFallback
+    [switch]$NoNuGetFallback,
+    # Compile with MSVC code analysis (/analyze) as well, writing findings to the console. It
+    # builds nothing; run it to see what the analyzer reports about the driver.
+    [switch]$Analyze
 )
 
 Set-StrictMode -Version Latest
@@ -125,6 +128,13 @@ $compileArguments = @(
     $source,
     "/Fo:$object"
 )
+
+if ($Analyze) {
+    Write-Host "[*] Analyzing blackshard minifilter with WDK $wdkVersion..." -ForegroundColor Cyan
+    $analysisArguments = $compileArguments | Where-Object { $_ -ne "/WX" -and $_ -ne "/Fo:$object" }
+    & $compiler @analysisArguments "/analyze" "/analyze:WX-" "/Fo:$object.analysis"
+    exit 0
+}
 
 Write-Host "[*] Compiling blackshard minifilter with WDK $wdkVersion..." -ForegroundColor Cyan
 & $compiler @compileArguments

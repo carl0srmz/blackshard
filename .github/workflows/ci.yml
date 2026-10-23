@@ -87,6 +87,13 @@ jobs:
 
       - run: cargo test --workspace --all-targets
 
+      # Informational for now: the analyzer's findings are read from this log, and fixed, before it
+      # is allowed to fail the build.
+      - name: Analyze the driver
+        continue-on-error: true
+        shell: pwsh
+        run: .\build-driver.ps1 -Analyze
+
       - name: Build binaries and driver
         shell: pwsh
         env:

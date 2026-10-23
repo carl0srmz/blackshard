@@ -480,8 +480,15 @@ BlackshardApplyFailurePolicy (
         0,
         0
         );
+    //
+    // A path of MAX_FILE_PATH_LENGTH characters or more cannot be sent to the service, so
+    // nothing could ever scan it; allowing it would let any program hide at a long enough
+    // path. A legitimate image at such a path is essentially nonexistent (the loader and
+    // most tools cannot open one), so an image load there is blocked once the filter is ready.
+    //
     if (phase == BlackshardPhaseReady &&
-        Reason == BlackshardFailureContentRace) {
+        (Reason == BlackshardFailureContentRace ||
+         Reason == BlackshardFailurePathTooLong)) {
         InterlockedIncrement64(&gBlackshardData.RequiredEnforcementBlocks);
         return BlackshardFailureBlock;
     }
