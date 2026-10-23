@@ -5,16 +5,194 @@
 //! either way, so the Run and RunOnce entries that launch it are removed with it: machine-wide,
 //! in the 32-bit view, and in every user hive that is loaded.
 //!
-//! ponytail: Run and RunOnce only. Scheduled tasks, services, Startup-folder shortcuts and WMI
-//! subscriptions are the next places to clean, in roughly that order of how often malware uses
-//! them. Paths written with 8.3 short names are not matched either.
+//! Scheduled tasks and Win32 services that launch the file are removed too. Startup-folder
+//! shortcuts and WMI subscriptions are the next places to clean. Paths written with 8.3 short
+//! names are not matched.
 
-use std::path::Path;
+use std::os::windows::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegDeleteValueW, RegEnumKeyExW, RegEnumValueW, RegGetValueW, RegOpenKeyExW, HKEY,
     HKEY_LOCAL_MACHINE, HKEY_USERS, KEY_ENUMERATE_SUB_KEYS, KEY_QUERY_VALUE, KEY_SET_VALUE,
-    KEY_WOW64_64KEY, REG_EXPAND_SZ, REG_SZ, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
+    KEY_WOW64_64KEY, REG_EXPAND_SZ, REG_SZ, RRF_RT_DWORD, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
 };
+
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// A scheduled task or service of this kind is a program started by Windows: a Win32 service that
+/// runs in its own process or shares one. Kernel drivers (types 1 and 2) are left alone.
+const SERVICE_WIN32_OWN_OR_SHARE: u32 = 0x10 | 0x20;
+const MAX_TASK_FILES: usize = 5_000;
+const MAX_TASK_FILE_BYTES: u64 = 256 * 1024;
+
+/// Removes the scheduled tasks and Win32 services that launch `target`, and describes each one.
+///
+/// Nothing is removed for a file inside the Windows folder: Windows itself registers tasks and
+/// services there, and a quarantined system file is a different problem from a dropped program.
+pub fn remove_tasks_and_services_for(target: &Path) -> Vec<String> {
+    let target = comparable(&target.to_string_lossy());
+    if target.is_empty() || is_under_windows_folder(&target) {
+        return Vec::new();
+    }
+    let mut removed = remove_tasks(&target);
+    removed.extend(remove_services(&target));
+    removed
+}
+
+fn windows_folder() -> PathBuf {
+    std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+}
+
+fn is_under_windows_folder(target: &str) -> bool {
+    let root = comparable(&windows_folder().to_string_lossy());
+    target.starts_with(&format!("{}\\", root.trim_end_matches('\\')))
+}
+
+fn remove_tasks(target: &str) -> Vec<String> {
+    let tasks_folder = windows_folder().join(r"System32\Tasks");
+    let mut found = Vec::new();
+    collect_task_files(&tasks_folder, &tasks_folder, 0, &mut found);
+
+    let schtasks = windows_folder().join(r"System32\schtasks.exe");
+    let mut removed = Vec::new();
+    for (name, definition) in found {
+        let launches_target = crate::remediation::task_command_lines(&definition)
+            .iter()
+            .any(|line| launches(line, None, target));
+        if !launches_target {
+            continue;
+        }
+        let deleted = Command::new(&schtasks)
+            .args(["/Delete", "/TN", &name, "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .is_ok_and(|status| status.success());
+        if deleted {
+            log::warn!("Removed scheduled task {name}");
+            removed.push(format!("scheduled task: {name}"));
+        }
+    }
+    removed
+}
+
+/// Every task definition under `folder` as (task name such as `\Vendor\Task`, file contents).
+fn collect_task_files(
+    root: &Path,
+    folder: &Path,
+    depth: usize,
+    found: &mut Vec<(String, Vec<u8>)>,
+) {
+    if depth > 6 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if found.len() >= MAX_TASK_FILES {
+            return;
+        }
+        let path = entry.path();
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        // Links are skipped: a task definition is a plain file, and following a junction could
+        // lead the walk out of the Tasks folder.
+        if kind.is_symlink() {
+            continue;
+        }
+        if kind.is_dir() {
+            collect_task_files(root, &path, depth + 1, found);
+        } else if kind.is_file()
+            && entry
+                .metadata()
+                .is_ok_and(|metadata| metadata.len() <= MAX_TASK_FILE_BYTES)
+        {
+            if let (Ok(relative), Ok(bytes)) = (path.strip_prefix(root), std::fs::read(&path)) {
+                found.push((format!(r"\{}", relative.display()), bytes));
+            }
+        }
+    }
+}
+
+fn remove_services(target: &str) -> Vec<String> {
+    const SERVICES: &str = r"SYSTEM\CurrentControlSet\Services";
+    let sc = windows_folder().join(r"System32\sc.exe");
+    let mut removed = Vec::new();
+    for service in subkeys(HKEY_LOCAL_MACHINE, SERVICES) {
+        let key = format!(r"{SERVICES}\{service}");
+        let service_type = registry_dword(HKEY_LOCAL_MACHINE, &key, "Type").unwrap_or(0);
+        if service_type & SERVICE_WIN32_OWN_OR_SHARE == 0 {
+            continue;
+        }
+        let Some(image_path) = registry_string(HKEY_LOCAL_MACHINE, &key, "ImagePath") else {
+            continue;
+        };
+        if !launches(&image_path, None, target) {
+            continue;
+        }
+        let run = |action: &str| {
+            Command::new(&sc)
+                .args([action, &service])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .creation_flags(CREATE_NO_WINDOW)
+                .status()
+                .is_ok_and(|status| status.success())
+        };
+        // Stopped first, so the file is no longer held open by the service's process.
+        let _ = run("stop");
+        if run("delete") {
+            log::warn!("Removed service {service}: {image_path}");
+            removed.push(format!("service: {service}"));
+        }
+    }
+    removed
+}
+
+fn registry_string(root: HKEY, path: &str, name: &str) -> Option<String> {
+    let path = wide(path);
+    let name = wide(name);
+    let mut buffer = vec![0u16; 4096];
+    let mut size = (buffer.len() * 2) as u32;
+    let status = unsafe {
+        RegGetValueW(
+            root,
+            path.as_ptr(),
+            name.as_ptr(),
+            RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ,
+            std::ptr::null_mut(),
+            buffer.as_mut_ptr().cast(),
+            &mut size,
+        )
+    };
+    (status == 0).then(|| utf16_bytes(bytemuck_u16(&buffer, size)))
+}
+
+fn registry_dword(root: HKEY, path: &str, name: &str) -> Option<u32> {
+    let path = wide(path);
+    let name = wide(name);
+    let mut value = 0u32;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let status = unsafe {
+        RegGetValueW(
+            root,
+            path.as_ptr(),
+            name.as_ptr(),
+            RRF_RT_DWORD,
+            std::ptr::null_mut(),
+            (&mut value as *mut u32).cast(),
+            &mut size,
+        )
+    };
+    (status == 0).then_some(value)
+}
 
 const RUN_KEYS: [&str; 4] = [
     r"Software\Microsoft\Windows\CurrentVersion\Run",
@@ -262,6 +440,31 @@ mod tests {
             expand("%NOT_A_VARIABLE_42%\\x", None),
             "%NOT_A_VARIABLE_42%\\x"
         );
+    }
+
+    #[test]
+    fn nothing_registered_by_windows_itself_is_touched() {
+        let system = comparable(&windows_folder().join(r"System32\cmd.exe").to_string_lossy());
+        assert!(is_under_windows_folder(&system));
+        assert!(!is_under_windows_folder(&comparable(
+            r"C:\Users\alice\AppData\Roaming\evil.exe"
+        )));
+        // A folder that merely starts with the same letters is not the Windows folder.
+        let lookalike = format!(
+            "{}old\\x.exe",
+            comparable(&windows_folder().to_string_lossy())
+        );
+        assert!(!is_under_windows_folder(&lookalike));
+        assert!(
+            remove_tasks_and_services_for(&windows_folder().join(r"System32\cmd.exe")).is_empty()
+        );
+    }
+
+    #[test]
+    fn an_unrelated_file_matches_no_task_or_service() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("no-such-task-launches-this.exe");
+        assert!(remove_tasks_and_services_for(&target).is_empty());
     }
 
     #[test]

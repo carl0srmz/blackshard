@@ -18,6 +18,7 @@ pub mod persistence;
 pub mod quarantine;
 pub mod readiness;
 pub mod realtime;
+pub mod remediation;
 pub mod rollback;
 pub mod rules;
 pub mod scan_manager;

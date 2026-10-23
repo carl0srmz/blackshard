@@ -375,6 +375,11 @@ impl QuarantineStore {
         {
             record.removed_autostarts =
                 crate::persistence::remove_autostarts_for(&record.original_path);
+            record
+                .removed_autostarts
+                .extend(crate::persistence::remove_tasks_and_services_for(
+                    &record.original_path,
+                ));
         }
         if record.state == IsolationState::Isolated || !record.removed_autostarts.is_empty() {
             self.write_record(&record)?;
