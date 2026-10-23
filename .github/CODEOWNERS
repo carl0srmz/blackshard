@@ -1,13 +1,13 @@
 # Changes here can weaken the machine blackshard runs on, or the pipeline that builds what ships to
 # it, so they always get the maintainer's review.
-/src/driver/                @carlosrmz009
-/src/ipc.rs                 @carlosrmz009
-/src/trust.rs               @carlosrmz009
-/src/quarantine.rs          @carlosrmz009
-/src/updater.rs             @carlosrmz009
-/src/update_client.rs       @carlosrmz009
-/blackshard-amsi/           @carlosrmz009
-/install.ps1                @carlosrmz009
-/installer/                 @carlosrmz009
-/.github/                   @carlosrmz009
-/rust-toolchain.toml        @carlosrmz009
+/src/driver/                @carl0srmz
+/src/ipc.rs                 @carl0srmz
+/src/trust.rs               @carl0srmz
+/src/quarantine.rs          @carl0srmz
+/src/updater.rs             @carl0srmz
+/src/update_client.rs       @carl0srmz
+/blackshard-amsi/           @carl0srmz
+/install.ps1                @carl0srmz
+/installer/                 @carl0srmz
+/.github/                   @carl0srmz
+/rust-toolchain.toml        @carl0srmz

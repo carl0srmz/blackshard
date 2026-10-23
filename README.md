@@ -1,14 +1,14 @@
 
-![Logo](https://github.com/carlosrmz009/blackshard-site/blob/main/assets/logo_horizontal.png?raw=true)
+![Logo](https://github.com/carl0srmz/blackshard-site/blob/main/assets/logo_horizontal.png?raw=true)
 
 open-source adaptive antivirus agent
 
-[![GPLv3 License](https://img.shields.io/badge/License-GPL%20v3-yellow.svg)](https://github.com/carlosrmz009/blackshard/blob/main/LICENSE)
+[![GPLv3 License](https://img.shields.io/badge/License-GPL%20v3-yellow.svg)](https://github.com/carl0srmz/blackshard/blob/main/LICENSE)
 
 
 ## License
 
-[GPL v3](https://github.com/carlosrmz009/blackshard/blob/main/LICENSE)
+[GPL v3](https://github.com/carl0srmz/blackshard/blob/main/LICENSE)
 
 
 ## Roadmap
@@ -30,7 +30,7 @@ open-source adaptive antivirus agent
 
 ## Demo
 
-blackshard is currently in really early stages of development, so no stable download is offered. If you're really brave, though, you can try compiling your own binaries, or grab `blackshard-setup.exe` from the [testing candidate](https://github.com/carlosrmz009/blackshard/releases/tag/veryveryunstable) release, rebuilt from every commit to main (NOT RECOMMENDED, NOT SIGNED AND UNSTABLE! try it in a VM).
+blackshard is currently in really early stages of development, so no stable download is offered. If you're really brave, though, you can try compiling your own binaries, or grab `blackshard-setup.exe` from the [testing candidate](https://github.com/carl0srmz/blackshard/releases/tag/veryveryunstable) release, rebuilt from every commit to main (NOT RECOMMENDED, NOT SIGNED AND UNSTABLE! try it in a VM).
 
 
 ## Architecture

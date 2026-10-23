@@ -50,7 +50,7 @@ const DEFAULT_MIRROR: &str = "https://database.clamav.net";
 /// definitions at all. Only then is this copy used. Every container carries ClamAV's signature,
 /// verified the same way whichever mirror served it, so the copy is no less trustworthy.
 const FALLBACK_MIRROR: &str =
-    "https://github.com/carlosrmz009/blackshard/releases/download/clamav-mirror";
+    "https://github.com/carl0srmz/blackshard/releases/download/clamav-mirror";
 
 /// User-Agent sent to the official mirror.
 ///

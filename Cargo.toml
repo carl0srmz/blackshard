@@ -10,7 +10,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Open-source adaptive antivirus agent for Windows"
 license-file = "LICENSE"
-repository = "https://github.com/carlosrmz009/blackshard"
+repository = "https://github.com/carl0srmz/blackshard"
 publish = false
 
 [[bin]]

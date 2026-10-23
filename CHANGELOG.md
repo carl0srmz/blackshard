@@ -1,7 +1,7 @@
 # Changelog
 
 blackshard is pre-release; every commit to `main` is published as the
-[testing build](https://github.com/carlosrmz009/blackshard/releases/tag/veryveryunstable). Notable
+[testing build](https://github.com/carl0srmz/blackshard/releases/tag/veryveryunstable). Notable
 changes are listed here, newest first.
 
 ## Unreleased

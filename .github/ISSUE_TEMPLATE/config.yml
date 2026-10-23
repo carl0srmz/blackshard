@@ -1,5 +1,5 @@
 blank_issues_enabled: true
 contact_links:
   - name: Report a vulnerability privately
-    url: https://github.com/carlosrmz009/blackshard/security/advisories/new
+    url: https://github.com/carl0srmz/blackshard/security/advisories/new
     about: Security problems go here, not in a public issue. See SECURITY.md.

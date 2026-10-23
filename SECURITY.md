@@ -6,7 +6,7 @@ machine it is meant to protect. Reports are very welcome.
 ## Reporting a vulnerability
 
 Please report privately, through GitHub's
-[private vulnerability reporting](https://github.com/carlosrmz009/blackshard/security/advisories/new),
+[private vulnerability reporting](https://github.com/carl0srmz/blackshard/security/advisories/new),
 not in a public issue. Include what you found, the build (`version.txt`, or the version shown in
 the UI), and the steps to reproduce it.
 
