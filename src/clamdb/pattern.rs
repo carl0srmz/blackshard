@@ -5,9 +5,10 @@
 //! because the bytes that make a malware family what it is survive repacking and small edits.
 //!
 //! What is understood: target types any, PE, OLE2, ELF and PDF; offsets `*`, absolute, and
-//! `EOF-n`; bytes, `??` for any byte, `*` for any run of bytes, and `{n}`, `{n-m}`, `{-m}` and
-//! `{n-}` for a run of bounded length. Anything else (alternatives, nibble wildcards, `EP+n` and
-//! section-relative offsets, normalized text targets) is counted and skipped, never guessed at.
+//! `EOF-n`, `EP+n`/`EP-n` and `Sx+n`/`SL+n` (relative to the entry point or a PE section), each
+//! optionally followed by `,shift`; bytes, `??` for any byte, `*` for any run of bytes, and `{n}`, `{n-m}`, `{-m}` and
+//! `{n-}` for a run of bounded length. Anything else (alternatives, nibble wildcards, normalized
+//! text targets) is counted and skipped, never guessed at.
 //!
 //! Matching is two stage. Every signature contributes its longest run of fixed bytes to one
 //! Aho-Corasick automaton, which finds candidates in a single pass; only a candidate is checked
@@ -49,13 +50,94 @@ impl Target {
     }
 }
 
+/// Where a signature may start: at `base`, or up to `shift` bytes after it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Offset {
+struct Offset {
+    base: Base,
+    shift: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Base {
     Anywhere,
-    /// The signature starts exactly here.
     Absolute(usize),
-    /// The signature starts this many bytes before the end of the file.
+    /// This many bytes before the end of the file.
     FromEnd(usize),
+    /// Relative to the entry point's position in the file.
+    EntryPoint(isize),
+    /// This many bytes into section `index` (the last one when `None`).
+    Section {
+        index: Option<usize>,
+        delta: usize,
+    },
+}
+
+/// Where the parts of a PE sit in the file, found only when a signature needs them.
+#[derive(Debug, Clone, Default)]
+struct PeLayout {
+    entry_point: Option<usize>,
+    sections: Vec<usize>,
+}
+
+impl PeLayout {
+    fn read(text: &[u8]) -> Self {
+        let u16_at = |at: usize| -> Option<usize> {
+            Some(u16::from_le_bytes(text.get(at..at + 2)?.try_into().ok()?) as usize)
+        };
+        let u32_at = |at: usize| -> Option<usize> {
+            Some(u32::from_le_bytes(text.get(at..at + 4)?.try_into().ok()?) as usize)
+        };
+        let parse = || -> Option<Self> {
+            let header = u32_at(0x3c)?;
+            if text.get(header..header + 4)? != b"PE\0\0" {
+                return None;
+            }
+            let section_count = u16_at(header + 6)?.min(96);
+            let optional_size = u16_at(header + 20)?;
+            let optional = header + 24;
+            let entry_rva = u32_at(optional + 16)?;
+            let table = optional + optional_size;
+            let mut sections = Vec::new();
+            let mut entry_point = None;
+            for index in 0..section_count {
+                let at = table + index * 40;
+                let virtual_size = u32_at(at + 8)?;
+                let virtual_address = u32_at(at + 12)?;
+                let raw_size = u32_at(at + 16)?;
+                let raw_pointer = u32_at(at + 20)?;
+                sections.push(raw_pointer);
+                let span = virtual_size.max(raw_size);
+                if entry_point.is_none()
+                    && entry_rva >= virtual_address
+                    && entry_rva < virtual_address.saturating_add(span)
+                {
+                    entry_point = Some(raw_pointer + (entry_rva - virtual_address));
+                }
+            }
+            Some(Self {
+                entry_point,
+                sections,
+            })
+        };
+        parse().unwrap_or_default()
+    }
+
+    /// The first position `base` allows, if this file has what it is relative to.
+    fn resolve(&self, base: Base, file_len: usize) -> Option<usize> {
+        match base {
+            Base::Anywhere => Some(0),
+            Base::Absolute(position) => Some(position),
+            Base::FromEnd(distance) => file_len.checked_sub(distance),
+            Base::EntryPoint(delta) => self.entry_point?.checked_add_signed(delta),
+            Base::Section { index, delta } => {
+                let start = match index {
+                    Some(index) => *self.sections.get(index)?,
+                    None => *self.sections.last()?,
+                };
+                start.checked_add(delta)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,19 +259,21 @@ impl PatternSet {
     pub fn scan(&self, text: &[u8], file_size: u64, truncated: bool) -> Option<&str> {
         let automaton = self.automaton.as_ref()?;
         let mut steps = 0usize;
+        let mut layout: Option<PeLayout> = None;
         for found in automaton.find_overlapping_iter(text) {
             let signature = &self.signatures[found.pattern().as_usize()];
             if !signature.target.applies_to(text) {
                 continue;
             }
-            if verify(
-                signature,
+            // Read once per file, and only when a PE signature is a candidate.
+            let layout = &*layout.get_or_insert_with(|| PeLayout::read(text));
+            let context = Context {
                 text,
-                found.start(),
                 file_size,
                 truncated,
-                &mut steps,
-            ) {
+                layout,
+            };
+            if verify(signature, &context, found.start(), &mut steps) {
                 return Some(&signature.name);
             }
             if steps > MAX_VERIFY_STEPS * 16 {
@@ -224,17 +308,13 @@ fn parse_line(line: &str) -> Parsed {
         "10" => Target::Pdf,
         _ => return Parsed::Unsupported,
     };
-    let offset = match fields[2].trim() {
-        "*" => Offset::Anywhere,
-        text if text.starts_with("EOF-") => match text[4..].parse() {
-            Ok(distance) => Offset::FromEnd(distance),
-            Err(_) => return Parsed::Unsupported,
-        },
-        text => match text.parse() {
-            Ok(position) => Offset::Absolute(position),
-            Err(_) => return Parsed::Unsupported,
-        },
+    let Some(offset) = parse_offset(fields[2].trim()) else {
+        return Parsed::Unsupported;
     };
+    // Entry point and section offsets only mean something in a PE.
+    if matches!(offset.base, Base::EntryPoint(_) | Base::Section { .. }) && target != Target::Pe {
+        return Parsed::Unsupported;
+    }
     let Some(parts) = parse_hex(fields[3].trim()) else {
         return Parsed::Unsupported;
     };
@@ -283,6 +363,40 @@ fn parse_line(line: &str) -> Parsed {
         anchor_part,
         anchor_start,
     })
+}
+
+fn parse_offset(text: &str) -> Option<Offset> {
+    let (position, shift) = match text.split_once(',') {
+        Some((position, shift)) => (position, shift.parse().ok()?),
+        None => (text, 0),
+    };
+    let base = if position == "*" {
+        Base::Anywhere
+    } else if let Some(distance) = position.strip_prefix("EOF-") {
+        Base::FromEnd(distance.parse().ok()?)
+    } else if let Some(delta) = position.strip_prefix("EP+") {
+        Base::EntryPoint(delta.parse().ok()?)
+    } else if let Some(delta) = position.strip_prefix("EP-") {
+        Base::EntryPoint(-delta.parse::<isize>().ok()?)
+    } else if let Some(delta) = position.strip_prefix("SL+") {
+        Base::Section {
+            index: None,
+            delta: delta.parse().ok()?,
+        }
+    } else if let Some(rest) = position.strip_prefix('S') {
+        let (index, delta) = rest.split_once('+')?;
+        Base::Section {
+            index: Some(index.parse().ok()?),
+            delta: delta.parse().ok()?,
+        }
+    } else {
+        Base::Absolute(position.parse().ok()?)
+    };
+    // `*` with a shift is meaningless, and a huge shift would make every position a candidate.
+    if (base == Base::Anywhere && shift != 0) || shift > 1 << 16 {
+        return None;
+    }
+    Some(Offset { base, shift })
 }
 
 /// Hex digits, `??`, `*` and `{…}` into parts. `None` for anything this matcher does not model.
@@ -383,15 +497,26 @@ fn bytes_match(pattern: &[Option<u8>], text: &[u8]) -> bool {
             .all(|(wanted, actual)| wanted.is_none_or(|wanted| wanted == *actual))
 }
 
+struct Context<'a> {
+    text: &'a [u8],
+    file_size: u64,
+    truncated: bool,
+    layout: &'a PeLayout,
+}
+
 /// Whether the whole signature matches with its anchor found at `anchor_at`.
 fn verify(
     signature: &Signature,
-    text: &[u8],
+    context: &Context<'_>,
     anchor_at: usize,
-    file_size: u64,
-    truncated: bool,
     steps: &mut usize,
 ) -> bool {
+    let &Context {
+        text,
+        file_size,
+        truncated,
+        layout,
+    } = context;
     let Part::Bytes(anchor_bytes) = &signature.parts[signature.anchor_part] else {
         return false;
     };
@@ -410,16 +535,18 @@ fn verify(
     let Some(end) = match_right(after, text, part_end, steps) else {
         return false;
     };
-    match signature.offset {
-        Offset::Anywhere => true,
-        Offset::Absolute(position) => start == position,
-        Offset::FromEnd(distance) => {
-            !truncated
-                && file_size as usize == text.len()
-                && text.len().checked_sub(distance) == Some(start)
-                && end <= text.len()
-        }
+    let offset = signature.offset;
+    if offset.base == Base::Anywhere {
+        return true;
     }
+    // The end of a file is unknown when only its start was read.
+    if matches!(offset.base, Base::FromEnd(_)) && (truncated || file_size as usize != text.len()) {
+        return false;
+    }
+    let Some(first) = layout.resolve(offset.base, text.len()) else {
+        return false;
+    };
+    end <= text.len() && (first..=first.saturating_add(offset.shift)).contains(&start)
 }
 
 /// Matches `parts` forward from `position`; returns where the match ends.
@@ -590,6 +717,63 @@ mod tests {
         assert_eq!(set.scan(&at_end, 10_000, true), None);
     }
 
+    /// A PE whose single section starts at file offset 0x400, with its entry point 0x10 bytes in.
+    fn pe_with(entry_bytes: &[u8]) -> Vec<u8> {
+        let mut pe = vec![0u8; 0x800];
+        pe[0] = b'M';
+        pe[1] = b'Z';
+        pe[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        pe[0x80..0x84].copy_from_slice(b"PE\0\0");
+        pe[0x86..0x88].copy_from_slice(&1u16.to_le_bytes()); // one section
+        pe[0x94..0x96].copy_from_slice(&0xf0u16.to_le_bytes()); // optional header size
+        let optional = 0x98;
+        pe[optional + 16..optional + 20].copy_from_slice(&0x1010u32.to_le_bytes()); // entry rva
+        let section = optional + 0xf0;
+        pe[section + 8..section + 12].copy_from_slice(&0x200u32.to_le_bytes()); // virtual size
+        pe[section + 12..section + 16].copy_from_slice(&0x1000u32.to_le_bytes()); // virtual address
+        pe[section + 16..section + 20].copy_from_slice(&0x200u32.to_le_bytes()); // raw size
+        pe[section + 20..section + 24].copy_from_slice(&0x400u32.to_le_bytes()); // raw pointer
+        pe[0x410..0x410 + entry_bytes.len()].copy_from_slice(entry_bytes);
+        pe
+    }
+
+    #[test]
+    fn entry_point_and_section_offsets_follow_the_pe_layout() {
+        let (set, stats) = set(&[
+            "Win.Test.Ep:1:EP+0:cafebabe11223344",
+            "Win.Test.EpBefore:1:EP-4:aabbccdd11223344",
+            "Win.Test.EpShift:1:EP+0,8:0102030405060708",
+            "Win.Test.Section:1:S0+16:cafebabe11223344",
+            "Win.Test.Last:1:SL+16:cafebabe11223344",
+            "Win.Test.WrongSection:1:S5+0:cafebabe11223344",
+        ]);
+        assert_eq!(stats.loaded, 6);
+        let entry = [0xca, 0xfe, 0xba, 0xbe, 0x11, 0x22, 0x33, 0x44];
+        // Section 0 + 16 and the entry point are the same place, so three signatures agree; the
+        // first loaded wins.
+        assert_eq!(scan(&set, &pe_with(&entry)), Some("Win.Test.Ep"));
+
+        // Four bytes before the entry point.
+        let mut pe = pe_with(&[]);
+        pe[0x40c..0x414].copy_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(scan(&set, &pe), Some("Win.Test.EpBefore"));
+
+        // Within the shift, and just outside it.
+        let sequence = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let mut shifted = pe_with(&[]);
+        shifted[0x418..0x420].copy_from_slice(&sequence);
+        assert_eq!(scan(&set, &shifted), Some("Win.Test.EpShift"));
+        let mut too_far = pe_with(&[]);
+        too_far[0x419..0x421].copy_from_slice(&sequence);
+        assert_eq!(scan(&set, &too_far), None);
+
+        // The same bytes in the wrong place, or in a file that is not a PE.
+        let mut elsewhere = pe_with(&[]);
+        elsewhere[0x500..0x508].copy_from_slice(&entry);
+        assert_eq!(scan(&set, &elsewhere), None);
+        assert_eq!(scan(&set, &entry), None);
+    }
+
     #[test]
     fn targets_restrict_where_a_signature_applies() {
         let (set, _) = set(&["Win.Test.Pe:1:*:deadbeefcafef00d"]);
@@ -607,14 +791,15 @@ mod tests {
             "Weak.NoAnchor:0:*:aa??bb??cc??dd??ee",
             "Unsupported.Alternation:0:*:(aabb|ccdd)11223344556677",
             "Unsupported.Nibble:0:*:aab?ccdd11223344",
-            "Unsupported.EntryPoint:1:EP+10:11223344556677889900",
+            "Unsupported.Offset:1:VI:11223344556677889900",
+            "Unsupported.EpOutsidePe:0:EP+0:11223344556677889900",
             "Unsupported.Text:7:*:11223344556677889900",
             "garbage",
             "",
         ]);
         assert_eq!(stats.loaded, 0);
         assert_eq!(stats.too_weak, 2);
-        assert_eq!(stats.unsupported, 6);
+        assert_eq!(stats.unsupported, 7);
         assert!(set.is_empty());
         assert_eq!(scan(&set, b"anything"), None);
     }
