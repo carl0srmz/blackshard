@@ -68,7 +68,8 @@ rule blackshard_office_macro_autoexec_shell_chain {
         $payload2 = "mshta" ascii wide nocase
         $payload3 = "rundll32" ascii wide nocase
     condition:
-        1 of ($auto*) and 1 of ($shell*) and 1 of ($payload*)
+        // Executables mention these words as ordinary strings; only documents and scripts count.
+        not (uint16(0) == 0x5A4D) and 1 of ($auto*) and 1 of ($shell*) and 1 of ($payload*)
 }
 "#;
 

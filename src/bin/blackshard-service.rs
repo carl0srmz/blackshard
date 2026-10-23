@@ -165,6 +165,8 @@ struct CorpusFileResult {
     file_size: u64,
     elapsed_micros: u64,
     container_findings: usize,
+    /// What scored, for anything not clean: `code (points): description`.
+    reasons: Vec<String>,
     error: Option<String>,
 }
 
@@ -283,6 +285,25 @@ fn evaluate_corpus(root: &std::path::Path, output: &std::path::Path) -> Result<(
             sha256: report.sha256,
             file_size: report.file_size,
             elapsed_micros: report.elapsed.as_micros().min(u64::MAX as u128) as u64,
+            reasons: if verdict == "clean" {
+                Vec::new()
+            } else {
+                report
+                    .static_report
+                    .iter()
+                    .flat_map(|stat| stat.evidence.iter())
+                    .filter(|item| item.risk_points > 0)
+                    .map(|item| {
+                        format!("{} ({}): {}", item.code, item.risk_points, item.description)
+                    })
+                    .chain(
+                        report
+                            .rule_matches
+                            .iter()
+                            .map(|rule| format!("rule {} ({})", rule.threat_name, rule.risk_score)),
+                    )
+                    .collect()
+            },
             container_findings: report
                 .container_inspection
                 .as_ref()

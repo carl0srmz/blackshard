@@ -825,14 +825,36 @@ fn analyze_pe(
             return;
         }
         Err(error) => {
-            push_evidence(
-                evidence,
-                "pe.malformed",
-                EvidenceSeverity::High,
-                55,
-                format!("MZ-marked file is not a structurally valid PE image: {error}"),
-            );
             *content_type = ContentType::PeUnknown;
+            if let Some(kind) = legacy_executable_kind(bytes) {
+                // 16-bit Windows and OS/2 programs ship with Windows itself (compobj.dll and
+                // others); they are not malformed, just not PE.
+                push_evidence(
+                    evidence,
+                    "pe.legacy_executable",
+                    EvidenceSeverity::Informational,
+                    0,
+                    format!("MZ file is a {kind} executable, not a PE image"),
+                );
+            } else if pe_headers_are_plausible(bytes) {
+                // The headers are sound but a table behind them did not parse: some real
+                // programs (installers, launchers) have an odd directory. Not enough alone.
+                push_evidence(
+                    evidence,
+                    "pe.structure_unreadable",
+                    EvidenceSeverity::Low,
+                    30,
+                    format!("PE headers are valid but a directory could not be read: {error}"),
+                );
+            } else {
+                push_evidence(
+                    evidence,
+                    "pe.malformed",
+                    EvidenceSeverity::High,
+                    55,
+                    format!("MZ-marked file is not a structurally valid PE image: {error}"),
+                );
+            }
             return;
         }
     };
@@ -979,6 +1001,43 @@ fn analyze_pe(
     }
 
     analyze_pe_imports(&pe, evidence);
+}
+
+fn new_header_offset(bytes: &[u8]) -> Option<usize> {
+    let raw = bytes.get(0x3c..0x40)?;
+    let offset = u32::from_le_bytes(raw.try_into().ok()?) as usize;
+    (offset >= 0x40).then_some(offset)
+}
+
+/// The kind of a non-PE "new executable" behind a DOS header, when its signature says so.
+fn legacy_executable_kind(bytes: &[u8]) -> Option<&'static str> {
+    let offset = new_header_offset(bytes)?;
+    match bytes.get(offset..offset.checked_add(2)?)? {
+        b"NE" => Some("16-bit Windows (NE)"),
+        b"LE" | b"LX" => Some("OS/2 or VxD (LE/LX)"),
+        _ => None,
+    }
+}
+
+/// Whether the PE signature, COFF header and section table fit in the file and agree with each
+/// other, so a failure to read a directory behind them says little.
+fn pe_headers_are_plausible(bytes: &[u8]) -> bool {
+    let Some(offset) = new_header_offset(bytes) else {
+        return false;
+    };
+    let Some(coff) = bytes.get(offset..offset.saturating_add(24)) else {
+        return false;
+    };
+    if &coff[..4] != b"PE\0\0" {
+        return false;
+    }
+    let sections = u16::from_le_bytes([coff[6], coff[7]]) as usize;
+    let optional = u16::from_le_bytes([coff[20], coff[21]]) as usize;
+    let table_end = offset
+        .saturating_add(24)
+        .saturating_add(optional)
+        .saturating_add(sections.saturating_mul(40));
+    (1..=96).contains(&sections) && optional >= 96 && table_end <= bytes.len()
 }
 
 fn analyze_pe_imports(pe: &PE<'_>, evidence: &mut Vec<Evidence>) {
@@ -1620,6 +1679,32 @@ mod tests {
             .evidence
             .iter()
             .any(|item| item.code == "pe.invalid_section_bounds"));
+    }
+
+    #[test]
+    fn legacy_and_odd_but_sound_images_are_not_called_malformed() {
+        let engine = ScanEngine::default();
+
+        let mut ne = vec![0u8; 0x200];
+        ne[0..2].copy_from_slice(b"MZ");
+        ne[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        ne[0x80..0x82].copy_from_slice(b"NE");
+        let report = engine.scan_bytes(&ne);
+        assert_eq!(report.verdict, Verdict::Clean);
+        assert!(report
+            .evidence
+            .iter()
+            .any(|item| item.code == "pe.legacy_executable"));
+
+        // Sound headers, but the optional header is too short for goblin to read the image.
+        let mut odd = minimal_pe(false, false, ".text");
+        odd[0x84 + 16..0x84 + 18].copy_from_slice(&100u16.to_le_bytes());
+        let report = engine.scan_bytes(&odd);
+        assert_ne!(report.verdict, Verdict::Malicious);
+        assert!(!report
+            .evidence
+            .iter()
+            .any(|item| item.code == "pe.malformed"));
     }
 
     #[test]

@@ -133,7 +133,7 @@ jobs:
           $result = Get-Content -LiteralPath $report -Raw | ConvertFrom-Json
           if ([int]$result.files -lt 500) { throw "The clean corpus is too small to mean anything: $($result.files) files." }
           $flagged = @($result.results | Where-Object { $_.verdict -in 'suspicious', 'malicious' })
-          $flagged | Select-Object path, verdict, risk_score, threat_name, sha256 | Format-List
+          $flagged | Select-Object path, verdict, risk_score, threat_name, sha256, reasons | Format-List
           if ($flagged.Count -gt 0) { throw "$($flagged.Count) clean Windows files were flagged: false positives." }
 
       - name: Build the installer
