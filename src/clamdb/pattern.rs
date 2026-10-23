@@ -181,11 +181,13 @@ struct Logical {
 }
 
 /// How many signature lines a load kept and why it dropped the rest.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PatternStats {
     pub loaded: usize,
     pub unsupported: usize,
     pub too_weak: usize,
+    /// How many lines each kind of unmodelled feature cost, to show what to build next.
+    pub reasons: std::collections::BTreeMap<&'static str, usize>,
 }
 
 #[derive(Default)]
@@ -256,8 +258,9 @@ impl PatternSet {
                 stats.loaded += 1;
                 true
             }
-            Parsed::Unsupported => {
+            Parsed::Unsupported(reason) => {
                 stats.unsupported += 1;
+                *stats.reasons.entry(reason).or_default() += 1;
                 false
             }
             Parsed::TooWeak => {
@@ -280,10 +283,12 @@ impl PatternSet {
                 stats.too_weak += 1;
                 false
             }
-            Err(_) => {
+            Err(Parsed::Unsupported(reason)) => {
                 stats.unsupported += 1;
+                *stats.reasons.entry(reason).or_default() += 1;
                 false
             }
+            Err(Parsed::Kept(_)) => false,
         }
     }
 
@@ -291,17 +296,17 @@ impl PatternSet {
     fn parse_logical(&mut self, line: &str) -> Result<(), Parsed> {
         let fields: Vec<&str> = line.trim().split(';').collect();
         if fields.len() < 4 || fields.len() - 3 > MAX_LOGICAL_SUBSIGNATURES {
-            return Err(Parsed::Unsupported);
+            return Err(Parsed::Unsupported("ldb: malformed or too many pieces"));
         }
         let name = fields[0].trim();
         if name.is_empty() {
-            return Err(Parsed::Unsupported);
+            return Err(Parsed::Unsupported("ldb: malformed or too many pieces"));
         }
         let Some((target, file_size)) = parse_target_block(fields[1].trim()) else {
-            return Err(Parsed::Unsupported);
+            return Err(Parsed::Unsupported("ldb: target block condition"));
         };
         let Some(expression) = Expr::parse(fields[2].trim()) else {
-            return Err(Parsed::Unsupported);
+            return Err(Parsed::Unsupported("ldb: expression form"));
         };
         let subsignatures = fields.len() - 3;
         // Every sub-signature must be used, or the line was split wrongly (a `;` inside one).
@@ -310,7 +315,7 @@ impl PatternSet {
         used.sort_unstable();
         used.dedup();
         if used != (0..subsignatures).collect::<Vec<_>>() {
-            return Err(Parsed::Unsupported);
+            return Err(Parsed::Unsupported("ldb: pieces and expression disagree"));
         }
 
         let mut built = Vec::with_capacity(subsignatures);
@@ -422,18 +427,19 @@ impl PatternSet {
 
 enum Parsed {
     Kept(Signature),
-    Unsupported,
+    /// Uses something this matcher does not model; the reason names it.
+    Unsupported(&'static str),
     TooWeak,
 }
 
 fn parse_line(line: &str) -> Parsed {
     let fields: Vec<&str> = line.trim().split(':').collect();
     if fields.len() < 4 {
-        return Parsed::Unsupported;
+        return Parsed::Unsupported("ndb: malformed line");
     }
     let name = fields[0].trim();
     if name.is_empty() {
-        return Parsed::Unsupported;
+        return Parsed::Unsupported("ndb: malformed line");
     }
     let target = match fields[1].trim() {
         "0" => Target::Any,
@@ -441,14 +447,14 @@ fn parse_line(line: &str) -> Parsed {
         "2" => Target::Ole2,
         "6" => Target::Elf,
         "10" => Target::Pdf,
-        _ => return Parsed::Unsupported,
+        _ => return Parsed::Unsupported("ndb: target type (text, mail, graphics, ...)"),
     };
     let Some(offset) = parse_offset(fields[2].trim()) else {
-        return Parsed::Unsupported;
+        return Parsed::Unsupported("ndb: offset form");
     };
     // Entry point and section offsets only mean something in a PE.
     if matches!(offset.base, Base::EntryPoint(_) | Base::Section { .. }) && target != Target::Pe {
-        return Parsed::Unsupported;
+        return Parsed::Unsupported("ndb: PE offset on a non-PE target");
     }
     build_signature(name, target, offset, fields[3].trim(), MIN_FIXED_BYTES)
 }
@@ -463,7 +469,7 @@ fn build_signature(
     min_fixed: usize,
 ) -> Parsed {
     let Some(parts) = parse_hex(hex) else {
-        return Parsed::Unsupported;
+        return Parsed::Unsupported(hex_reason(hex));
     };
 
     let fixed: usize = parts
@@ -560,17 +566,22 @@ fn parse_target_block(text: &str) -> Option<(Target, Option<(u64, u64)>)> {
 /// One piece of a logical signature: `hex`, or `offset:hex`. Modifiers (`::i`, `::w`, ...),
 /// regular expressions, macros and alternatives are not modelled.
 fn parse_subsignature(name: &str, target: Target, text: &str) -> Parsed {
-    if text.is_empty()
-        || text.contains("::")
-        || text.starts_with('/')
-        || text.contains(['(', ')', '[', ']', '$', '|', '!'])
-    {
-        return Parsed::Unsupported;
+    if text.is_empty() {
+        return Parsed::Unsupported("ldb: empty piece");
+    }
+    if text.starts_with('/') {
+        return Parsed::Unsupported("ldb piece: regular expression");
+    }
+    if text.contains("::") {
+        return Parsed::Unsupported("ldb piece: modifier (::i, ::w, ::f, ...)");
+    }
+    if text.contains('$') {
+        return Parsed::Unsupported("ldb piece: macro");
     }
     let (offset, hex) = match text.split_once(':') {
         Some((offset, hex)) => match parse_offset(offset) {
             Some(offset) => (offset, hex),
-            None => return Parsed::Unsupported,
+            None => return Parsed::Unsupported("ldb piece: offset form"),
         },
         None => (
             Offset {
@@ -581,9 +592,28 @@ fn parse_subsignature(name: &str, target: Target, text: &str) -> Parsed {
         ),
     };
     if matches!(offset.base, Base::EntryPoint(_) | Base::Section { .. }) && target != Target::Pe {
-        return Parsed::Unsupported;
+        return Parsed::Unsupported("ldb piece: PE offset on a non-PE target");
     }
     build_signature(name, target, offset, hex, MIN_ANCHOR)
+}
+
+/// Why `parse_hex` refused `text`, for the report of what to build next.
+fn hex_reason(text: &str) -> &'static str {
+    if text.contains('!') {
+        "hex: negated alternatives"
+    } else if text.contains('(') {
+        "hex: alternatives (a|b)"
+    } else if text.contains('[') {
+        "hex: byte-count ranges [n-m]"
+    } else if text.contains('?') && !text.replace("??", "").contains('?') {
+        "hex: other wildcard"
+    } else if text.contains('?') {
+        "hex: nibble wildcards (a?, ?a)"
+    } else if text.contains('{') || text.contains('*') {
+        "hex: gap form"
+    } else {
+        "hex: other"
+    }
 }
 
 fn parse_offset(text: &str) -> Option<Offset> {

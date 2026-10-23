@@ -495,6 +495,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "Indexed {} body and logical signatures; skipped {} that use features not yet modelled or are too weak",
                 stats.patterns, stats.patterns_skipped
             );
+            let mut reasons: Vec<_> = stats.pattern_skip_reasons.iter().collect();
+            reasons.sort_by(|left, right| right.1.cmp(left.1));
+            for (reason, count) in reasons {
+                println!("  skipped {count:>7}  {reason}");
+            }
             println!("Unpacked databases at {}", active.unpacked_path.display());
             if stats.file_hashes == 0 {
                 return Err("the activated generation produced no usable file hashes".into());

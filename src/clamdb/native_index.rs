@@ -159,7 +159,7 @@ pub struct LoadOptions {
 }
 
 /// How many signatures a load added, broken down by family.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LoadStats {
     pub file_hashes: usize,
     pub section_hashes: usize,
@@ -168,6 +168,8 @@ pub struct LoadStats {
     pub patterns: usize,
     /// `.ndb` lines that use features the matcher does not model, or are too weak to convict on.
     pub patterns_skipped: usize,
+    /// How many of the skipped lines each unmodelled feature accounts for.
+    pub pattern_skip_reasons: std::collections::BTreeMap<&'static str, usize>,
 }
 
 impl LoadStats {
@@ -234,6 +236,9 @@ impl NativeIndex {
             stats.allowlist_entries += added.allowlist_entries;
             stats.patterns += added.patterns;
             stats.patterns_skipped += added.patterns_skipped;
+            for (reason, count) in added.pattern_skip_reasons {
+                *stats.pattern_skip_reasons.entry(reason).or_default() += count;
+            }
         }
         self.sort();
         self.patterns.build();
@@ -312,6 +317,13 @@ impl NativeIndex {
         Ok(LoadStats {
             patterns: pattern_stats.loaded,
             patterns_skipped: pattern_stats.unsupported + pattern_stats.too_weak,
+            pattern_skip_reasons: {
+                let mut reasons = pattern_stats.reasons;
+                if pattern_stats.too_weak > 0 {
+                    reasons.insert("too few fixed bytes to convict on", pattern_stats.too_weak);
+                }
+                reasons
+            },
             ..LoadStats::default()
         })
     }
