@@ -221,6 +221,8 @@ mod windows_service_host {
     const SETTINGS_CHECK_INTERVAL: Duration = Duration::from_secs(5);
     const STOP_WAIT_HINT: Duration = Duration::from_secs(30);
     const MANUAL_UPDATE_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+    /// How often an expired bundle is looked at again for a newer one that was installed meanwhile.
+    const EXPIRED_RELOAD_INTERVAL: Duration = Duration::from_secs(10 * 60);
     const REALTIME_EVENT_CHANNEL_CAPACITY: usize = 256;
     const UPDATE_MANIFEST_URL: Option<&str> = option_env!("BLACKSHARD_UPDATE_MANIFEST_URL");
     const UPDATE_ALLOWED_ORIGINS: Option<&str> = option_env!("BLACKSHARD_UPDATE_ALLOWED_ORIGINS");
@@ -546,6 +548,8 @@ mod windows_service_host {
             }
         };
         let mut last_manual_update = None::<Instant>;
+        let mut last_expired_reload = None::<Instant>;
+        let mut expiry_reported = false;
 
         readiness.update_state(crate::readiness::ReadinessState::ConnectingDriver);
         snapshot.readiness = Some(readiness.diagnostics().current_state);
@@ -641,12 +645,32 @@ mod windows_service_host {
                 }
             }
 
-            if definitions_expired(&stable_definitions, Utc::now()) {
+            if definitions_expired(&stable_definitions, Utc::now())
+                && last_expired_reload.is_none_or(|at| at.elapsed() >= EXPIRED_RELOAD_INTERVAL)
+            {
+                last_expired_reload = Some(Instant::now());
                 match load_detection_engine(&mut snapshot, &history) {
                     Ok(fresh) => {
-                        replace_detection_engine(&engine, fresh);
-                        definition_generation.fetch_add(1, std::sync::atomic::Ordering::Release);
-                        stable_definitions = snapshot.definitions.clone();
+                        // Still the same expired bundle: keep the engine already running rather
+                        // than recompiling every rule to arrive at it again.
+                        if snapshot.definitions != stable_definitions {
+                            replace_detection_engine(&engine, fresh);
+                            definition_generation
+                                .fetch_add(1, std::sync::atomic::Ordering::Release);
+                            stable_definitions = snapshot.definitions.clone();
+                        }
+                        if definitions_expired(&stable_definitions, Utc::now()) && !expiry_reported
+                        {
+                            expiry_reported = true;
+                            let message = "Definitions have expired and could not be refreshed; \
+                                 the last authenticated set is still in use. Connect to the \
+                                 internet so blackshard can update."
+                                .to_owned();
+                            append_error(&history, &message);
+                            snapshot.last_error = Some(message);
+                        } else if !definitions_expired(&stable_definitions, Utc::now()) {
+                            expiry_reported = false;
+                        }
                     }
                     Err(error) => {
                         match DetectionEngine::builtin() {

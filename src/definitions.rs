@@ -1038,14 +1038,28 @@ fn load_active_candidate(
     })?;
 
     let installed_before_candidate = active.sequence.saturating_sub(1);
-    let verified = verify_update(
-        &envelope,
-        &payload,
-        installed_before_candidate,
-        now,
-        MAX_DEFINITION_PAYLOAD_BYTES as u64,
-        trusted_public_key,
-    )
+    let verify_at = |at: DateTime<Utc>| {
+        verify_update(
+            &envelope,
+            &payload,
+            installed_before_candidate,
+            at,
+            MAX_DEFINITION_PAYLOAD_BYTES as u64,
+            trusted_public_key,
+        )
+    };
+    // The expiry limits how long a bundle may be *installed*, so an attacker cannot hold a
+    // machine on a stale feed by replaying one. A bundle already installed and authenticated is
+    // another matter: once it expires, its signatures are still worth far more than the small
+    // built-in set, so an offline machine keeps using it (and reports it as expired) until a newer
+    // bundle arrives. Everything else is still checked: signature, sequence, size and digest.
+    let verified = match verify_at(now) {
+        Err(UpdateError::Expired { expired_at }) => {
+            let just_before = expired_at - chrono::Duration::seconds(1);
+            verify_at(just_before)
+        }
+        other => other,
+    }
     .map_err(|error| {
         CandidateFailure::new(DefinitionIssueStage::Authentication, error.to_string())
     })?;
@@ -1709,6 +1723,30 @@ mod tests {
             DefinitionSource::BuiltIn.runtime_freshness(now()),
             DefinitionRuntimeFreshness::BuiltIn
         ));
+    }
+
+    #[test]
+    fn an_installed_bundle_stays_in_use_after_it_expires() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DefinitionStore::new(directory.path()).unwrap();
+        stage(
+            &store,
+            1,
+            &yara_bundle("kept-rule", Some(RuleDisposition::Suspicious)),
+        );
+        let key = signing_key().verifying_key().to_bytes();
+
+        // Well past the 7-day expiry the test envelopes carry.
+        let later = now() + chrono::Duration::days(30);
+        let outcome = store.load_with_defaults(later, &key).unwrap();
+        assert!(matches!(outcome.source, DefinitionSource::Current { .. }));
+        assert!(outcome.source.is_expired_at(later));
+        assert!(outcome
+            .engine
+            .scan_bytes(b"blackshard-external-marker")
+            .rule_matches
+            .iter()
+            .any(|matched| matched.identifier == "External_Marker"));
     }
 
     #[test]
