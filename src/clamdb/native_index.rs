@@ -1,7 +1,7 @@
 //! Native reader for the ClamAV signature databases blackshard consumes directly.
 //!
-//! The hash families are handled here directly, and `.ndb` body signatures through the matcher in
-//! [`super::pattern`]. Logical (`.ldb`) signatures and bytecode are not evaluated yet:
+//! The hash families are handled here directly, and `.ndb` body signatures and `.ldb` logical
+//! signatures through the matcher in [`super::pattern`]. Bytecode is not evaluated yet:
 //!
 //! | Extension       | Layout                               | Meaning                       |
 //! |-----------------|--------------------------------------|-------------------------------|
@@ -10,6 +10,7 @@
 //! | `.mdb` / `.mdu` | `PESectionSize:MD5:Name`             | PE section MD5                |
 //! | `.msb` / `.msu` | `PESectionSize:SHA256:Name`          | PE section SHA-256            |
 //! | `.ndb`          | `Name:Target:Offset:HexSignature`    | byte pattern in the file      |
+//! | `.ldb`          | `Name;Target;Expression;Sub;Sub...`  | several patterns and a rule   |
 //! | `.fp`           | `MD5:FileSize:Name`                  | allowlist, suppresses matches |
 //! | `.sfp`          | `SHA:FileSize:Name`                  | allowlist, suppresses matches |
 //!
@@ -253,8 +254,8 @@ impl NativeIndex {
             .unwrap_or_default()
             .to_ascii_lowercase();
 
-        if extension == "ndb" {
-            let stats = self.load_patterns(path)?;
+        if matches!(extension.as_str(), "ndb" | "ldb" | "ldu" | "ndu") {
+            let stats = self.load_patterns(path, extension.starts_with('l'))?;
             if finish {
                 self.patterns.build();
             }
@@ -290,7 +291,7 @@ impl NativeIndex {
         Ok(stats)
     }
 
-    fn load_patterns(&mut self, path: &Path) -> io::Result<LoadStats> {
+    fn load_patterns(&mut self, path: &Path, logical: bool) -> io::Result<LoadStats> {
         let mut pattern_stats = super::pattern::PatternStats::default();
         for line in BufReader::new(File::open(path)?).lines() {
             let line = line?;
@@ -302,7 +303,11 @@ impl NativeIndex {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            self.patterns.ingest(line, &mut pattern_stats);
+            if logical {
+                self.patterns.ingest_logical(line, &mut pattern_stats);
+            } else {
+                self.patterns.ingest(line, &mut pattern_stats);
+            }
         }
         Ok(LoadStats {
             patterns: pattern_stats.loaded,
@@ -612,6 +617,36 @@ mod tests {
         assert!(vouched
             .evaluate_patterns(&sample, sample.len() as u64, &digest, Some(&md5("ab")))
             .is_none());
+    }
+
+    #[test]
+    fn logical_signatures_load_and_match_across_files() {
+        let directory = tempfile::tempdir().unwrap();
+        write(
+            directory.path(),
+            "daily.ldb",
+            "Win.Test.Logical;Target:0;0&1;deadbeef00112233;cafebabe44556677\n\
+             Win.Test.Regex;Target:0;0&1;deadbeef00112233;/evil.*regex/",
+        );
+        let mut index = NativeIndex::new();
+        let stats = index
+            .load_from_directory(directory.path(), LoadOptions::default())
+            .unwrap();
+        assert_eq!((stats.patterns, stats.patterns_skipped), (1, 1));
+
+        let mut sample = vec![0x41u8; 8];
+        sample.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef, 0x00, 0x11, 0x22, 0x33]);
+        sample.extend_from_slice(&[0x41; 8]);
+        let digest = sha("ab");
+        assert!(index
+            .evaluate_patterns(&sample, sample.len() as u64, &digest, None)
+            .is_none());
+        sample.extend_from_slice(&[0xca, 0xfe, 0xba, 0xbe, 0x44, 0x55, 0x66, 0x77]);
+        let matched = index
+            .evaluate_patterns(&sample, sample.len() as u64, &digest, None)
+            .expect("both pieces are present");
+        assert_eq!(matched.threat_name, "Win.Test.Logical");
+        assert_eq!(matched.origin, MatchOrigin::Pattern);
     }
 
     #[test]

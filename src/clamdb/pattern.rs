@@ -15,7 +15,9 @@
 //! against the whole signature. A signature with no fixed run of at least [`MIN_ANCHOR`] bytes, or
 //! fewer than [`MIN_FIXED_BYTES`] fixed bytes in all, is too weak to convict on and is skipped.
 
+use super::logical::Expr;
 use aho_corasick::{AhoCorasick, AhoCorasickKind, MatchKind};
+use std::collections::HashMap;
 
 /// The shortest fixed run a signature may be found by.
 const MIN_ANCHOR: usize = 4;
@@ -26,6 +28,12 @@ const MIN_FIXED_BYTES: usize = 8;
 const MAX_UNBOUNDED_GAP: usize = 1 << 20;
 const MAX_VERIFY_STEPS: usize = 4 << 20;
 const MAX_SIGNATURE_BYTES: usize = 4096;
+/// A logical signature joins weak pieces, so what its expression needs in all must be about as
+/// strong as one stand-alone body signature twice over.
+const MIN_LOGICAL_FIXED_BYTES: usize = 16;
+/// The shortest fixed run a piece of a logical signature may be found by is [`MIN_ANCHOR`]; this
+/// bounds how many logical signatures one file may touch, so a hostile file stays cheap.
+const MAX_TOUCHED_LOGICALS: usize = 50_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Target {
@@ -157,6 +165,19 @@ struct Signature {
     /// Which part holds the anchor, and where in that part it begins.
     anchor_part: usize,
     anchor_start: usize,
+    /// Set for a sub-signature of a logical signature: which one, and which slot of it. Such a
+    /// match only counts toward the logical signature's expression.
+    logical: Option<(u32, u16)>,
+}
+
+/// A `.ldb` signature: sub-signatures and the expression over how often each matched.
+#[derive(Debug, Clone)]
+struct Logical {
+    name: String,
+    /// Inclusive bounds on the size of the whole file.
+    file_size: Option<(u64, u64)>,
+    expression: Expr,
+    subsignatures: usize,
 }
 
 /// How many signature lines a load kept and why it dropped the rest.
@@ -170,6 +191,7 @@ pub struct PatternStats {
 #[derive(Default)]
 pub struct PatternSet {
     signatures: Vec<Signature>,
+    logicals: Vec<Logical>,
     /// Anchors waiting for [`PatternSet::build`].
     pending: Vec<Vec<u8>>,
     automaton: Option<AhoCorasick>,
@@ -190,6 +212,7 @@ impl Clone for PatternSet {
         // is only ever taken of a set that is about to be rebuilt anyway.
         let mut clone = Self {
             signatures: self.signatures.clone(),
+            logicals: self.logicals.clone(),
             pending: self.signatures.iter().map(Signature::anchor).collect(),
             automaton: None,
         };
@@ -211,8 +234,13 @@ impl Signature {
 }
 
 impl PatternSet {
+    /// Body signatures and logical signatures kept.
     pub fn len(&self) -> usize {
-        self.signatures.len()
+        self.signatures
+            .iter()
+            .filter(|signature| signature.logical.is_none())
+            .count()
+            + self.logicals.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -239,6 +267,88 @@ impl PatternSet {
         }
     }
 
+    /// Reads one `.ldb` line: `Name;TargetBlock;Expression;Sub0;Sub1;...`. Returns whether it
+    /// was kept. A signature with any piece this matcher cannot model is dropped whole, because
+    /// the expression cannot be judged without all of them.
+    pub fn ingest_logical(&mut self, line: &str, stats: &mut PatternStats) -> bool {
+        match self.parse_logical(line) {
+            Ok(()) => {
+                stats.loaded += 1;
+                true
+            }
+            Err(Parsed::TooWeak) => {
+                stats.too_weak += 1;
+                false
+            }
+            Err(_) => {
+                stats.unsupported += 1;
+                false
+            }
+        }
+    }
+
+    /// `Err` carries why the line was not kept.
+    fn parse_logical(&mut self, line: &str) -> Result<(), Parsed> {
+        let fields: Vec<&str> = line.trim().split(';').collect();
+        if fields.len() < 4 || fields.len() - 3 > MAX_LOGICAL_SUBSIGNATURES {
+            return Err(Parsed::Unsupported);
+        }
+        let name = fields[0].trim();
+        if name.is_empty() {
+            return Err(Parsed::Unsupported);
+        }
+        let Some((target, file_size)) = parse_target_block(fields[1].trim()) else {
+            return Err(Parsed::Unsupported);
+        };
+        let Some(expression) = Expr::parse(fields[2].trim()) else {
+            return Err(Parsed::Unsupported);
+        };
+        let subsignatures = fields.len() - 3;
+        // Every sub-signature must be used, or the line was split wrongly (a `;` inside one).
+        let mut used = Vec::new();
+        expression.subsignatures(&mut used);
+        used.sort_unstable();
+        used.dedup();
+        if used != (0..subsignatures).collect::<Vec<_>>() {
+            return Err(Parsed::Unsupported);
+        }
+
+        let mut built = Vec::with_capacity(subsignatures);
+        let mut fixed = Vec::with_capacity(subsignatures);
+        for field in &fields[3..] {
+            match parse_subsignature(name, target, field.trim()) {
+                Parsed::Kept(signature) => {
+                    fixed.push(fixed_bytes(&signature));
+                    built.push(signature);
+                }
+                other => return Err(other),
+            }
+        }
+        let needed = expression.required_bytes(&fixed);
+        let floor = if matches!(expression, Expr::Seen(_)) {
+            MIN_FIXED_BYTES
+        } else {
+            MIN_LOGICAL_FIXED_BYTES
+        };
+        if needed < floor {
+            return Err(Parsed::TooWeak);
+        }
+
+        let index = self.logicals.len() as u32;
+        for (slot, mut signature) in built.into_iter().enumerate() {
+            signature.logical = Some((index, slot as u16));
+            self.pending.push(signature.anchor());
+            self.signatures.push(signature);
+        }
+        self.logicals.push(Logical {
+            name: name.to_owned(),
+            file_size,
+            expression,
+            subsignatures,
+        });
+        Ok(())
+    }
+
     /// Builds the automaton once everything is loaded. Idempotent.
     pub fn build(&mut self) {
         if self.pending.len() != self.signatures.len() || self.signatures.is_empty() {
@@ -255,14 +365,19 @@ impl PatternSet {
     /// The name of the first signature `text` matches.
     ///
     /// `truncated` says `text` is only the start of a larger file of `file_size` bytes, so
-    /// signatures anchored to the end of the file cannot be judged.
+    /// signatures anchored to the end of the file cannot be judged, and neither can a logical
+    /// signature, whose expression may depend on something not being there.
     pub fn scan(&self, text: &[u8], file_size: u64, truncated: bool) -> Option<&str> {
         let automaton = self.automaton.as_ref()?;
         let mut steps = 0usize;
         let mut layout: Option<PeLayout> = None;
+        let mut tallies: HashMap<u32, Vec<u32>> = HashMap::new();
         for found in automaton.find_overlapping_iter(text) {
             let signature = &self.signatures[found.pattern().as_usize()];
             if !signature.target.applies_to(text) {
+                continue;
+            }
+            if signature.logical.is_some() && truncated {
                 continue;
             }
             // Read once per file, and only when a PE signature is a candidate.
@@ -274,14 +389,34 @@ impl PatternSet {
                 layout,
             };
             if verify(signature, &context, found.start(), &mut steps) {
-                return Some(&signature.name);
+                let Some((logical, slot)) = signature.logical else {
+                    return Some(&signature.name);
+                };
+                if tallies.len() < MAX_TOUCHED_LOGICALS || tallies.contains_key(&logical) {
+                    let counts = tallies
+                        .entry(logical)
+                        .or_insert_with(|| vec![0; self.logicals[logical as usize].subsignatures]);
+                    counts[slot as usize] = counts[slot as usize].saturating_add(1);
+                }
             }
             if steps > MAX_VERIFY_STEPS * 16 {
                 // One adversarial file must not be allowed to cost minutes.
                 return None;
             }
         }
-        None
+        // The lowest index that holds, so the answer does not depend on hash order.
+        tallies
+            .iter()
+            .filter(|(index, counts)| {
+                let logical = &self.logicals[**index as usize];
+                logical
+                    .file_size
+                    .is_none_or(|(least, most)| (least..=most).contains(&file_size))
+                    && logical.expression.holds(counts)
+            })
+            .map(|(index, _)| *index)
+            .min()
+            .map(|index| self.logicals[index as usize].name.as_str())
     }
 }
 
@@ -315,7 +450,19 @@ fn parse_line(line: &str) -> Parsed {
     if matches!(offset.base, Base::EntryPoint(_) | Base::Section { .. }) && target != Target::Pe {
         return Parsed::Unsupported;
     }
-    let Some(parts) = parse_hex(fields[3].trim()) else {
+    build_signature(name, target, offset, fields[3].trim(), MIN_FIXED_BYTES)
+}
+
+/// A signature from its parts, kept only if it has at least `min_fixed` fixed bytes and a fixed
+/// run to find it by.
+fn build_signature(
+    name: &str,
+    target: Target,
+    offset: Offset,
+    hex: &str,
+    min_fixed: usize,
+) -> Parsed {
+    let Some(parts) = parse_hex(hex) else {
         return Parsed::Unsupported;
     };
 
@@ -326,7 +473,7 @@ fn parse_line(line: &str) -> Parsed {
             Part::Gap { .. } => 0,
         })
         .sum();
-    if fixed < MIN_FIXED_BYTES {
+    if fixed < min_fixed {
         return Parsed::TooWeak;
     }
     // The longest run of fixed bytes anywhere in the signature.
@@ -362,7 +509,81 @@ fn parse_line(line: &str) -> Parsed {
         parts,
         anchor_part,
         anchor_start,
+        logical: None,
     })
+}
+
+/// How many pieces a logical signature may have.
+const MAX_LOGICAL_SUBSIGNATURES: usize = 64;
+
+fn fixed_bytes(signature: &Signature) -> usize {
+    signature
+        .parts
+        .iter()
+        .map(|part| match part {
+            Part::Bytes(bytes) => bytes.iter().flatten().count(),
+            Part::Gap { .. } => 0,
+        })
+        .sum()
+}
+
+/// `Target:1,FileSize:100-2000,Engine:51-255` into a target and a file size range. A key this
+/// matcher does not model makes the signature unsupported: ignoring a condition would widen it.
+fn parse_target_block(text: &str) -> Option<(Target, Option<(u64, u64)>)> {
+    let mut target = None;
+    let mut file_size = None;
+    for entry in text.split(',') {
+        let (key, value) = entry.split_once(':')?;
+        match key.trim() {
+            "Target" => {
+                target = Some(match value.trim() {
+                    "0" => Target::Any,
+                    "1" => Target::Pe,
+                    "2" => Target::Ole2,
+                    "6" => Target::Elf,
+                    "10" => Target::Pdf,
+                    _ => return None,
+                });
+            }
+            "FileSize" => {
+                let (least, most) = value.trim().split_once('-')?;
+                file_size = Some((least.parse().ok()?, most.parse().ok()?));
+            }
+            // The engine versions ClamAV signatures need are all older than this matcher.
+            "Engine" => {}
+            _ => return None,
+        }
+    }
+    Some((target?, file_size))
+}
+
+/// One piece of a logical signature: `hex`, or `offset:hex`. Modifiers (`::i`, `::w`, ...),
+/// regular expressions, macros and alternatives are not modelled.
+fn parse_subsignature(name: &str, target: Target, text: &str) -> Parsed {
+    if text.is_empty()
+        || text.contains("::")
+        || text.starts_with('/')
+        || text.contains(['(', ')', '[', ']', '$', '|', '!'])
+    {
+        return Parsed::Unsupported;
+    }
+    let (offset, hex) = match text.split_once(':') {
+        Some((offset, hex)) => match parse_offset(offset) {
+            Some(offset) => (offset, hex),
+            None => return Parsed::Unsupported,
+        },
+        None => (
+            Offset {
+                base: Base::Anywhere,
+                shift: 0,
+            },
+            text,
+        ),
+    };
+    if matches!(offset.base, Base::EntryPoint(_) | Base::Section { .. }) && target != Target::Pe {
+        return Parsed::Unsupported;
+    }
+    build_signature(name, target, offset, hex, MIN_ANCHOR)
 }
 
 fn parse_offset(text: &str) -> Option<Offset> {
@@ -825,5 +1046,125 @@ mod tests {
         let clone = set.clone();
         let text = [0xde, 0xad, 0xbe, 0xef, 0x00, 0x11, 0x22, 0x33];
         assert_eq!(scan(&clone, &text), Some("Win.Test.Family-1"));
+    }
+
+    fn logical_set(lines: &[&str]) -> (PatternSet, PatternStats) {
+        let mut set = PatternSet::default();
+        let mut stats = PatternStats::default();
+        for line in lines {
+            set.ingest_logical(line, &mut stats);
+        }
+        set.build();
+        (set, stats)
+    }
+
+    fn document(parts: &[&[u8]]) -> Vec<u8> {
+        let mut text = Vec::new();
+        for part in parts {
+            text.extend_from_slice(&[0x41; 20]);
+            text.extend_from_slice(part);
+        }
+        text
+    }
+
+    #[test]
+    fn a_logical_signature_needs_its_expression_to_hold() {
+        let (set, stats) = logical_set(&[
+            "Win.Test.Combo;Target:0;0&1&(2|3);aabbccddeeff;112233445566;556677889900;998877665544",
+        ]);
+        assert_eq!(stats.loaded, 1);
+        let a: &[u8] = &[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        let b: &[u8] = &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        let c: &[u8] = &[0x55, 0x66, 0x77, 0x88, 0x99, 0x00];
+        let d: &[u8] = &[0x99, 0x88, 0x77, 0x66, 0x55, 0x44];
+        assert_eq!(scan(&set, &document(&[a, b, c])), Some("Win.Test.Combo"));
+        assert_eq!(scan(&set, &document(&[d, b, a])), Some("Win.Test.Combo"));
+        // Missing a required piece, or neither of the alternatives.
+        assert_eq!(scan(&set, &document(&[a, c])), None);
+        assert_eq!(scan(&set, &document(&[a, b])), None);
+        // A piece alone is never a detection.
+        assert_eq!(scan(&set, &document(&[a])), None);
+    }
+
+    #[test]
+    fn match_counts_and_file_size_are_honoured() {
+        let (set, stats) = logical_set(&[
+            "Win.Test.Repeated;Target:0;0>2&1;deadbeef01020304;cafebabe05060708",
+            "Win.Test.Sized;Target:0,FileSize:100-200;0&1;0102030405060708;090a0b0c0d0e0f10",
+        ]);
+        assert_eq!(stats.loaded, 2);
+        let dead: &[u8] = &[0xde, 0xad, 0xbe, 0xef, 1, 2, 3, 4];
+        let cafe: &[u8] = &[0xca, 0xfe, 0xba, 0xbe, 5, 6, 7, 8];
+        assert_eq!(
+            scan(&set, &document(&[dead, dead, dead, cafe])),
+            Some("Win.Test.Repeated")
+        );
+        assert_eq!(scan(&set, &document(&[dead, dead, cafe])), None);
+
+        let one: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8];
+        let two: &[u8] = &[9, 10, 11, 12, 13, 14, 15, 16];
+        let mut inside = document(&[one, two]);
+        inside.resize(150, 0x41);
+        assert_eq!(scan(&set, &inside), Some("Win.Test.Sized"));
+        let mut outside = document(&[one, two]);
+        outside.resize(300, 0x41);
+        assert_eq!(scan(&set, &outside), None);
+    }
+
+    #[test]
+    fn pieces_can_carry_offsets() {
+        let (set, _) =
+            logical_set(&["Win.Test.Anchored;Target:0;0&1;0:4d5a900011223344;*:cafebabe05060708"]);
+        let mut text = vec![0x4d, 0x5a, 0x90, 0x00, 0x11, 0x22, 0x33, 0x44];
+        text.extend_from_slice(&[0x41; 30]);
+        text.extend_from_slice(&[0xca, 0xfe, 0xba, 0xbe, 5, 6, 7, 8]);
+        assert_eq!(scan(&set, &text), Some("Win.Test.Anchored"));
+        let mut moved = vec![0x41];
+        moved.extend_from_slice(&text);
+        assert_eq!(scan(&set, &moved), None);
+    }
+
+    #[test]
+    fn unmodelled_pieces_drop_the_whole_signature() {
+        for line in [
+            // A regular expression piece, a modifier, a macro, an alternative.
+            "A;Target:0;0&1;aabbccdd;/evil.*payload/",
+            "A;Target:0;0&1;aabbccdd;11223344::i",
+            "A;Target:0;0&1;aabbccdd;${3-6}0$",
+            "A;Target:0;0&1;aabbccdd;(11223344|55667788)",
+            // A condition on the container.
+            "A;Target:0,Container:CL_TYPE_ZIP;0&1;aabbccdd;11223344",
+            // Mixed operators, or a piece the expression never uses.
+            "A;Target:0;0&1|2;aabbccdd;11223344;55667788",
+            "A;Target:0;0;aabbccdd;11223344",
+            // Not enough fixed bytes in all.
+            "A;Target:0;0&1;aabbccdd;11223344",
+            "A;Target:0;0|1;aabbccdd;1122",
+        ] {
+            let (set, stats) = logical_set(&[line]);
+            assert_eq!(stats.loaded, 0, "{line}");
+            assert!(set.is_empty(), "{line}");
+        }
+        // Eight fixed bytes in all, but a single piece is held to the stand-alone rule.
+        let (_, stats) = logical_set(&["A;Target:0;0;aabbccdd11223344"]);
+        assert_eq!(stats.loaded, 1);
+    }
+
+    #[test]
+    fn truncated_files_are_not_judged_by_logical_signatures() {
+        let (set, _) = logical_set(&[
+            "Win.Test.Neg;Target:0;0&1=0;aabbccddeeff00112233445566778899;deadbeefcafe",
+        ]);
+        let mut text = vec![0x41; 10];
+        text.extend_from_slice(&[
+            0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+            0x88, 0x99,
+        ]);
+        assert_eq!(
+            set.scan(&text, text.len() as u64, false),
+            Some("Win.Test.Neg")
+        );
+        // Only the start was read, so the second piece might be in the part not read.
+        assert_eq!(set.scan(&text, text.len() as u64 + 100, true), None);
     }
 }

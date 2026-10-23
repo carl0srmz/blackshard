@@ -18,7 +18,18 @@ changes are listed here, newest first.
   test-signing no longer leaves a code-signing key on the machine.
 - Self-tests are administrator-only and rate-limited; clearing the history is recorded.
 
+### Added
+- ClamAV body signatures (`.ndb`) and logical signatures (`.ldb`) are matched natively, including
+  entry-point and section offsets, match counts and file-size conditions. Anything the matcher
+  does not model (regular expressions, modifiers, macros, alternatives) is skipped whole.
+- Before an unknown program changes a document, a copy is kept; if the program is convicted of
+  ransomware the originals are restored.
+- Removing a program also removes scheduled tasks, services and Startup-folder items that launch it.
+- CI scans the runner's clean Windows files and fails on any detection, and fails on driver
+  analyzer findings.
+
 ### Fixed
+- 16-bit Windows executables and system DLLs are no longer flagged as malformed or as Office macros.
 - Large valid executables and large ordinary archives are no longer flagged Suspicious.
 - Every member of a multi-member gzip file is scanned.
 - New definition generations are no longer lost when the service is busy.
