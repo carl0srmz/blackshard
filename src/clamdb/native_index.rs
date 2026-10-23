@@ -1,7 +1,7 @@
 //! Native reader for the ClamAV signature databases blackshard consumes directly.
 //!
-//! Only the hash based families are handled here, because they are the ones that can be evaluated
-//! without reimplementing ClamAV's pattern matcher or its bytecode virtual machine:
+//! The hash families are handled here directly, and `.ndb` body signatures through the matcher in
+//! [`super::pattern`]. Logical (`.ldb`) signatures and bytecode are not evaluated yet:
 //!
 //! | Extension       | Layout                               | Meaning                       |
 //! |-----------------|--------------------------------------|-------------------------------|
@@ -9,6 +9,7 @@
 //! | `.hsb` / `.hsu` | `SHA:FileSize:Name`                  | whole file SHA-256            |
 //! | `.mdb` / `.mdu` | `PESectionSize:MD5:Name`             | PE section MD5                |
 //! | `.msb` / `.msu` | `PESectionSize:SHA256:Name`          | PE section SHA-256            |
+//! | `.ndb`          | `Name:Target:Offset:HexSignature`    | byte pattern in the file      |
 //! | `.fp`           | `MD5:FileSize:Name`                  | allowlist, suppresses matches |
 //! | `.sfp`          | `SHA:FileSize:Name`                  | allowlist, suppresses matches |
 //!
@@ -123,6 +124,8 @@ pub enum MatchOrigin {
     WholeFile,
     /// An individual PE section digest matched, which also catches repacked variants.
     PeSection,
+    /// A byte pattern matched inside the file, which catches a family rather than one sample.
+    Pattern,
 }
 
 /// Every hash family blackshard loads out of an unpacked ClamAV database directory.
@@ -143,6 +146,7 @@ pub struct NativeIndex {
     section_sizes: HashSet<u64>,
     /// Set when some section signature uses the `*` size wildcard.
     section_any_size: bool,
+    patterns: super::pattern::PatternSet,
 }
 
 /// Which database families a load should consider.
@@ -159,11 +163,15 @@ pub struct LoadStats {
     pub file_hashes: usize,
     pub section_hashes: usize,
     pub allowlist_entries: usize,
+    /// `.ndb` body signatures kept.
+    pub patterns: usize,
+    /// `.ndb` lines that use features the matcher does not model, or are too weak to convict on.
+    pub patterns_skipped: usize,
 }
 
 impl LoadStats {
     pub fn total(&self) -> usize {
-        self.file_hashes + self.section_hashes + self.allowlist_entries
+        self.file_hashes + self.section_hashes + self.allowlist_entries + self.patterns
     }
 }
 
@@ -185,6 +193,7 @@ impl NativeIndex {
             + self.file_md5.len()
             + self.section_sha256.len()
             + self.section_md5.len()
+            + self.patterns.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -218,23 +227,39 @@ impl NativeIndex {
             if !options.include_pua && extension.ends_with('u') && extension != "sfp" {
                 continue;
             }
-            let added = self.load_from_file(entry.path())?;
+            let added = self.load_file(entry.path(), false)?;
             stats.file_hashes += added.file_hashes;
             stats.section_hashes += added.section_hashes;
             stats.allowlist_entries += added.allowlist_entries;
+            stats.patterns += added.patterns;
+            stats.patterns_skipped += added.patterns_skipped;
         }
         self.sort();
+        self.patterns.build();
         Ok(stats)
     }
 
     /// Loads one database file, dispatching on its extension.
     pub fn load_from_file<P: AsRef<Path>>(&mut self, path: P) -> io::Result<LoadStats> {
-        let path = path.as_ref();
+        self.load_file(path.as_ref(), true)
+    }
+
+    /// `finish` says whether this is the last file of a load, so the pattern automaton is built
+    /// now rather than by the directory walk that called it.
+    fn load_file(&mut self, path: &Path, finish: bool) -> io::Result<LoadStats> {
         let extension = path
             .extension()
             .and_then(|value| value.to_str())
             .unwrap_or_default()
             .to_ascii_lowercase();
+
+        if extension == "ndb" {
+            let stats = self.load_patterns(path)?;
+            if finish {
+                self.patterns.build();
+            }
+            return Ok(stats);
+        }
 
         let (family, hash_first) = match extension.as_str() {
             "hdb" | "hdu" | "hsb" | "hsu" => (Family::FileHash, true),
@@ -263,6 +288,48 @@ impl NativeIndex {
             }
         }
         Ok(stats)
+    }
+
+    fn load_patterns(&mut self, path: &Path) -> io::Result<LoadStats> {
+        let mut pattern_stats = super::pattern::PatternStats::default();
+        for line in BufReader::new(File::open(path)?).lines() {
+            let line = line?;
+            if line.len() > MAX_LINE_BYTES {
+                pattern_stats.unsupported += 1;
+                continue;
+            }
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            self.patterns.ingest(line, &mut pattern_stats);
+        }
+        Ok(LoadStats {
+            patterns: pattern_stats.loaded,
+            patterns_skipped: pattern_stats.unsupported + pattern_stats.too_weak,
+            ..LoadStats::default()
+        })
+    }
+
+    /// Looks for a body signature in `sample`, the start of a file of `file_size` bytes. Files
+    /// vouched for by the allowlists are never convicted.
+    pub fn evaluate_patterns(
+        &self,
+        sample: &[u8],
+        file_size: u64,
+        sha256: &[u8; 32],
+        md5: Option<&[u8; 16]>,
+    ) -> Option<IndexMatch> {
+        if self.patterns.is_empty() || self.is_allowlisted(sha256, md5) {
+            return None;
+        }
+        let truncated = file_size > sample.len() as u64;
+        self.patterns
+            .scan(sample, file_size, truncated)
+            .map(|name| IndexMatch {
+                threat_name: name.to_owned(),
+                origin: MatchOrigin::Pattern,
+            })
     }
 
     /// Parses one signature line. Returns whether it was understood and stored.
@@ -504,6 +571,47 @@ mod tests {
 
     fn md5(byte: &str) -> [u8; 16] {
         hex::decode(byte.repeat(16)).unwrap().try_into().unwrap()
+    }
+
+    #[test]
+    fn body_signatures_load_match_and_respect_the_allowlist() {
+        let directory = tempfile::tempdir().unwrap();
+        write(
+            directory.path(),
+            "main.ndb",
+            "Win.Test.Family:0:*:deadbeef00112233\nUnsupported.Sig:1:EP+0:11223344556677889900",
+        );
+        let mut index = NativeIndex::new();
+        let stats = index
+            .load_from_directory(directory.path(), LoadOptions::default())
+            .unwrap();
+        assert_eq!((stats.patterns, stats.patterns_skipped), (1, 1));
+        assert_eq!(index.len(), 1);
+
+        let sample = [0u8, 0, 0xde, 0xad, 0xbe, 0xef, 0x00, 0x11, 0x22, 0x33, 9];
+        let digest = sha("ab");
+        let matched = index
+            .evaluate_patterns(&sample, sample.len() as u64, &digest, None)
+            .expect("pattern should match");
+        assert_eq!(matched.threat_name, "Win.Test.Family");
+        assert_eq!(matched.origin, MatchOrigin::Pattern);
+        assert!(index
+            .evaluate_patterns(&[0u8; 64], 64, &digest, None)
+            .is_none());
+
+        // A file ClamAV vouches for is never convicted by a pattern.
+        write(
+            directory.path(),
+            "daily.fp",
+            &format!("{}:11:Allowed", "ab".repeat(16)),
+        );
+        let mut vouched = NativeIndex::new();
+        vouched
+            .load_from_directory(directory.path(), LoadOptions::default())
+            .unwrap();
+        assert!(vouched
+            .evaluate_patterns(&sample, sample.len() as u64, &digest, Some(&md5("ab")))
+            .is_none());
     }
 
     #[test]

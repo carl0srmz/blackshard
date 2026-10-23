@@ -32,6 +32,7 @@ cfb = "0.15.0"
 ed25519-dalek = "3.0.0"
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
 hex = "0.4.3"
+aho-corasick = "1.1.5"
 base64 = "0.22.1"
 rand = "0.10.2"
 serde = { version = "1.0", features = ["derive"] }

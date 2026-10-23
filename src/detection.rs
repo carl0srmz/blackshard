@@ -197,6 +197,7 @@ impl DetectionEngine {
             .and_then(|value| hex::decode(value).ok())
             .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())?;
 
+        let md5_ref = whole_file_md5.as_ref();
         self.native_index.read().ok().and_then(|index| {
             // Section digests only mean anything for a PE, and parsing is skipped otherwise.
             let sections = if matches!(
@@ -207,12 +208,10 @@ impl DetectionEngine {
             } else {
                 Vec::new()
             };
-            index.evaluate(
-                &sha256,
-                whole_file_md5.as_ref(),
-                Some(declared_size),
-                &sections,
-            )
+            index
+                .evaluate(&sha256, md5_ref, Some(declared_size), &sections)
+                // Hashes first, being exact; a byte pattern only when no hash recognised the file.
+                .or_else(|| index.evaluate_patterns(sample, declared_size, &sha256, md5_ref))
         })
     }
 
@@ -922,6 +921,7 @@ impl EvidenceCascade {
             let (score, certainty) = match matched.origin {
                 MatchOrigin::WholeFile => (100, 100),
                 MatchOrigin::PeSection => (95, 95),
+                MatchOrigin::Pattern => (92, 92),
             };
             risk_score = score;
             confidence = certainty;
