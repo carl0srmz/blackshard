@@ -163,7 +163,22 @@ impl RuleEngine {
     }
 
     pub fn scan(&self, bytes: &[u8]) -> Result<Vec<RuleMatch>, String> {
-        let mut scanner = Scanner::new(&self.rules);
+        // Making a scanner builds a WebAssembly store, which costs more than scanning a small
+        // file, so each thread keeps its scanner for as long as it scans with the same rules.
+        SCANNER.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            if slot
+                .as_ref()
+                .is_none_or(|cached| !Arc::ptr_eq(&cached.rules, &self.rules))
+            {
+                *slot = Some(CachedScanner::new(Arc::clone(&self.rules)));
+            }
+            let cached = slot.as_mut().expect("a scanner was just stored");
+            self.scan_with(&mut cached.scanner, bytes)
+        })
+    }
+
+    fn scan_with(&self, scanner: &mut Scanner<'_>, bytes: &[u8]) -> Result<Vec<RuleMatch>, String> {
         scanner
             .set_timeout(Duration::from_millis(250))
             .max_matches_per_pattern(32)
@@ -204,6 +219,28 @@ impl RuleEngine {
         }
         Ok(matches)
     }
+}
+
+/// A scanner together with the rules it borrows from.
+struct CachedScanner {
+    // Declared first so it is dropped first: it points into `rules`.
+    scanner: Scanner<'static>,
+    rules: Arc<Rules>,
+}
+
+impl CachedScanner {
+    fn new(rules: Arc<Rules>) -> Self {
+        // SAFETY: the scanner borrows the `Rules` inside the `Arc`, which this struct keeps alive
+        // for as long as the scanner exists (fields drop in declaration order, scanner first), and
+        // `Rules` is never mutated once built. The borrow is extended to 'static only so the two
+        // can be stored together; nothing outside this struct ever sees the extended lifetime.
+        let scanner = Scanner::new(unsafe { &*Arc::as_ptr(&rules) });
+        Self { scanner, rules }
+    }
+}
+
+thread_local! {
+    static SCANNER: std::cell::RefCell<Option<CachedScanner>> = const { std::cell::RefCell::new(None) };
 }
 
 fn provenance_for(namespace: &str, identifier: &str) -> RuleProvenance {
