@@ -485,10 +485,21 @@ impl DetectionEngine {
         started: Instant,
         system_amsi: SystemAmsi,
     ) -> DetectionReport {
-        let content_type = report
+        let mut content_type = report
             .static_report
             .as_ref()
             .map(|static_report| static_report.content_type);
+        // A program or document with an archive appended (a self-extractor, a polyglot) is
+        // opened by an archiver from the end, so it is inspected as the archive it also is.
+        if !report.truncated
+            && !matches!(
+                content_type,
+                Some(ContentType::Zip | ContentType::Gzip | ContentType::OleCompound)
+            )
+            && has_trailing_zip(bytes)
+        {
+            content_type = Some(ContentType::Zip);
+        }
         if report.truncated
             || !matches!(
                 content_type,
@@ -1042,6 +1053,45 @@ fn learned_shard(static_report: &ScanReport) -> Option<String> {
         .and_then(crate::shards::lookup)
 }
 
+/// Whether `bytes` end with a well-formed ZIP end-of-central-directory record, whatever comes
+/// before the archive. The record must be the last thing in the file (apart from its own comment)
+/// and point at a central directory that lies before it.
+fn has_trailing_zip(bytes: &[u8]) -> bool {
+    const SIGNATURE: &[u8] = b"PK\x05\x06";
+    const RECORD: usize = 22;
+    // The comment is at most 65,535 bytes.
+    let window_start = bytes.len().saturating_sub(RECORD + u16::MAX as usize);
+    let Some(tail) = bytes.get(window_start..) else {
+        return false;
+    };
+    let mut search_end = tail.len();
+    while search_end >= RECORD {
+        let Some(found) = tail[..search_end]
+            .windows(SIGNATURE.len())
+            .rposition(|window| window == SIGNATURE)
+        else {
+            return false;
+        };
+        search_end = found + SIGNATURE.len() - 1;
+        let Some(record) = tail.get(found..found + RECORD) else {
+            continue;
+        };
+        let comment = u16::from_le_bytes([record[20], record[21]]) as usize;
+        if found + RECORD + comment != tail.len() {
+            continue;
+        }
+        let directory_size = u32::from_le_bytes([record[12], record[13], record[14], record[15]]);
+        let directory_offset = u32::from_le_bytes([record[16], record[17], record[18], record[19]]);
+        let record_at = (window_start + found) as u64;
+        if u64::from(directory_offset) + u64::from(directory_size) <= record_at
+            && directory_size > 0
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn shared_native_index() -> Arc<RwLock<NativeIndex>> {
     static SHARED: OnceLock<Arc<RwLock<NativeIndex>>> = OnceLock::new();
     Arc::clone(SHARED.get_or_init(|| Arc::new(RwLock::new(NativeIndex::new()))))
@@ -1061,6 +1111,52 @@ fn shared_system_amsi() -> Result<Arc<AmsiScanner>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn zip_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        let mut output = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut output);
+            for (name, contents) in entries {
+                writer
+                    .start_file(*name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                writer.write_all(contents).unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        output.into_inner()
+    }
+
+    #[test]
+    fn an_archive_appended_to_a_program_is_inspected() {
+        let engine = DetectionEngine::builtin().unwrap();
+        let archive = zip_of(&[("payload.txt", crate::self_test::PAYLOAD)]);
+        assert!(has_trailing_zip(&archive));
+
+        // A self-extractor shape: something that is not a zip, then a zip.
+        let mut program = b"MZ\x90\x00".to_vec();
+        program.extend(std::iter::repeat_n(0x90u8, 4096));
+        program.extend_from_slice(&archive);
+        assert!(has_trailing_zip(&program));
+        let report = engine.scan_bytes(&program);
+        assert_eq!(report.verdict, DetectionVerdict::Malicious, "{report:?}");
+
+        // Nothing appended, or garbage that only mentions the signature, is not an archive.
+        assert!(!has_trailing_zip(b"MZ plain program"));
+        let mut mention = vec![0u8; 100];
+        mention.extend_from_slice(b"PK\x05\x06");
+        mention.extend_from_slice(&[0u8; 30]);
+        assert!(!has_trailing_zip(&mention));
+        assert!(!has_trailing_zip(b""));
+        let clean = zip_of(&[("notes.txt", b"nothing here")]);
+        let mut wrapped = b"MZ\x90\x00".to_vec();
+        wrapped.extend_from_slice(&clean);
+        assert_ne!(
+            engine.scan_bytes(&wrapped).verdict,
+            DetectionVerdict::Malicious
+        );
+    }
 
     #[test]
     fn a_panicking_analysis_becomes_an_error_verdict() {
