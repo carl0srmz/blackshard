@@ -17,7 +17,7 @@
 //! fewer than [`MIN_FIXED_BYTES`] fixed bytes in all, is too weak to convict on and is skipped.
 
 use super::logical::Expr;
-use aho_corasick::{AhoCorasick, AhoCorasickKind, MatchKind};
+use daachorse::{DoubleArrayAhoCorasick, DoubleArrayAhoCorasickBuilder, MatchKind};
 use std::collections::HashMap;
 
 /// The shortest fixed run a signature may be found by.
@@ -199,12 +199,57 @@ pub struct PatternStats {
 pub struct PatternSet {
     signatures: Vec<Signature>,
     logicals: Vec<Logical>,
-    /// Finds the anchors of case-sensitive signatures; `plain_ids` maps its patterns back to
-    /// `signatures`. Case-folded signatures have an automaton of their own.
-    plain: Option<AhoCorasick>,
-    plain_ids: Vec<usize>,
-    folded: Option<AhoCorasick>,
-    folded_ids: Vec<usize>,
+    /// Finds the anchors of case-sensitive signatures; each pattern maps to the signatures that
+    /// share that anchor. Case-folded signatures have an automaton of their own, run over a
+    /// lowercased copy of the text.
+    plain: Option<Anchors>,
+    folded: Option<Anchors>,
+}
+
+/// An automaton over anchors, and which signatures each anchor belongs to.
+struct Anchors {
+    automaton: DoubleArrayAhoCorasick<u32>,
+    signatures: Vec<Vec<usize>>,
+}
+
+impl Anchors {
+    /// `None` when there are no anchors, or the automaton cannot be built.
+    fn build(anchors: Vec<(Vec<u8>, usize)>) -> Option<Self> {
+        let mut index: HashMap<Vec<u8>, usize> = HashMap::new();
+        let mut patterns: Vec<Vec<u8>> = Vec::new();
+        let mut signatures: Vec<Vec<usize>> = Vec::new();
+        for (anchor, signature) in anchors {
+            // The automaton refuses duplicates; several signatures may share one anchor.
+            let group = *index.entry(anchor.clone()).or_insert_with(|| {
+                patterns.push(anchor);
+                signatures.push(Vec::new());
+                patterns.len() - 1
+            });
+            signatures[group].push(signature);
+        }
+        if patterns.is_empty() {
+            return None;
+        }
+        let automaton = DoubleArrayAhoCorasickBuilder::new()
+            .match_kind(MatchKind::Standard)
+            .build(&patterns)
+            .ok()?;
+        Some(Self {
+            automaton,
+            signatures,
+        })
+    }
+
+    /// Every signature whose anchor occurs in `text`, with where the anchor starts.
+    fn hits<'a>(&'a self, text: &'a [u8]) -> impl Iterator<Item = (usize, usize)> + 'a {
+        self.automaton
+            .find_overlapping_iter(text)
+            .flat_map(|found| {
+                self.signatures[found.value() as usize]
+                    .iter()
+                    .map(move |signature| (*signature, found.start()))
+            })
+    }
 }
 
 impl std::fmt::Debug for PatternSet {
@@ -224,9 +269,7 @@ impl Clone for PatternSet {
             signatures: self.signatures.clone(),
             logicals: self.logicals.clone(),
             plain: None,
-            plain_ids: Vec::new(),
             folded: None,
-            folded_ids: Vec::new(),
         };
         clone.build();
         clone
@@ -364,31 +407,15 @@ impl PatternSet {
     /// Builds the automata once everything is loaded. Idempotent.
     pub fn build(&mut self) {
         let (mut plain, mut folded) = (Vec::new(), Vec::new());
-        self.plain_ids.clear();
-        self.folded_ids.clear();
         for (index, signature) in self.signatures.iter().enumerate() {
             if signature.fold {
-                folded.push(signature.anchor());
-                self.folded_ids.push(index);
+                folded.push((signature.anchor().to_ascii_lowercase(), index));
             } else {
-                plain.push(signature.anchor());
-                self.plain_ids.push(index);
+                plain.push((signature.anchor(), index));
             }
         }
-        let build = |anchors: &[Vec<u8>], fold: bool| {
-            (!anchors.is_empty())
-                .then(|| {
-                    AhoCorasick::builder()
-                        .match_kind(MatchKind::Standard)
-                        .kind(Some(AhoCorasickKind::ContiguousNFA))
-                        .ascii_case_insensitive(fold)
-                        .build(anchors)
-                        .ok()
-                })
-                .flatten()
-        };
-        self.plain = build(&plain, false);
-        self.folded = build(&folded, true);
+        self.plain = Anchors::build(plain);
+        self.folded = Anchors::build(folded);
     }
 
     /// The name of the first signature `text` matches.
@@ -403,16 +430,14 @@ impl PatternSet {
         let mut steps = 0usize;
         let mut layout: Option<PeLayout> = None;
         let mut tallies: HashMap<u32, Vec<u32>> = HashMap::new();
-        let plain = self.plain.iter().flat_map(|automaton| {
-            automaton
-                .find_overlapping_iter(text)
-                .map(|found| (self.plain_ids[found.pattern().as_usize()], found.start()))
-        });
-        let folded = self.folded.iter().flat_map(|automaton| {
-            automaton
-                .find_overlapping_iter(text)
-                .map(|found| (self.folded_ids[found.pattern().as_usize()], found.start()))
-        });
+        // Anchors that ignore case are looked for in a lowercased copy, made only when needed.
+        let lowered = self.folded.as_ref().map(|_| text.to_ascii_lowercase());
+        let plain = self.plain.iter().flat_map(|anchors| anchors.hits(text));
+        let folded = self
+            .folded
+            .iter()
+            .zip(lowered.iter())
+            .flat_map(|(anchors, lowered)| anchors.hits(lowered));
         for (index, start) in plain.chain(folded) {
             let signature = &self.signatures[index];
             if !signature.target.applies_to(text) {

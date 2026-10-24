@@ -632,11 +632,11 @@ dependencies = [
 name = "blackshard"
 version = "0.1.0"
 dependencies = [
- "aho-corasick",
  "base64 0.22.1",
  "cfb",
  "chacha20poly1305",
  "chrono",
+ "daachorse",
  "ed25519-dalek",
  "eframe",
  "env_logger",
