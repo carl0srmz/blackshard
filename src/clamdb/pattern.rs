@@ -1783,4 +1783,70 @@ mod tests {
             assert_eq!(scan(&first, &document(&[piece_b])), None);
         }
     }
+
+    /// Signature lines made by damaging good ones, and text made of the bytes they look for,
+    /// must never panic or hang the matcher.
+    #[test]
+    fn damaged_signatures_and_odd_text_never_panic() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move |limit: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % limit
+        };
+        let ndb = [
+            "Win.A:1:EP+0,10:aabbccdd??eeff00{2-4}11223344*55667788",
+            "Win.B:0:*:deadbeef00112233",
+            "Win.C:0:EOF-64:cafebabe0102030405",
+        ];
+        let ldb = [
+            "Win.L:Target:1,FileSize:10-5000;0&1&(2|3)>1;aabbccdd11223344;0:4d5a900011223344::i;99887766554433221100::wa;55667788aabbccdd::f",
+            "Win.M:Target:0;0=0&1;aabbccddeeff00112233445566778899;deadbeefcafebabe",
+        ];
+        let alphabet = b"0123456789abcdef:;,*?{}()|&<>=-+EOFPSLx ::iwaf\n";
+        for round in 0..1000 {
+            let mut set = PatternSet::default();
+            let mut stats = PatternStats::default();
+            for _ in 0..6 {
+                let source = if next(2) == 0 {
+                    ndb[next(ndb.len() as u64) as usize]
+                } else {
+                    ldb[next(ldb.len() as u64) as usize]
+                };
+                let mut line = source.as_bytes().to_vec();
+                for _ in 0..next(6) {
+                    let at = next(line.len() as u64 + 1) as usize;
+                    match next(3) {
+                        0 if at < line.len() => {
+                            line[at] = alphabet[next(alphabet.len() as u64) as usize]
+                        }
+                        1 if at < line.len() => {
+                            line.remove(at);
+                        }
+                        _ => line.insert(at, alphabet[next(alphabet.len() as u64) as usize]),
+                    }
+                }
+                let Ok(line) = String::from_utf8(line) else {
+                    continue;
+                };
+                if line.contains(';') {
+                    set.ingest_logical(&line, &mut stats);
+                } else {
+                    set.ingest(&line, &mut stats);
+                }
+            }
+            set.build();
+            let mut text: Vec<u8> = (0..next(400)).map(|_| next(256) as u8).collect();
+            if round % 3 == 0 {
+                text.splice(0..0, *b"MZ");
+            }
+            for needle in [&[0xaa, 0xbb, 0xcc, 0xdd][..], &[0xde, 0xad, 0xbe, 0xef][..]] {
+                let at = next(text.len() as u64 + 1) as usize;
+                text.splice(at..at, needle.iter().copied());
+            }
+            let _ = set.scan(&text, text.len() as u64, false);
+            let _ = set.scan(&text, text.len() as u64 + 5, true);
+        }
+    }
 }

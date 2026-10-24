@@ -39,4 +39,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "clamav_signatures"
+path = "fuzz_targets/clamav_signatures.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
