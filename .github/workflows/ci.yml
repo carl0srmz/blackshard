@@ -402,6 +402,32 @@ jobs:
           gh release edit $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY `
             --prerelease --title "testing candidate ($version)" --notes-file notes.md
 
+  # The engine is platform independent, so it is built and tested on Linux as well: minutes
+  # instead of the Windows job's half hour, which makes it the quick signal. The Windows job
+  # remains the gate; this one covers everything in the library that is not Windows-only.
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-on-failure: false
+
+      - name: Run cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: Run cargo clippy on the library
+        run: cargo clippy --lib -- -D warnings
+
+      - name: Run the library's tests
+        run: cargo test --lib
+
   dependency-audit:
     runs-on: ubuntu-latest
 

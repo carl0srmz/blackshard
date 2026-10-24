@@ -1,3 +1,7 @@
+// The service, driver and UI halves are Windows-only; on other systems (where the engine is built
+// and tested) what only they use is expected to be unused.
+#![cfg_attr(not(windows), allow(dead_code, unused_imports))]
+
 pub mod amsi;
 pub mod archive;
 pub mod atomic_file;
@@ -6,6 +10,7 @@ pub mod config;
 pub mod definitions;
 pub mod detection;
 pub mod driver_installer;
+#[cfg(windows)]
 pub mod elevation;
 pub mod engine;
 pub mod history;
@@ -17,6 +22,7 @@ pub mod paths;
 pub mod persistence;
 pub mod quarantine;
 pub mod readiness;
+#[cfg(windows)]
 pub mod realtime;
 pub mod remediation;
 pub mod rollback;
@@ -28,6 +34,7 @@ pub mod service_log;
 pub mod shards;
 pub mod similarity;
 pub mod trust;
+#[cfg(windows)]
 pub mod ui;
 pub mod update_client;
 pub mod updater;

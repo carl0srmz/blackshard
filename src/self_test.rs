@@ -1,7 +1,10 @@
 use crate::detection::{DetectionEngine, DetectionVerdict};
 use crate::readiness::ProtectionTier;
+#[cfg(windows)]
 use crate::realtime;
+#[cfg(windows)]
 use std::fs;
+#[cfg(windows)]
 use uuid::Uuid;
 
 pub const PAYLOAD: &[u8] =
@@ -39,6 +42,12 @@ pub fn run_detection_self_test(engine: &DetectionEngine) -> Result<String, Strin
     }
 }
 
+#[cfg(not(windows))]
+pub fn run_self_test() -> Result<String, String> {
+    Err("the kernel self-test needs the Windows driver".to_owned())
+}
+
+#[cfg(windows)]
 pub fn run_self_test() -> Result<String, String> {
     let test_id = Uuid::new_v4();
     let file_name = format!("blackshard-selftest-{}.com", test_id);

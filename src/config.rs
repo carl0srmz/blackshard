@@ -302,6 +302,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn exclusions_match_the_forms_real_time_events_arrive_in() {
         let temporary = tempfile::tempdir().unwrap();
         let excluded = fs::canonicalize(temporary.path())

@@ -1309,6 +1309,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn health_path_is_stable_and_machine_scoped() {
         let path = service_health_path_from_program_data(Path::new(r"D:\MachineData"));
         assert_eq!(
