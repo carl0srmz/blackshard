@@ -219,6 +219,46 @@ fn corpus_evaluation_exit_code() -> Option<i32> {
     )
 }
 
+/// How fast the signature matcher alone reads the corpus, apart from everything else a scan does,
+/// so a slowdown can be told from a slower matcher.
+fn report_matcher_speed(index: &clamdb::native_index::NativeIndex, root: &std::path::Path) {
+    use std::io::Read;
+    const SAMPLE_BYTES: u64 = 64 * 1024 * 1024;
+    let (mut bytes_read, mut files, mut hits) = (0u64, 0usize, 0usize);
+    let mut elapsed = std::time::Duration::ZERO;
+    for entry in walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .max_depth(64)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+    {
+        let Ok(file) = fs::File::open(entry.path()) else {
+            continue;
+        };
+        let size = file.metadata().map_or(0, |metadata| metadata.len());
+        let mut sample = Vec::new();
+        if file.take(SAMPLE_BYTES).read_to_end(&mut sample).is_err() {
+            continue;
+        }
+        let started = std::time::Instant::now();
+        if index
+            .evaluate_patterns(&sample, size, &[0; 32], None)
+            .is_some()
+        {
+            hits += 1;
+        }
+        elapsed += started.elapsed();
+        bytes_read += sample.len() as u64;
+        files += 1;
+    }
+    let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
+    println!(
+        "Signature matcher alone: {:.1} MiB/s over {files} files ({hits} matched)",
+        bytes_read as f64 / (1024.0 * 1024.0) / seconds
+    );
+}
+
 fn evaluate_corpus(
     root: &std::path::Path,
     output: &std::path::Path,
@@ -251,6 +291,7 @@ fn evaluate_corpus(
             "Evaluating with {} file hashes, {} section hashes and {} body signatures",
             loaded.file_hashes, loaded.section_hashes, loaded.patterns
         );
+        report_matcher_speed(&index, &root);
         engine = engine.with_native_index(index);
     }
     let wall_started = std::time::Instant::now();
