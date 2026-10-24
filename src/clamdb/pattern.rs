@@ -19,6 +19,7 @@
 use super::logical::Expr;
 use daachorse::{DoubleArrayAhoCorasick, DoubleArrayAhoCorasickBuilder, MatchKind};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The shortest fixed run a signature may be found by.
 const MIN_ANCHOR: usize = 4;
@@ -199,11 +200,14 @@ pub struct PatternStats {
 pub struct PatternSet {
     signatures: Vec<Signature>,
     logicals: Vec<Logical>,
-    /// Finds the anchors of case-sensitive signatures; each pattern maps to the signatures that
-    /// share that anchor. Case-folded signatures have an automaton of their own, run over a
-    /// lowercased copy of the text.
-    plain: Option<Anchors>,
-    folded: Option<Anchors>,
+    /// Finds every signature's anchor, in lowercase, in a lowercased copy of the text: one pass
+    /// serves case-sensitive and case-insensitive signatures alike. A case-sensitive signature's
+    /// whole match is then checked against the original text, which settles its case.
+    anchors: Option<Anchors>,
+    /// Anchor occurrences found, and how many were then checked against their whole signature,
+    /// over every scan since the set was built. They show where scan time goes.
+    anchor_hits: AtomicU64,
+    verifications: AtomicU64,
 }
 
 /// An automaton over anchors, and which signatures each anchor belongs to.
@@ -268,8 +272,9 @@ impl Clone for PatternSet {
         let mut clone = Self {
             signatures: self.signatures.clone(),
             logicals: self.logicals.clone(),
-            plain: None,
-            folded: None,
+            anchors: None,
+            anchor_hits: AtomicU64::new(0),
+            verifications: AtomicU64::new(0),
         };
         clone.build();
         clone
@@ -404,18 +409,15 @@ impl PatternSet {
         Ok(())
     }
 
-    /// Builds the automata once everything is loaded. Idempotent.
+    /// Builds the automaton once everything is loaded. Idempotent.
     pub fn build(&mut self) {
-        let (mut plain, mut folded) = (Vec::new(), Vec::new());
-        for (index, signature) in self.signatures.iter().enumerate() {
-            if signature.fold {
-                folded.push((signature.anchor().to_ascii_lowercase(), index));
-            } else {
-                plain.push((signature.anchor(), index));
-            }
-        }
-        self.plain = Anchors::build(plain);
-        self.folded = Anchors::build(folded);
+        let anchors = self
+            .signatures
+            .iter()
+            .enumerate()
+            .map(|(index, signature)| (signature.anchor().to_ascii_lowercase(), index))
+            .collect();
+        self.anchors = Anchors::build(anchors);
     }
 
     /// The name of the first signature `text` matches.
@@ -424,21 +426,36 @@ impl PatternSet {
     /// signatures anchored to the end of the file cannot be judged, and neither can a logical
     /// signature, whose expression may depend on something not being there.
     pub fn scan(&self, text: &[u8], file_size: u64, truncated: bool) -> Option<&str> {
-        if self.plain.is_none() && self.folded.is_none() {
-            return None;
-        }
+        let (mut hits, mut verified) = (0u64, 0u64);
+        let found = self.scan_counting(text, file_size, truncated, &mut hits, &mut verified);
+        self.anchor_hits.fetch_add(hits, Ordering::Relaxed);
+        self.verifications.fetch_add(verified, Ordering::Relaxed);
+        found
+    }
+
+    /// `(anchor occurrences, whole-signature checks)` over all scans so far.
+    pub fn work(&self) -> (u64, u64) {
+        (
+            self.anchor_hits.load(Ordering::Relaxed),
+            self.verifications.load(Ordering::Relaxed),
+        )
+    }
+
+    fn scan_counting(
+        &self,
+        text: &[u8],
+        file_size: u64,
+        truncated: bool,
+        hits: &mut u64,
+        verified: &mut u64,
+    ) -> Option<&str> {
+        let anchors = self.anchors.as_ref()?;
         let mut steps = 0usize;
         let mut layout: Option<PeLayout> = None;
         let mut tallies: HashMap<u32, Vec<u32>> = HashMap::new();
-        // Anchors that ignore case are looked for in a lowercased copy, made only when needed.
-        let lowered = self.folded.as_ref().map(|_| text.to_ascii_lowercase());
-        let plain = self.plain.iter().flat_map(|anchors| anchors.hits(text));
-        let folded = self
-            .folded
-            .iter()
-            .zip(lowered.iter())
-            .flat_map(|(anchors, lowered)| anchors.hits(lowered));
-        for (index, start) in plain.chain(folded) {
+        let lowered = text.to_ascii_lowercase();
+        for (index, start) in anchors.hits(&lowered) {
+            *hits += 1;
             let signature = &self.signatures[index];
             if !signature.target.applies_to(text) {
                 continue;
@@ -454,6 +471,7 @@ impl PatternSet {
                 truncated,
                 layout,
             };
+            *verified += 1;
             if verify(signature, &context, start, &mut steps) {
                 let Some((logical, slot)) = signature.logical else {
                     return Some(&signature.name);
@@ -1465,5 +1483,14 @@ mod tests {
         assert_eq!(scan(&set, &with(b"EVIL_PAYLOAD")), Some("Win.Test.Folded"));
         assert_eq!(scan(&set, &with(b"evil-payload")), Some("Win.Test.Folded"));
         assert_eq!(scan(&set, &with(b"evil-paylaod")), None);
+    }
+
+    #[test]
+    fn case_sensitive_signatures_stay_case_sensitive() {
+        // "EvilPayload" with one automaton for everything: only the exact case convicts.
+        let (set, _) = set(&["Win.Test.Case:0:*:4576696c5061796c6f6164"]);
+        assert_eq!(scan(&set, b"..EvilPayload.."), Some("Win.Test.Case"));
+        assert_eq!(scan(&set, b"..evilpayload.."), None);
+        assert_eq!(scan(&set, b"..EVILPAYLOAD.."), None);
     }
 }

@@ -253,9 +253,13 @@ fn report_matcher_speed(index: &clamdb::native_index::NativeIndex, root: &std::p
         files += 1;
     }
     let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
+    let (anchors, checks) = index.pattern_work();
+    let mib = bytes_read as f64 / (1024.0 * 1024.0);
     println!(
-        "Signature matcher alone: {:.1} MiB/s over {files} files ({hits} matched)",
-        bytes_read as f64 / (1024.0 * 1024.0) / seconds
+        "Signature matcher alone: {:.1} MiB/s over {files} files ({hits} matched); {:.0} anchor hits and {:.0} full checks per MiB",
+        mib / seconds,
+        anchors as f64 / mib.max(f64::EPSILON),
+        checks as f64 / mib.max(f64::EPSILON)
     );
 }
 

@@ -328,6 +328,11 @@ impl NativeIndex {
         })
     }
 
+    /// `(anchor occurrences, whole-signature checks)` the body matcher has done so far.
+    pub fn pattern_work(&self) -> (u64, u64) {
+        self.patterns.work()
+    }
+
     /// Looks for a body signature in `sample`, the start of a file of `file_size` bytes. Files
     /// vouched for by the allowlists are never convicted.
     pub fn evaluate_patterns(
