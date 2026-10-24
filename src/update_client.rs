@@ -569,7 +569,7 @@ fn update_worker(
         let delay = config.scheduler.delay_for_sample(rand::rng().next_u64());
         let next_check = SystemTime::now()
             .checked_add(delay)
-            .unwrap_or(SystemTime::UNIX_EPOCH + Duration::from_secs(u64::MAX));
+            .unwrap_or_else(|| SystemTime::UNIX_EPOCH + Duration::from_secs(u64::MAX));
         mutate_status(&status, |value| {
             value.phase = UpdatePhase::Sleeping;
             value.next_check = Some(next_check);

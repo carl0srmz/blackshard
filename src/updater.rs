@@ -662,7 +662,7 @@ impl UpdateScheduler {
 
     pub fn next_check(&self, now: SystemTime, random_sample: u64) -> SystemTime {
         now.checked_add(self.delay_for_sample(random_sample))
-            .unwrap_or(SystemTime::UNIX_EPOCH + Duration::from_secs(u64::MAX))
+            .unwrap_or_else(|| SystemTime::UNIX_EPOCH + Duration::from_secs(u64::MAX))
     }
 }
 
