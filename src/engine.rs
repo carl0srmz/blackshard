@@ -1330,7 +1330,86 @@ fn near(haystack: &str, left: &[&str], right: &[&str], window: usize) -> bool {
     })
 }
 
+/// Most that is inflated from one PDF stream, from all of a PDF's streams, and how many streams
+/// are tried: a PDF is a container, and a hostile one must not cost more than a bounded effort.
+const MAX_PDF_STREAM_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PDF_EXPANDED_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PDF_STREAMS: usize = 512;
+
+/// What a PDF reader would see: the file with `#41`-style escapes in names decoded, followed by
+/// the contents of its Flate-compressed streams. Active content is routinely hidden in either.
+fn expand_pdf(bytes: &[u8]) -> Vec<u8> {
+    use std::io::Read;
+
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'#' {
+            let decoded = bytes.get(at + 1..at + 3).and_then(|pair| {
+                let text = std::str::from_utf8(pair).ok()?;
+                u8::from_str_radix(text, 16).ok()
+            });
+            if let Some(byte) = decoded {
+                out.push(byte);
+                at += 3;
+                continue;
+            }
+        }
+        out.push(bytes[at]);
+        at += 1;
+    }
+
+    let mut expanded = 0usize;
+    let mut streams = 0usize;
+    let mut search = 0;
+    while let Some(found) = find_subslice(&bytes[search..], b"stream") {
+        let keyword = search + found;
+        search = keyword + b"stream".len();
+        // `endstream` contains the word too.
+        if keyword >= 3 && &bytes[keyword - 3..keyword] == b"end" {
+            continue;
+        }
+        let mut start = keyword + b"stream".len();
+        if bytes.get(start) == Some(&b'\r') {
+            start += 1;
+        }
+        if bytes.get(start) == Some(&b'\n') {
+            start += 1;
+        } else {
+            continue;
+        }
+        let dictionary = &bytes[keyword.saturating_sub(512)..keyword];
+        if find_subslice(dictionary, b"/FlateDecode").is_none()
+            && find_subslice(dictionary, b"/Fl ").is_none()
+        {
+            continue;
+        }
+        streams += 1;
+        if streams > MAX_PDF_STREAMS || expanded >= MAX_PDF_EXPANDED_BYTES {
+            break;
+        }
+        let end = find_subslice(&bytes[start..], b"endstream").map_or(bytes.len(), |n| start + n);
+        let budget = MAX_PDF_STREAM_BYTES.min(MAX_PDF_EXPANDED_BYTES - expanded);
+        let mut inflated = Vec::new();
+        let decoder = flate2::read::ZlibDecoder::new(&bytes[start..end]);
+        // A stream that is cut off or corrupt still yields what inflated before the error.
+        let _ = decoder.take(budget as u64).read_to_end(&mut inflated);
+        expanded += inflated.len();
+        out.push(b'\n');
+        out.extend_from_slice(&inflated);
+    }
+    out
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
 fn analyze_pdf(bytes: &[u8], evidence: &mut Vec<Evidence>) {
+    let expanded = expand_pdf(bytes);
+    let bytes = expanded.as_slice();
     let javascript = contains_pdf_name(bytes, b"JavaScript") || contains_pdf_name(bytes, b"JS");
     let automatic_action =
         contains_pdf_name(bytes, b"OpenAction") || contains_pdf_name(bytes, b"AA");
@@ -1633,6 +1712,45 @@ mod tests {
             .evidence
             .iter()
             .any(|item| item.code == "script.download_and_execute"));
+    }
+
+    #[test]
+    fn pdf_active_content_hidden_in_streams_and_escaped_names_is_seen() {
+        use flate2::{write::ZlibEncoder, Compression};
+        use std::io::Write;
+
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(b"<< /S /JavaScript /JS (app.alert(1)) /OpenAction 5 0 R >>")
+            .unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut pdf =
+            b"%PDF-1.7\n1 0 obj << /Type /ObjStm /Filter /FlateDecode /Length 99 >>\nstream\n"
+                .to_vec();
+        pdf.extend_from_slice(&compressed);
+        pdf.extend_from_slice(b"\nendstream\nendobj\n");
+        let report = ScanEngine::default().scan_bytes(&pdf);
+        assert!(
+            report
+                .evidence
+                .iter()
+                .any(|item| item.code == "pdf.automatic_javascript"),
+            "{:?}",
+            report.evidence
+        );
+
+        // The same words, with letters written as #hh escapes the way a reader decodes them.
+        let escaped = b"%PDF-1.7\n1 0 obj << /Open#41ction 2 0 R /J#61vaScript (x) >> endobj";
+        let report = ScanEngine::default().scan_bytes(escaped);
+        assert!(report
+            .evidence
+            .iter()
+            .any(|item| item.code == "pdf.automatic_javascript"));
+
+        // A corrupt stream, and one claiming more than it holds, are survived.
+        let broken = b"%PDF-1.7\n1 0 obj << /Filter /FlateDecode >>\nstream\nnot deflate data\nendstream endobj";
+        let report = ScanEngine::default().scan_bytes(broken);
+        assert_ne!(report.verdict, Verdict::Malicious);
     }
 
     #[test]
