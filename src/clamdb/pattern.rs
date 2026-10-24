@@ -673,16 +673,28 @@ fn parse_piece(name: &str, target: Target, text: &str) -> Result<Vec<Signature>,
             }
         }
     }
-    let Some(literal) = parse_literal(hex) else {
+    if wide && fullword {
+        return Err(Parsed::Unsupported("ldb piece: fullword on wide text"));
+    }
+    let literal = parse_literal(hex);
+    if wide && literal.is_none() {
         return Err(Parsed::Unsupported(
-            "ldb piece: modifier on a pattern with wildcards",
+            "ldb piece: wide modifier on a pattern with wildcards",
         ));
+    }
+    // Case folding and fullword work on any pattern: only wide needs plain bytes.
+    let Some(literal) = literal else {
+        return match build_signature(name, target, offset, hex, MIN_ANCHOR) {
+            Parsed::Kept(mut signature) => {
+                signature.fold = fold;
+                signature.fullword = fullword;
+                Ok(vec![signature])
+            }
+            other => Err(other),
+        };
     };
     if literal.len() < MIN_ANCHOR {
         return Err(Parsed::TooWeak);
-    }
-    if wide && fullword {
-        return Err(Parsed::Unsupported("ldb piece: fullword on wide text"));
     }
     // `w` alone is wide only; `wa` is both; no `w` is ascii.
     let mut forms = Vec::new();
@@ -862,20 +874,13 @@ fn parse_range(text: &str) -> Option<(usize, Option<usize>)> {
     Some((min, max))
 }
 
-fn bytes_match(pattern: &[Option<u8>], text: &[u8]) -> bool {
+fn bytes_match(pattern: &[Option<u8>], text: &[u8], fold: bool) -> bool {
     pattern.len() == text.len()
-        && pattern
-            .iter()
-            .zip(text)
-            .all(|(wanted, actual)| wanted.is_none_or(|wanted| wanted == *actual))
-}
-
-fn bytes_match_folded(pattern: &[Option<u8>], text: &[u8]) -> bool {
-    pattern.len() == text.len()
-        && pattern
-            .iter()
-            .zip(text)
-            .all(|(wanted, actual)| wanted.is_none_or(|wanted| wanted.eq_ignore_ascii_case(actual)))
+        && pattern.iter().zip(text).all(|(wanted, actual)| {
+            wanted.is_none_or(|wanted| {
+                wanted == *actual || (fold && wanted.eq_ignore_ascii_case(actual))
+            })
+        })
 }
 
 /// Whether the bytes just outside `start..end` are not letters or digits.
@@ -915,20 +920,15 @@ fn verify(
     if part_end > text.len() {
         return false;
     }
-    let anchor_matches = if signature.fold {
-        bytes_match_folded(anchor_bytes, &text[part_start..part_end])
-    } else {
-        bytes_match(anchor_bytes, &text[part_start..part_end])
-    };
-    if !anchor_matches {
+    if !bytes_match(anchor_bytes, &text[part_start..part_end], signature.fold) {
         return false;
     }
     let before = &signature.parts[..signature.anchor_part];
     let after = &signature.parts[signature.anchor_part + 1..];
-    let Some(start) = match_left(before, text, part_start, steps) else {
+    let Some(start) = match_left(before, text, part_start, steps, signature.fold) else {
         return false;
     };
-    let Some(end) = match_right(after, text, part_end, steps) else {
+    let Some(end) = match_right(after, text, part_end, steps, signature.fold) else {
         return false;
     };
     if signature.fullword && !on_word_boundaries(text, start, end) {
@@ -949,7 +949,13 @@ fn verify(
 }
 
 /// Matches `parts` forward from `position`; returns where the match ends.
-fn match_right(parts: &[Part], text: &[u8], position: usize, steps: &mut usize) -> Option<usize> {
+fn match_right(
+    parts: &[Part],
+    text: &[u8],
+    position: usize,
+    steps: &mut usize,
+    fold: bool,
+) -> Option<usize> {
     let Some((first, rest)) = parts.split_first() else {
         return Some(position);
     };
@@ -959,11 +965,11 @@ fn match_right(parts: &[Part], text: &[u8], position: usize, steps: &mut usize) 
             let end = position.checked_add(bytes.len())?;
             if *steps > MAX_VERIFY_STEPS
                 || end > text.len()
-                || !bytes_match(bytes, &text[position..end])
+                || !bytes_match(bytes, &text[position..end], fold)
             {
                 return None;
             }
-            match_right(rest, text, end, steps)
+            match_right(rest, text, end, steps, fold)
         }
         Part::Gap { min, max } => {
             let limit = max.unwrap_or(MAX_UNBOUNDED_GAP).min(MAX_UNBOUNDED_GAP);
@@ -972,7 +978,7 @@ fn match_right(parts: &[Part], text: &[u8], position: usize, steps: &mut usize) 
                 if *steps > MAX_VERIFY_STEPS || position + skip > text.len() {
                     return None;
                 }
-                if let Some(end) = match_right(rest, text, position + skip, steps) {
+                if let Some(end) = match_right(rest, text, position + skip, steps, fold) {
                     return Some(end);
                 }
             }
@@ -982,7 +988,13 @@ fn match_right(parts: &[Part], text: &[u8], position: usize, steps: &mut usize) 
 }
 
 /// Matches `parts` backward from `end`; returns where the match starts.
-fn match_left(parts: &[Part], text: &[u8], end: usize, steps: &mut usize) -> Option<usize> {
+fn match_left(
+    parts: &[Part],
+    text: &[u8],
+    end: usize,
+    steps: &mut usize,
+    fold: bool,
+) -> Option<usize> {
     let Some((last, rest)) = parts.split_last() else {
         return Some(end);
     };
@@ -990,10 +1002,10 @@ fn match_left(parts: &[Part], text: &[u8], end: usize, steps: &mut usize) -> Opt
         Part::Bytes(bytes) => {
             *steps += bytes.len();
             let start = end.checked_sub(bytes.len())?;
-            if *steps > MAX_VERIFY_STEPS || !bytes_match(bytes, &text[start..end]) {
+            if *steps > MAX_VERIFY_STEPS || !bytes_match(bytes, &text[start..end], fold) {
                 return None;
             }
-            match_left(rest, text, start, steps)
+            match_left(rest, text, start, steps, fold)
         }
         Part::Gap { min, max } => {
             let limit = max.unwrap_or(MAX_UNBOUNDED_GAP).min(MAX_UNBOUNDED_GAP);
@@ -1003,7 +1015,7 @@ fn match_left(parts: &[Part], text: &[u8], end: usize, steps: &mut usize) -> Opt
                     return None;
                 }
                 let start = end.checked_sub(skip)?;
-                if let Some(found) = match_left(rest, text, start, steps) {
+                if let Some(found) = match_left(rest, text, start, steps, fold) {
                     return Some(found);
                 }
             }
@@ -1400,8 +1412,8 @@ mod tests {
     #[test]
     fn modifiers_on_anything_but_plain_bytes_are_refused() {
         for line in [
-            // Wildcards, an unknown modifier, fullword on wide text, a piece too short.
-            "A;Target:0;0&1;aabb??ccddeeff::i;1122334455667788",
+            // Wide text with wildcards, an unknown modifier, fullword on wide text, too short.
+            "A;Target:0;0&1;aabb??ccddeeff::w;1122334455667788",
             "A;Target:0;0&1;aabbccddeeff0011::q;1122334455667788",
             "A;Target:0;0&1;aabbccddeeff0011::wf;1122334455667788",
             "A;Target:0;0&1;aabb::i;1122334455667788",
@@ -1410,5 +1422,23 @@ mod tests {
             assert_eq!(stats.loaded, 0, "{line}");
             assert!(set.is_empty(), "{line}");
         }
+    }
+
+    #[test]
+    fn case_folding_and_fullword_work_with_wildcards() {
+        // "Evil" "Payload" with a one-byte wildcard between them, ignoring case.
+        let (set, stats) = logical_set(&[
+            "Win.Test.Folded;Target:0;0&1;6576696c??7061796c6f6164::i;aabbccddeeff1122",
+        ]);
+        assert_eq!(stats.loaded, 1);
+        let with = |word: &[u8]| {
+            let mut text = vec![0x20u8; 4];
+            text.extend_from_slice(word);
+            text.extend_from_slice(&[0x20, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x11, 0x22]);
+            text
+        };
+        assert_eq!(scan(&set, &with(b"EVIL_PAYLOAD")), Some("Win.Test.Folded"));
+        assert_eq!(scan(&set, &with(b"evil-payload")), Some("Win.Test.Folded"));
+        assert_eq!(scan(&set, &with(b"evil-paylaod")), None);
     }
 }

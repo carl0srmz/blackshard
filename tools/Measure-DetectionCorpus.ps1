@@ -24,12 +24,17 @@ $arguments = "--evaluate-corpus `"$corpus`" `"$report`""
 if ($SignaturesPath) {
     $arguments += " `"$((Resolve-Path -LiteralPath $SignaturesPath).Path)`""
 }
-$process = Start-Process -FilePath $binary -ArgumentList $arguments -PassThru -WindowStyle Hidden
+$console = [IO.Path]::GetTempFileName()
+$errors = [IO.Path]::GetTempFileName()
+$process = Start-Process -FilePath $binary -ArgumentList $arguments -PassThru -WindowStyle Hidden `
+    -RedirectStandardOutput $console -RedirectStandardError $errors
 if (-not $process.WaitForExit(24 * 60 * 60 * 1000)) {
     $process.Kill()
     $process.WaitForExit()
     throw 'Corpus evaluation exceeded 24 hours.'
 }
+Get-Content -LiteralPath $console, $errors | Write-Host
+Remove-Item -LiteralPath $console, $errors -ErrorAction SilentlyContinue
 if ($process.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $report -PathType Leaf)) {
     throw "blackshard corpus evaluation failed with exit code $($process.ExitCode)."
 }
