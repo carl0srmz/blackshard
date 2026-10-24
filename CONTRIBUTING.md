@@ -10,8 +10,11 @@ thanks for wanting to help! a few things that make it easier.
 
 ## Building and testing
 
-see [Building from source](README.md#building-from-source). blackshard builds and tests on Windows
-only; everything Rust is pinned in `rust-toolchain.toml`.
+see [Building from source](README.md#building-from-source). the product (service, driver, UI, AMSI)
+builds and tests on Windows only. the detection engine, the definition pipeline and the signature
+matcher are platform independent, so on Linux or macOS `cargo test --lib` runs their tests in
+seconds, and `cargo clippy --lib -- -D warnings` checks them. everything Rust is pinned in
+`rust-toolchain.toml`.
 
 before opening a pull request, run what CI runs:
 

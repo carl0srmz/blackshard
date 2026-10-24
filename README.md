@@ -85,6 +85,9 @@ cargo test --workspace --all-targets
 `installer\build-development-vm-installer.ps1` wraps `dist\` into the single-file setup used for
 the testing builds; it needs the .NET Framework C# compiler that ships with Windows.
 
+the detection engine, signature matcher and definition pipeline also build and test on Linux and
+macOS (`cargo test --lib`), which is the fast way to work on detection without a Windows machine.
+
 the driver is test-signed, so installing it needs test-signing mode (`enable-test-signing.ps1`)
 and Secure Boot off. please only do that in a VM.
 
