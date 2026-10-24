@@ -19,6 +19,8 @@ changes are listed here, newest first.
 - Self-tests are administrator-only and rate-limited; clearing the history is recorded.
 
 ### Added
+- HTML applications (`.hta`) that create a scripting object next to a command, download or run
+  call are flagged.
 - RTF documents are read for embedded objects: self-updating linked objects, Equation Editor
   objects, and embedded executables or Office files.
 - Windows shortcuts (`.lnk`) are read: one that starts a script interpreter or downloader with
