@@ -33,11 +33,8 @@ const MAX_SIGNATURE_BYTES: usize = 4096;
 /// A logical signature joins weak pieces, so what its expression needs in all must be about as
 /// strong as one stand-alone body signature twice over.
 const MIN_LOGICAL_FIXED_BYTES: usize = 16;
-/// The shortest fixed run a piece of a logical signature may be found by is [`MIN_ANCHOR`]; this
-/// bounds how many logical signatures one file may touch, so a hostile file stays cheap.
-const MAX_TOUCHED_LOGICALS: usize = 50_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Target {
     Any,
     Pe,
@@ -73,13 +70,13 @@ impl Target {
 }
 
 /// Where a signature may start: at `base`, or up to `shift` bytes after it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct Offset {
     base: Base,
     shift: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Base {
     Anywhere,
     Absolute(usize),
@@ -162,7 +159,7 @@ impl PeLayout {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Part {
     /// Bytes to match; `None` is a wildcard byte.
     Bytes(Vec<Option<u8>>),
@@ -180,9 +177,9 @@ struct Signature {
     anchor_part: usize,
     anchor_start: usize,
     anchor_len: usize,
-    /// Set for a sub-signature of a logical signature: which one, and which slot of it. Such a
-    /// match only counts toward the logical signature's expression.
-    logical: Option<(u32, u16)>,
+    /// A piece of logical signatures rather than a signature of its own: its matches are only
+    /// counted, and the logical signatures that use it are judged once the scan is over.
+    piece: bool,
     /// ASCII letters match in either case (`::i`).
     fold: bool,
     /// The match must not touch a letter or digit on either side (`::f`).
@@ -196,9 +193,33 @@ struct Logical {
     /// Inclusive bounds on the size of the whole file.
     file_size: Option<(u64, u64)>,
     expression: Expr,
-    subsignatures: usize,
-    /// Where this signature's piece counters start in the scan's flat counter array.
-    base: u32,
+    /// Number of sub-signatures, which the expression numbers.
+    slots: usize,
+    /// The pieces that stand for the sub-signatures, and for each the sub-signature it is. A
+    /// sub-signature written for both ascii and wide text has two pieces.
+    pieces: Vec<u32>,
+    slot_of: Vec<u8>,
+}
+
+/// What identifies a piece, so a piece shared by many logical signatures is kept, found and
+/// counted once.
+type PieceKey = (Target, Offset, Vec<Part>, bool, bool);
+
+/// Which logical signatures use each piece, as one flat array: the users of piece `p` are
+/// `users[starts[p]..starts[p + 1]]`.
+#[derive(Default)]
+struct PieceUsers {
+    starts: Vec<u32>,
+    users: Vec<u32>,
+}
+
+impl PieceUsers {
+    fn of(&self, piece: usize) -> &[u32] {
+        match (self.starts.get(piece), self.starts.get(piece + 1)) {
+            (Some(start), Some(end)) => &self.users[*start as usize..*end as usize],
+            _ => &[],
+        }
+    }
 }
 
 /// How many signature lines a load kept and why it dropped the rest.
@@ -219,8 +240,9 @@ pub struct PatternSet {
     /// serves case-sensitive and case-insensitive signatures alike. A case-sensitive signature's
     /// whole match is then checked against the original text, which settles its case.
     anchors: Option<Anchors>,
-    /// Counters needed for all the pieces of all logical signatures.
-    slots: u32,
+    /// The pieces already stored, so identical ones are shared.
+    piece_index: HashMap<PieceKey, u32>,
+    users: PieceUsers,
     /// Anchor occurrences found, and how many were then checked against their whole signature,
     /// over every scan since the set was built. They show where scan time goes.
     anchor_hits: AtomicU64,
@@ -236,12 +258,12 @@ struct Anchors {
 impl Anchors {
     /// `None` when there are no anchors, or the automaton cannot be built.
     fn build(anchors: Vec<(Vec<u8>, usize)>) -> Option<Self> {
-        let mut index: HashMap<Vec<u8>, usize> = HashMap::new();
+        let mut seen: HashMap<Vec<u8>, usize> = HashMap::new();
         let mut patterns: Vec<Vec<u8>> = Vec::new();
         let mut signatures: Vec<Vec<usize>> = Vec::new();
         for (anchor, signature) in anchors {
             // The automaton refuses duplicates; several signatures may share one anchor.
-            let group = *index.entry(anchor.clone()).or_insert_with(|| {
+            let group = *seen.entry(anchor.clone()).or_insert_with(|| {
                 patterns.push(anchor);
                 signatures.push(Vec::new());
                 patterns.len() - 1
@@ -261,15 +283,14 @@ impl Anchors {
         })
     }
 
-    /// Every signature whose anchor occurs in `text`, with where the anchor starts.
-    fn hits<'a>(&'a self, text: &'a [u8]) -> impl Iterator<Item = (usize, usize)> + 'a {
-        self.automaton
-            .find_overlapping_iter(text)
-            .flat_map(|found| {
-                self.signatures[found.value() as usize]
-                    .iter()
-                    .map(move |signature| (*signature, found.start()))
-            })
+    /// Calls `found(group, start)` for every occurrence of every anchor in `text`, until it
+    /// returns `false`.
+    fn for_each_match<F: FnMut(usize, usize) -> bool>(&self, text: &[u8], mut found: F) {
+        for hit in self.automaton.find_overlapping_iter(text) {
+            if !found(hit.value() as usize, hit.start()) {
+                return;
+            }
+        }
     }
 }
 
@@ -290,7 +311,8 @@ impl Clone for PatternSet {
             signatures: self.signatures.clone(),
             logicals: self.logicals.clone(),
             anchors: None,
-            slots: self.slots,
+            piece_index: self.piece_index.clone(),
+            users: PieceUsers::default(),
             anchor_hits: AtomicU64::new(0),
             verifications: AtomicU64::new(0),
         };
@@ -316,7 +338,7 @@ impl PatternSet {
     pub fn len(&self) -> usize {
         self.signatures
             .iter()
-            .filter(|signature| signature.logical.is_none())
+            .filter(|signature| !signature.piece)
             .count()
             + self.logicals.len()
     }
@@ -411,21 +433,35 @@ impl PatternSet {
             return Err(Parsed::TooWeak);
         }
 
-        let index = self.logicals.len() as u32;
+        let mut pieces = Vec::new();
+        let mut slot_of = Vec::new();
         for (slot, variants) in built.into_iter().enumerate() {
             for mut signature in variants {
-                signature.logical = Some((index, slot as u16));
-                self.signatures.push(signature);
+                signature.piece = true;
+                signature.name = String::new();
+                let key = (
+                    signature.target,
+                    signature.offset,
+                    signature.parts.clone(),
+                    signature.fold,
+                    signature.fullword,
+                );
+                let next = self.signatures.len() as u32;
+                let id = *self.piece_index.entry(key).or_insert(next);
+                if id == next {
+                    self.signatures.push(signature);
+                }
+                pieces.push(id);
+                slot_of.push(slot as u8);
             }
         }
-        let base = self.slots;
-        self.slots += subsignatures as u32;
         self.logicals.push(Logical {
             name: name.to_owned(),
             file_size,
             expression,
-            subsignatures,
-            base,
+            slots: subsignatures,
+            pieces,
+            slot_of,
         });
         Ok(())
     }
@@ -439,6 +475,27 @@ impl PatternSet {
             .map(|(index, signature)| (signature.anchor().to_ascii_lowercase(), index))
             .collect();
         self.anchors = Anchors::build(anchors);
+
+        // Which logical signatures use each piece.
+        let mut starts = vec![0u32; self.signatures.len() + 1];
+        for logical in &self.logicals {
+            for piece in &logical.pieces {
+                starts[*piece as usize + 1] += 1;
+            }
+        }
+        for index in 1..starts.len() {
+            starts[index] += starts[index - 1];
+        }
+        let mut next = starts.clone();
+        let mut users = vec![0u32; starts[starts.len() - 1] as usize];
+        for (index, logical) in self.logicals.iter().enumerate() {
+            for piece in &logical.pieces {
+                let at = &mut next[*piece as usize];
+                users[*at as usize] = index as u32;
+                *at += 1;
+            }
+        }
+        self.users = PieceUsers { starts, users };
     }
 
     /// The name of the first signature `text` matches.
@@ -478,98 +535,124 @@ impl PatternSet {
         let lowered = text.to_ascii_lowercase();
         SCRATCH.with(|cell| {
             let mut scratch = cell.borrow_mut();
-            scratch.prepare(self.slots as usize, self.logicals.len());
+            scratch.prepare(self.signatures.len(), self.logicals.len());
             let scratch = &mut *scratch;
-            for (index, start) in anchors.hits(&lowered) {
-                *hits += 1;
-                let signature = &self.signatures[index];
-                if !applies[signature.target.index()] {
-                    continue;
-                }
-                if signature.logical.is_some() && truncated {
-                    continue;
-                }
-                // Read once per file, and only when a signature is a candidate.
-                let layout = &*layout.get_or_insert_with(|| PeLayout::read(text));
-                let context = Context {
-                    text,
-                    file_size,
-                    truncated,
-                    layout,
-                };
-                *verified += 1;
-                if verify(signature, &context, start, &mut steps) {
-                    let Some((logical, slot)) = signature.logical else {
-                        scratch.clear();
-                        return Some(signature.name.as_str());
-                    };
-                    let entry = &self.logicals[logical as usize];
-                    if !scratch.marked[logical as usize] {
-                        if scratch.touched.len() >= MAX_TOUCHED_LOGICALS {
-                            continue;
-                        }
-                        scratch.marked[logical as usize] = true;
-                        scratch
-                            .touched
-                            .push((logical, entry.base, entry.subsignatures as u32));
+            // Set when a body signature matches, or the scan gives up.
+            let mut verdict: Option<Option<&str>> = None;
+            anchors.for_each_match(&lowered, |group, start| {
+                for &index in &anchors.signatures[group] {
+                    *hits += 1;
+                    let signature = &self.signatures[index];
+                    if !applies[signature.target.index()] || (signature.piece && truncated) {
+                        continue;
                     }
-                    let counter = &mut scratch.counts[(entry.base + u32::from(slot)) as usize];
-                    *counter = counter.saturating_add(1);
+                    // Read once per file, and only when a signature is a candidate.
+                    let layout = &*layout.get_or_insert_with(|| PeLayout::read(text));
+                    let context = Context {
+                        text,
+                        file_size,
+                        truncated,
+                        layout,
+                    };
+                    *verified += 1;
+                    if verify(signature, &context, start, &mut steps) {
+                        if !signature.piece {
+                            verdict = Some(Some(signature.name.as_str()));
+                            return false;
+                        }
+                        let counter = &mut scratch.counts[index];
+                        if *counter == 0 {
+                            scratch.touched.push(index as u32);
+                        }
+                        *counter = counter.saturating_add(1);
+                    }
+                    if steps > MAX_VERIFY_STEPS * 16 {
+                        // One adversarial file must not be allowed to cost minutes.
+                        verdict = Some(None);
+                        return false;
+                    }
                 }
-                if steps > MAX_VERIFY_STEPS * 16 {
-                    // One adversarial file must not be allowed to cost minutes.
-                    scratch.clear();
-                    return None;
+                true
+            });
+            if let Some(verdict) = verdict {
+                scratch.clear();
+                return verdict;
+            }
+
+            // Judge, once, each logical signature that has a piece in this file.
+            for piece in 0..scratch.touched.len() {
+                for &user in self.users.of(scratch.touched[piece] as usize) {
+                    if !scratch.marked[user as usize] {
+                        scratch.marked[user as usize] = true;
+                        scratch.candidates.push(user);
+                    }
                 }
             }
             // The lowest index that holds, so the answer does not depend on hit order.
-            let found = scratch
-                .touched
-                .iter()
-                .filter(|(logical, base, length)| {
-                    let entry = &self.logicals[*logical as usize];
-                    let counters = &scratch.counts[*base as usize..(*base + *length) as usize];
-                    entry
-                        .file_size
-                        .is_none_or(|(least, most)| (least..=most).contains(&file_size))
-                        && entry.expression.holds(counters)
-                })
-                .map(|(logical, ..)| *logical)
-                .min();
+            let mut found: Option<u32> = None;
+            for &candidate in &scratch.candidates {
+                if found.is_some_and(|best| best < candidate) {
+                    continue;
+                }
+                let logical = &self.logicals[candidate as usize];
+                if !logical
+                    .file_size
+                    .is_none_or(|(least, most)| (least..=most).contains(&file_size))
+                {
+                    continue;
+                }
+                scratch.gathered.clear();
+                scratch.gathered.resize(logical.slots, 0);
+                for (piece, slot) in logical.pieces.iter().zip(&logical.slot_of) {
+                    let seen = scratch.counts[*piece as usize];
+                    let total = &mut scratch.gathered[*slot as usize];
+                    *total = total.saturating_add(seen);
+                }
+                if logical.expression.holds(&scratch.gathered) {
+                    found = Some(candidate);
+                }
+            }
             scratch.clear();
             found.map(|logical| self.logicals[logical as usize].name.as_str())
         })
     }
 }
 
-/// Per-thread counters for the logical signatures one scan touches, kept between scans so a scan
-/// allocates nothing per hit. Everything a scan dirties is zeroed again before the next.
+/// Per-thread counters for the pieces one scan finds, kept between scans so a scan allocates
+/// nothing per hit. Everything a scan dirties is zeroed again before the next.
 #[derive(Default)]
 struct Scratch {
-    /// How often each piece of each logical signature matched, in one flat array.
+    /// How often each piece matched.
     counts: Vec<u32>,
-    /// Logical signatures touched, with where their counters sit and how many there are.
-    touched: Vec<(u32, u32, u32)>,
-    /// Whether a logical signature is already in `touched`.
+    /// Pieces with a nonzero count.
+    touched: Vec<u32>,
+    /// Whether a logical signature is already in `candidates`.
     marked: Vec<bool>,
+    /// Logical signatures with a piece in this file, to be judged.
+    candidates: Vec<u32>,
+    /// One logical signature's counts by sub-signature.
+    gathered: Vec<u32>,
 }
 
 impl Scratch {
     fn clear(&mut self) {
-        for (_, base, length) in self.touched.drain(..) {
-            let base = base as usize;
-            if let Some(counters) = self.counts.get_mut(base..base + length as usize) {
-                counters.fill(0);
+        for piece in self.touched.drain(..) {
+            if let Some(count) = self.counts.get_mut(piece as usize) {
+                *count = 0;
             }
         }
-        self.marked.fill(false);
+        for candidate in self.candidates.drain(..) {
+            if let Some(mark) = self.marked.get_mut(candidate as usize) {
+                *mark = false;
+            }
+        }
     }
 
-    fn prepare(&mut self, slots: usize, logicals: usize) {
+    fn prepare(&mut self, pieces: usize, logicals: usize) {
         self.clear();
-        if self.counts.len() != slots {
+        if self.counts.len() != pieces {
             self.counts.clear();
-            self.counts.resize(slots, 0);
+            self.counts.resize(pieces, 0);
         }
         if self.marked.len() != logicals {
             self.marked.clear();
@@ -650,7 +733,7 @@ fn build_signature(
         anchor_part,
         anchor_start,
         anchor_len,
-        logical: None,
+        piece: false,
         fold: false,
         fullword: false,
     })
@@ -798,8 +881,6 @@ fn parse_target_block(text: &str) -> Option<(Target, Option<(u64, u64)>)> {
     Some((target?, file_size))
 }
 
-/// One piece of a logical signature: `hex`, or `offset:hex`. Modifiers (`::i`, `::w`, ...),
-/// regular expressions, macros and alternatives are not modelled.
 /// One piece of a logical signature: `hex`, `offset:hex`, either followed by `::modifiers`.
 /// Regular expressions and macros are not modelled. The modifiers `i` (either case), `w` (wide,
 /// each byte followed by a zero), `a` (ascii, the default; with `w`, both) and `f` (fullword) are,
@@ -902,7 +983,7 @@ fn parse_piece(name: &str, target: Target, text: &str) -> Result<Vec<Signature>,
             anchor_part,
             anchor_start,
             anchor_len,
-            logical: None,
+            piece: false,
             fold,
             fullword,
         });
