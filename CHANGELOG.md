@@ -19,6 +19,8 @@ changes are listed here, newest first.
 - Self-tests are administrator-only and rate-limited; clearing the history is recorded.
 
 ### Added
+- RTF documents are read for embedded objects: self-updating linked objects, Equation Editor
+  objects, and embedded executables or Office files.
 - Windows shortcuts (`.lnk`) are read: one that starts a script interpreter or downloader with
   arguments that fetch, decode or run code, or whose arguments are padded with blanks to hide the
   command, is flagged.

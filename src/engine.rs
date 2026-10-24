@@ -51,6 +51,7 @@ pub enum ContentType {
     Rar,
     OleCompound,
     Lnk,
+    Rtf,
     Elf,
     MachO,
     Binary,
@@ -518,6 +519,7 @@ impl ScanEngine {
             }
             ContentType::Pdf => analyze_pdf(bytes, &mut evidence),
             ContentType::Lnk => analyze_lnk(bytes, &mut evidence),
+            ContentType::Rtf => analyze_rtf(bytes, &mut evidence),
             _ => {
                 if entropy >= HIGH_ENTROPY_THRESHOLD && bytes.len() >= MIN_SECTION_ENTROPY_BYTES {
                     push_evidence(
@@ -652,6 +654,9 @@ fn classify_content(bytes: &[u8], text_limit: usize) -> ContentType {
     }
     if bytes.starts_with(b"%PDF-") {
         return ContentType::Pdf;
+    }
+    if bytes.starts_with(b"{\\rtf") {
+        return ContentType::Rtf;
     }
     if crate::lnk::is_shortcut(bytes) {
         return ContentType::Lnk;
@@ -1308,6 +1313,78 @@ fn analyze_script(bytes: &[u8], sample_limit: usize, evidence: &mut Vec<Evidence
             EvidenceSeverity::Medium,
             18,
             "script constructs character data before dynamic execution".to_owned(),
+        );
+    }
+}
+
+/// An RTF document is text, but it can carry OLE objects as hex, and nearly every RTF exploit
+/// is one: a linked object that updates itself from a URL, an Equation Editor object, or an
+/// embedded executable or Office file. Pictures use `\pict`, not `\objdata`, so a document that
+/// only has images has none of this.
+fn analyze_rtf(bytes: &[u8], evidence: &mut Vec<Evidence>) {
+    const EQUATION: &str = "4571756174696f6e2e33"; // "Equation.3"
+    const OLE_HEADER: &str = "d0cf11e0a1b11ae1";
+    const PE_HEADER: &str = "4d5a9000";
+    const HEX_RUN: usize = 4096;
+
+    let lower =
+        String::from_utf8_lossy(&bytes[..bytes.len().min(32 * 1024 * 1024)]).to_ascii_lowercase();
+    let has_objdata = lower.contains("\\objdata");
+    if !has_objdata {
+        return;
+    }
+    // Object data is hex; strip the whitespace RTF allows inside it before looking for headers.
+    let hex: String = lower.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+
+    let linked_update = lower.contains("\\objupdate")
+        && (lower.contains("\\objautlink") || lower.contains("\\objlink"));
+    if linked_update {
+        push_evidence(
+            evidence,
+            "rtf.auto_updating_link",
+            EvidenceSeverity::High,
+            40,
+            "RTF embeds a linked object that updates itself when the document opens".to_owned(),
+        );
+    }
+    if hex.contains(EQUATION) || lower.contains("equation.3") {
+        push_evidence(
+            evidence,
+            "rtf.equation_object",
+            EvidenceSeverity::High,
+            40,
+            "RTF embeds an Equation Editor object, the target of many exploits".to_owned(),
+        );
+    }
+    if hex.contains(PE_HEADER) && hex.contains("546869732070726f6772616d") {
+        push_evidence(
+            evidence,
+            "rtf.embedded_executable",
+            EvidenceSeverity::High,
+            45,
+            "RTF object data contains an executable image".to_owned(),
+        );
+    } else if hex.contains(OLE_HEADER) {
+        push_evidence(
+            evidence,
+            "rtf.embedded_office_file",
+            EvidenceSeverity::Medium,
+            20,
+            "RTF object data contains an OLE compound file".to_owned(),
+        );
+    }
+    let longest_hex = hex
+        .split(|c: char| !c.is_ascii_hexdigit())
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    if longest_hex >= HEX_RUN && lower.contains("\\objemb") && !hex.contains(OLE_HEADER) {
+        push_evidence(
+            evidence,
+            "rtf.opaque_object",
+            EvidenceSeverity::Low,
+            10,
+            "RTF embeds a large object that is not a recognisable OLE file".to_owned(),
         );
     }
 }
@@ -1982,6 +2059,40 @@ mod tests {
             .evidence
             .iter()
             .any(|item| item.code == "pe.malformed"));
+    }
+
+    #[test]
+    fn rtf_objects_are_judged_by_what_they_embed() {
+        let engine = ScanEngine::default();
+        let pe_hex = format!("4d5a9000{}", "00".repeat(40) + "546869732070726f6772616d");
+        let hostile =
+            format!("{{\\rtf1{{\\object\\objautlink\\objupdate{{\\*\\objdata {pe_hex}}}}}}}");
+        let report = engine.scan_bytes(hostile.as_bytes());
+        assert_eq!(report.content_type, ContentType::Rtf);
+        assert_eq!(report.verdict, Verdict::Suspicious);
+        for code in ["rtf.auto_updating_link", "rtf.embedded_executable"] {
+            assert!(
+                report.evidence.iter().any(|item| item.code == code),
+                "{code}"
+            );
+        }
+
+        let equation = "{\\rtf1{\\object\\objemb{\\*\\objdata 4571756174696f6e2e33}}}";
+        let report = engine.scan_bytes(equation.as_bytes());
+        assert!(report
+            .evidence
+            .iter()
+            .any(|item| item.code == "rtf.equation_object"));
+
+        for plain in [
+            "{\\rtf1\\ansi Hello {\\b world}}",
+            "{\\rtf1{\\pict\\pngblip 89504e470d0a1a0a}}",
+            "{\\rtf1{\\object\\objemb{\\*\\objdata 00ff}}}",
+        ] {
+            let report = engine.scan_bytes(plain.as_bytes());
+            assert_eq!(report.verdict, Verdict::Clean, "{plain}");
+            assert!(report.evidence.is_empty(), "{plain}");
+        }
     }
 
     #[test]
