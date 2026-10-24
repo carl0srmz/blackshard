@@ -68,8 +68,10 @@ rule blackshard_office_macro_autoexec_shell_chain {
         $payload2 = "mshta" ascii wide nocase
         $payload3 = "rundll32" ascii wide nocase
     condition:
-        // Executables mention these words as ordinary strings; only documents and scripts count.
-        not (uint16(0) == 0x5A4D) and 1 of ($auto*) and 1 of ($shell*) and 1 of ($payload*)
+        // Executables mention these words as ordinary strings, and so do large scripts and
+        // bundles; the macro text this looks for is a few kilobytes of Visual Basic.
+        not (uint16(0) == 0x5A4D) and filesize < 1MB
+            and 1 of ($auto*) and 1 of ($shell*) and 1 of ($payload*)
 }
 "#;
 
@@ -438,5 +440,26 @@ mod tests {
             identifiers(b"certutil -decode cert.b64 cert.cer"),
             ["blackshard_lolbin_transfer_or_decode"]
         );
+    }
+
+    #[test]
+    fn the_macro_rule_does_not_fire_on_large_text_or_executables() {
+        let engine = RuleEngine::builtin().unwrap();
+        let macro_text = "Sub AutoOpen()\n Set s = CreateObject(\"WScript.Shell\")\n s.Run \"powershell\"\nEnd Sub\n";
+        let matched = |bytes: &[u8]| {
+            engine
+                .scan(bytes)
+                .unwrap()
+                .iter()
+                .any(|found| found.identifier == "blackshard_office_macro_autoexec_shell_chain")
+        };
+        assert!(matched(macro_text.as_bytes()));
+        // The same words inside an executable, or in two megabytes of other text.
+        let mut executable = b"MZ".to_vec();
+        executable.extend_from_slice(macro_text.as_bytes());
+        assert!(!matched(&executable));
+        let mut large = macro_text.as_bytes().to_vec();
+        large.resize(2 << 20, b' ');
+        assert!(!matched(&large));
     }
 }
