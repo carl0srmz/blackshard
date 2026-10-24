@@ -47,6 +47,18 @@ enum Target {
 }
 
 impl Target {
+    const ALL: [Target; 5] = [Self::Any, Self::Pe, Self::Ole2, Self::Elf, Self::Pdf];
+
+    fn index(self) -> usize {
+        match self {
+            Self::Any => 0,
+            Self::Pe => 1,
+            Self::Ole2 => 2,
+            Self::Elf => 3,
+            Self::Pdf => 4,
+        }
+    }
+
     fn applies_to(self, text: &[u8]) -> bool {
         match self {
             Self::Any => true,
@@ -185,6 +197,8 @@ struct Logical {
     file_size: Option<(u64, u64)>,
     expression: Expr,
     subsignatures: usize,
+    /// Where this signature's piece counters start in the scan's flat counter array.
+    base: u32,
 }
 
 /// How many signature lines a load kept and why it dropped the rest.
@@ -205,6 +219,8 @@ pub struct PatternSet {
     /// serves case-sensitive and case-insensitive signatures alike. A case-sensitive signature's
     /// whole match is then checked against the original text, which settles its case.
     anchors: Option<Anchors>,
+    /// Counters needed for all the pieces of all logical signatures.
+    slots: u32,
     /// Anchor occurrences found, and how many were then checked against their whole signature,
     /// over every scan since the set was built. They show where scan time goes.
     anchor_hits: AtomicU64,
@@ -274,6 +290,7 @@ impl Clone for PatternSet {
             signatures: self.signatures.clone(),
             logicals: self.logicals.clone(),
             anchors: None,
+            slots: self.slots,
             anchor_hits: AtomicU64::new(0),
             verifications: AtomicU64::new(0),
         };
@@ -401,11 +418,14 @@ impl PatternSet {
                 self.signatures.push(signature);
             }
         }
+        let base = self.slots;
+        self.slots += subsignatures as u32;
         self.logicals.push(Logical {
             name: name.to_owned(),
             file_size,
             expression,
             subsignatures,
+            base,
         });
         Ok(())
     }
@@ -453,56 +473,113 @@ impl PatternSet {
         let anchors = self.anchors.as_ref()?;
         let mut steps = 0usize;
         let mut layout: Option<PeLayout> = None;
-        let mut tallies: HashMap<u32, Vec<u32>> = HashMap::new();
+        // Which kinds of file this is, decided once rather than at every hit.
+        let applies = Target::ALL.map(|target| target.applies_to(text));
         let lowered = text.to_ascii_lowercase();
-        for (index, start) in anchors.hits(&lowered) {
-            *hits += 1;
-            let signature = &self.signatures[index];
-            if !signature.target.applies_to(text) {
-                continue;
-            }
-            if signature.logical.is_some() && truncated {
-                continue;
-            }
-            // Read once per file, and only when a PE signature is a candidate.
-            let layout = &*layout.get_or_insert_with(|| PeLayout::read(text));
-            let context = Context {
-                text,
-                file_size,
-                truncated,
-                layout,
-            };
-            *verified += 1;
-            if verify(signature, &context, start, &mut steps) {
-                let Some((logical, slot)) = signature.logical else {
-                    return Some(&signature.name);
+        SCRATCH.with(|cell| {
+            let mut scratch = cell.borrow_mut();
+            scratch.prepare(self.slots as usize, self.logicals.len());
+            let scratch = &mut *scratch;
+            for (index, start) in anchors.hits(&lowered) {
+                *hits += 1;
+                let signature = &self.signatures[index];
+                if !applies[signature.target.index()] {
+                    continue;
+                }
+                if signature.logical.is_some() && truncated {
+                    continue;
+                }
+                // Read once per file, and only when a signature is a candidate.
+                let layout = &*layout.get_or_insert_with(|| PeLayout::read(text));
+                let context = Context {
+                    text,
+                    file_size,
+                    truncated,
+                    layout,
                 };
-                if tallies.len() < MAX_TOUCHED_LOGICALS || tallies.contains_key(&logical) {
-                    let counts = tallies
-                        .entry(logical)
-                        .or_insert_with(|| vec![0; self.logicals[logical as usize].subsignatures]);
-                    counts[slot as usize] = counts[slot as usize].saturating_add(1);
+                *verified += 1;
+                if verify(signature, &context, start, &mut steps) {
+                    let Some((logical, slot)) = signature.logical else {
+                        scratch.clear();
+                        return Some(signature.name.as_str());
+                    };
+                    let entry = &self.logicals[logical as usize];
+                    if !scratch.marked[logical as usize] {
+                        if scratch.touched.len() >= MAX_TOUCHED_LOGICALS {
+                            continue;
+                        }
+                        scratch.marked[logical as usize] = true;
+                        scratch
+                            .touched
+                            .push((logical, entry.base, entry.subsignatures as u32));
+                    }
+                    let counter = &mut scratch.counts[(entry.base + u32::from(slot)) as usize];
+                    *counter = counter.saturating_add(1);
+                }
+                if steps > MAX_VERIFY_STEPS * 16 {
+                    // One adversarial file must not be allowed to cost minutes.
+                    scratch.clear();
+                    return None;
                 }
             }
-            if steps > MAX_VERIFY_STEPS * 16 {
-                // One adversarial file must not be allowed to cost minutes.
-                return None;
+            // The lowest index that holds, so the answer does not depend on hit order.
+            let found = scratch
+                .touched
+                .iter()
+                .filter(|(logical, base, length)| {
+                    let entry = &self.logicals[*logical as usize];
+                    let counters = &scratch.counts[*base as usize..(*base + *length) as usize];
+                    entry
+                        .file_size
+                        .is_none_or(|(least, most)| (least..=most).contains(&file_size))
+                        && entry.expression.holds(counters)
+                })
+                .map(|(logical, ..)| *logical)
+                .min();
+            scratch.clear();
+            found.map(|logical| self.logicals[logical as usize].name.as_str())
+        })
+    }
+}
+
+/// Per-thread counters for the logical signatures one scan touches, kept between scans so a scan
+/// allocates nothing per hit. Everything a scan dirties is zeroed again before the next.
+#[derive(Default)]
+struct Scratch {
+    /// How often each piece of each logical signature matched, in one flat array.
+    counts: Vec<u32>,
+    /// Logical signatures touched, with where their counters sit and how many there are.
+    touched: Vec<(u32, u32, u32)>,
+    /// Whether a logical signature is already in `touched`.
+    marked: Vec<bool>,
+}
+
+impl Scratch {
+    fn clear(&mut self) {
+        for (_, base, length) in self.touched.drain(..) {
+            let base = base as usize;
+            if let Some(counters) = self.counts.get_mut(base..base + length as usize) {
+                counters.fill(0);
             }
         }
-        // The lowest index that holds, so the answer does not depend on hash order.
-        tallies
-            .iter()
-            .filter(|(index, counts)| {
-                let logical = &self.logicals[**index as usize];
-                logical
-                    .file_size
-                    .is_none_or(|(least, most)| (least..=most).contains(&file_size))
-                    && logical.expression.holds(counts)
-            })
-            .map(|(index, _)| *index)
-            .min()
-            .map(|index| self.logicals[index as usize].name.as_str())
+        self.marked.fill(false);
     }
+
+    fn prepare(&mut self, slots: usize, logicals: usize) {
+        self.clear();
+        if self.counts.len() != slots {
+            self.counts.clear();
+            self.counts.resize(slots, 0);
+        }
+        if self.marked.len() != logicals {
+            self.marked.clear();
+            self.marked.resize(logicals, false);
+        }
+    }
+}
+
+thread_local! {
+    static SCRATCH: std::cell::RefCell<Scratch> = std::cell::RefCell::new(Scratch::default());
 }
 
 enum Parsed {
@@ -581,9 +658,9 @@ fn build_signature(
 
 /// The longest window of a signature's fixed bytes searched for as its anchor.
 const MAX_ANCHOR: usize = 12;
-/// Below this a window is so common in ordinary files (zero padding, stack setup, ...) that
-/// searching for it would drown the scan in candidates that never confirm.
-const MIN_ANCHOR_SCORE: f32 = 7.0;
+/// A window with fewer different bytes than this (padding, a run of no-ops) is not worth
+/// searching for, whatever its length.
+const MIN_DISTINCT_BYTES: usize = 3;
 
 /// How rare a byte is in executables: those that fill padding and make up common instructions
 /// count for little.
@@ -628,8 +705,8 @@ fn window_score(window: &[u8]) -> f32 {
 
 /// Where to search for a signature: the rarest window of up to [`MAX_ANCHOR`] fixed bytes inside
 /// any one run of them, as `(part, start in part, length)`. `None` if there is no window of at
-/// least [`MIN_ANCHOR`] bytes that scores [`MIN_ANCHOR_SCORE`]. A rare window means few false
-/// candidates, which is what a scan's speed is made of.
+/// least [`MIN_ANCHOR`] bytes with [`MIN_DISTINCT_BYTES`] different ones. A rare window means few
+/// false candidates, which is what a scan's speed is made of.
 fn best_anchor(parts: &[Part]) -> Option<(usize, usize, usize)> {
     let mut best: Option<(f32, usize, usize, usize)> = None;
     for (index, part) in parts.iter().enumerate() {
@@ -644,7 +721,15 @@ fn best_anchor(parts: &[Part]) -> Option<(usize, usize, usize)> {
             if run.len() >= MIN_ANCHOR {
                 let width = run.len().min(MAX_ANCHOR);
                 for offset in 0..=run.len() - width {
-                    let score = window_score(&run[offset..offset + width]);
+                    let window = &run[offset..offset + width];
+                    let mut distinct = [false; 256];
+                    for &byte in window {
+                        distinct[byte as usize] = true;
+                    }
+                    if distinct.iter().filter(|seen| **seen).count() < MIN_DISTINCT_BYTES {
+                        continue;
+                    }
+                    let score = window_score(window);
                     if best.is_none_or(|(top, ..)| score > top) {
                         best = Some((score, index, start + offset, width));
                     }
@@ -653,8 +738,7 @@ fn best_anchor(parts: &[Part]) -> Option<(usize, usize, usize)> {
             start += run.len();
         }
     }
-    best.filter(|(score, ..)| *score >= MIN_ANCHOR_SCORE)
-        .map(|(_, index, start, width)| (index, start, width))
+    best.map(|(_, index, start, width)| (index, start, width))
 }
 
 /// How many pieces a logical signature may have.
@@ -1587,5 +1671,35 @@ mod tests {
         ]);
         assert_eq!(stats.loaded, 0);
         assert!(set.is_empty());
+    }
+
+    #[test]
+    fn scans_leave_no_counts_behind() {
+        // The counters live in per-thread scratch that outlasts a scan and is shared by every set.
+        let (first, _) =
+            logical_set(&["Win.Test.A;Target:0;0&1;aabbccdd11223344;eeff00112233deadbeef"]);
+        let (second, _) =
+            logical_set(&["Win.Test.B;Target:0;0&1;aabbccdd11223344;99887766554433221100"]);
+        let piece_a: &[u8] = &[0xaa, 0xbb, 0xcc, 0xdd, 0x11, 0x22, 0x33, 0x44];
+        let piece_b: &[u8] = &[0xee, 0xff, 0x00, 0x11, 0x22, 0x33, 0xde, 0xad, 0xbe, 0xef];
+        let piece_c: &[u8] = &[0x99, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x00];
+
+        // A half match in one set must not complete with the other half seen in another scan.
+        assert_eq!(scan(&first, &document(&[piece_a])), None);
+        assert_eq!(scan(&first, &document(&[piece_b])), None);
+        assert_eq!(scan(&second, &document(&[piece_c])), None);
+        assert_eq!(scan(&second, &document(&[piece_a])), None);
+        // And a full match still works afterwards, repeatedly.
+        for _ in 0..3 {
+            assert_eq!(
+                scan(&first, &document(&[piece_a, piece_b])),
+                Some("Win.Test.A")
+            );
+            assert_eq!(
+                scan(&second, &document(&[piece_a, piece_c])),
+                Some("Win.Test.B")
+            );
+            assert_eq!(scan(&first, &document(&[piece_b])), None);
+        }
     }
 }

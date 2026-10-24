@@ -321,7 +321,7 @@ impl NativeIndex {
                 let mut reasons = pattern_stats.reasons;
                 if pattern_stats.too_weak > 0 {
                     reasons.insert(
-                        "too few fixed bytes, or only common bytes, to search for",
+                        "too few fixed bytes, or only padding, to search for",
                         pattern_stats.too_weak,
                     );
                 }
