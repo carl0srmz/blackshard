@@ -19,6 +19,9 @@ changes are listed here, newest first.
 - Self-tests are administrator-only and rate-limited; clearing the history is recorded.
 
 ### Added
+- Windows shortcuts (`.lnk`) are read: one that starts a script interpreter or downloader with
+  arguments that fetch, decode or run code, or whose arguments are padded with blanks to hide the
+  command, is flagged.
 - ClamAV body signatures (`.ndb`) and logical signatures (`.ldb`) are matched natively: about
   399,000 of the 414,000 in the live databases, including entry-point and section offsets,
   match counts, file-size conditions and the `i`, `w`, `a` and `f` modifiers. Anything the
