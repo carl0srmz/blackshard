@@ -320,7 +320,10 @@ impl NativeIndex {
             pattern_skip_reasons: {
                 let mut reasons = pattern_stats.reasons;
                 if pattern_stats.too_weak > 0 {
-                    reasons.insert("too few fixed bytes to convict on", pattern_stats.too_weak);
+                    reasons.insert(
+                        "too few fixed bytes, or only common bytes, to search for",
+                        pattern_stats.too_weak,
+                    );
                 }
                 reasons
             },

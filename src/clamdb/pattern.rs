@@ -167,6 +167,7 @@ struct Signature {
     /// Which part holds the anchor, and where in that part it begins.
     anchor_part: usize,
     anchor_start: usize,
+    anchor_len: usize,
     /// Set for a sub-signature of a logical signature: which one, and which slot of it. Such a
     /// match only counts toward the logical signature's expression.
     logical: Option<(u32, u16)>,
@@ -286,7 +287,7 @@ impl Signature {
         let Part::Bytes(bytes) = &self.parts[self.anchor_part] else {
             unreachable!("the anchor is always inside a byte part");
         };
-        bytes[self.anchor_start..]
+        bytes[self.anchor_start..self.anchor_start + self.anchor_len]
             .iter()
             .map_while(|byte| *byte)
             .collect()
@@ -561,8 +562,76 @@ fn build_signature(
     if fixed < min_fixed {
         return Parsed::TooWeak;
     }
-    // The longest run of fixed bytes anywhere in the signature.
-    let mut best: Option<(usize, usize, usize)> = None;
+    let Some((anchor_part, anchor_start, anchor_len)) = best_anchor(&parts) else {
+        return Parsed::TooWeak;
+    };
+    Parsed::Kept(Signature {
+        name: name.to_owned(),
+        target,
+        offset,
+        parts,
+        anchor_part,
+        anchor_start,
+        anchor_len,
+        logical: None,
+        fold: false,
+        fullword: false,
+    })
+}
+
+/// The longest window of a signature's fixed bytes searched for as its anchor.
+const MAX_ANCHOR: usize = 12;
+/// Below this a window is so common in ordinary files (zero padding, stack setup, ...) that
+/// searching for it would drown the scan in candidates that never confirm.
+const MIN_ANCHOR_SCORE: f32 = 7.0;
+
+/// How rare a byte is in executables: those that fill padding and make up common instructions
+/// count for little.
+fn byte_weight(byte: u8) -> f32 {
+    match byte {
+        0x00
+        | 0xff
+        | 0x90
+        | 0xcc
+        | 0x20
+        | 0x0a
+        | 0x0d
+        | 0x01..=0x04
+        | 0x08
+        | 0x10
+        | 0x24
+        | 0x40..=0x5f
+        | 0x83
+        | 0x89
+        | 0x8b
+        | 0xe8
+        | 0x0f
+        | 0xc2
+        | 0xc3 => 0.5,
+        _ => 1.5,
+    }
+}
+
+/// How unlikely `window` is to turn up by chance: its bytes' rarity, and how many differ.
+fn window_score(window: &[u8]) -> f32 {
+    let mut seen = [false; 256];
+    let mut score = 0.0;
+    for &byte in window {
+        score += byte_weight(byte);
+        if !seen[byte as usize] {
+            seen[byte as usize] = true;
+            score += 0.5;
+        }
+    }
+    score
+}
+
+/// Where to search for a signature: the rarest window of up to [`MAX_ANCHOR`] fixed bytes inside
+/// any one run of them, as `(part, start in part, length)`. `None` if there is no window of at
+/// least [`MIN_ANCHOR`] bytes that scores [`MIN_ANCHOR_SCORE`]. A rare window means few false
+/// candidates, which is what a scan's speed is made of.
+fn best_anchor(parts: &[Part]) -> Option<(usize, usize, usize)> {
+    let mut best: Option<(f32, usize, usize, usize)> = None;
     for (index, part) in parts.iter().enumerate() {
         let Part::Bytes(bytes) = part else { continue };
         let mut start = 0;
@@ -571,33 +640,21 @@ fn build_signature(
                 start += 1;
                 continue;
             }
-            let length = bytes[start..]
-                .iter()
-                .take_while(|byte| byte.is_some())
-                .count();
-            if best.is_none_or(|(_, _, longest)| length > longest) {
-                best = Some((index, start, length));
+            let run: Vec<u8> = bytes[start..].iter().map_while(|byte| *byte).collect();
+            if run.len() >= MIN_ANCHOR {
+                let width = run.len().min(MAX_ANCHOR);
+                for offset in 0..=run.len() - width {
+                    let score = window_score(&run[offset..offset + width]);
+                    if best.is_none_or(|(top, ..)| score > top) {
+                        best = Some((score, index, start + offset, width));
+                    }
+                }
             }
-            start += length;
+            start += run.len();
         }
     }
-    let Some((anchor_part, anchor_start, length)) = best else {
-        return Parsed::TooWeak;
-    };
-    if length < MIN_ANCHOR {
-        return Parsed::TooWeak;
-    }
-    Parsed::Kept(Signature {
-        name: name.to_owned(),
-        target,
-        offset,
-        parts,
-        anchor_part,
-        anchor_start,
-        logical: None,
-        fold: false,
-        fullword: false,
-    })
+    best.filter(|(score, ..)| *score >= MIN_ANCHOR_SCORE)
+        .map(|(_, index, start, width)| (index, start, width))
 }
 
 /// How many pieces a logical signature may have.
@@ -747,20 +804,26 @@ fn parse_piece(name: &str, target: Target, text: &str) -> Result<Vec<Signature>,
     if wide {
         forms.push(literal.iter().flat_map(|byte| [*byte, 0]).collect());
     }
-    Ok(forms
-        .into_iter()
-        .map(|bytes| Signature {
+    let mut signatures = Vec::with_capacity(forms.len());
+    for bytes in forms {
+        let parts = vec![Part::Bytes(bytes.into_iter().map(Some).collect())];
+        let Some((anchor_part, anchor_start, anchor_len)) = best_anchor(&parts) else {
+            return Err(Parsed::TooWeak);
+        };
+        signatures.push(Signature {
             name: name.to_owned(),
             target,
             offset,
-            parts: vec![Part::Bytes(bytes.into_iter().map(Some).collect())],
-            anchor_part: 0,
-            anchor_start: 0,
+            parts,
+            anchor_part,
+            anchor_start,
+            anchor_len,
             logical: None,
             fold,
             fullword,
-        })
-        .collect())
+        });
+    }
+    Ok(signatures)
 }
 
 /// Hex digits only: a plain run of bytes.
@@ -1079,6 +1142,10 @@ mod tests {
         }
         set.build();
         (set, stats)
+    }
+
+    fn set_of(lines: &[&str]) -> (PatternSet, PatternStats) {
+        set(lines)
     }
 
     fn scan<'a>(set: &'a PatternSet, text: &[u8]) -> Option<&'a str> {
@@ -1492,5 +1559,33 @@ mod tests {
         assert_eq!(scan(&set, b"..EvilPayload.."), Some("Win.Test.Case"));
         assert_eq!(scan(&set, b"..evilpayload.."), None);
         assert_eq!(scan(&set, b"..EVILPAYLOAD.."), None);
+    }
+
+    #[test]
+    fn the_anchor_is_the_rarest_window_not_the_longest_run() {
+        // Sixteen bytes of padding, then four rare ones: the padding must not be searched for.
+        let line = "Win.Test.Padded:0:*:00000000000000000000000000000000deadbeef0102";
+        let (set, stats) = set(&[line]);
+        assert_eq!(stats.loaded, 1);
+        let anchor = set.signatures[0].anchor();
+        assert!(
+            anchor.ends_with(&[0xde, 0xad, 0xbe, 0xef, 0x01, 0x02]),
+            "{anchor:02x?}"
+        );
+        assert!(anchor.len() <= MAX_ANCHOR);
+        // And it still matches whole.
+        let mut text = vec![0u8; 16];
+        text.extend_from_slice(&[0u8; 16]);
+        text.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef, 0x01, 0x02]);
+        assert_eq!(scan(&set, &text), Some("Win.Test.Padded"));
+
+        // Nothing but padding, stack setup or no-ops is too common to search for.
+        let (set, stats) = set_of(&[
+            "Win.Test.Zeros:0:*:0000000000000000000000000000000000",
+            "Win.Test.Nops:0:*:90909090909090909090",
+            "Win.Test.Prologue:0:*:558bec83ec10",
+        ]);
+        assert_eq!(stats.loaded, 0);
+        assert!(set.is_empty());
     }
 }
