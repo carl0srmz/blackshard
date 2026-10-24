@@ -1359,6 +1359,15 @@ impl BlackshardApp {
                         )
                         .changed();
                 });
+                ui.horizontal(|ui| {
+                    ui.add_space(24.0);
+                    changed |= ui
+                        .checkbox(
+                            &mut self.settings.rollback_documents,
+                            "keep a copy of a document before an unknown program changes it, to undo ransomware",
+                        )
+                        .changed();
+                });
             });
             changed |= ui
                 .checkbox(

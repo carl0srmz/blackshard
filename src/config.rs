@@ -18,6 +18,9 @@ pub struct Settings {
     pub ransomware_protection: bool,
 
     pub ransomware_block_mode: bool,
+    /// Keep a copy of a document before an unknown program changes it, so a program that turns
+    /// out to be ransomware can be undone. Part of ransomware protection.
+    pub rollback_documents: bool,
     pub automatic_quarantine: bool,
     pub notify_on_detection: bool,
     pub scan_archives: bool,
@@ -43,6 +46,7 @@ impl Default for Settings {
             ransomware_protection: true,
             // Stopping the writer is the point; audit mode only watches files get encrypted.
             ransomware_block_mode: true,
+            rollback_documents: true,
             automatic_quarantine: true,
             notify_on_detection: true,
             scan_archives: true,

@@ -782,7 +782,7 @@ fn handle_protected_modification(
     definition_generation: &AtomicU64,
 ) {
     let observed_at = std::time::SystemTime::now();
-    let (enabled, block_mode) = settings
+    let (enabled, block_mode, keep_copies) = settings
         .read()
         .map(|settings| {
             (
@@ -790,9 +790,10 @@ fn handle_protected_modification(
                     && settings.ransomware_protection
                     && !settings.is_excluded(path),
                 settings.ransomware_block_mode,
+                settings.rollback_documents,
             )
         })
-        .unwrap_or((false, false));
+        .unwrap_or((false, false, false));
     if !enabled {
         let _ = reply(
             item.port,
@@ -822,7 +823,8 @@ fn handle_protected_modification(
     // Save the original before the driver lets the operation through; the notification arrives
     // ahead of the write, rename or delete. Signed programs are skipped: they edit documents all
     // day, and a hijacked one is rarer than the cost of copying everything they touch.
-    if process_trust != ProcessTrust::Trusted
+    if keep_copies
+        && process_trust != ProcessTrust::Trusted
         && action.is_some()
         && notification.process_id != 0
         && notification.process_start_key != 0
