@@ -221,6 +221,7 @@ enum Confirmation {
     Restore(QuarantineRecordView),
     Delete(QuarantineRecordView),
     ClearActivity,
+    Emergency,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1067,12 +1068,22 @@ impl BlackshardApp {
                     "every local drive. this can take a long time",
                     ScanRequestKind::Full,
                 ),
+                (
+                    "emergency scan",
+                    "protection on, then a full-speed hunt that removes what it convicts",
+                    ScanRequestKind::Turbo,
+                ),
             ];
             egui::Grid::new("scan_choices")
                 .spacing(egui::vec2(18.0, 8.0))
                 .show(ui, |ui| {
                     for (label, detail, kind) in choices {
-                        if bracket_button(ui, label, TEXT, !running).clicked() {
+                        let color = if kind == ScanRequestKind::Turbo {
+                            ALARM
+                        } else {
+                            TEXT
+                        };
+                        if bracket_button(ui, label, color, !running).clicked() {
                             requested = Some(kind);
                         }
                         ui.label(RichText::new(detail).color(MUTED));
@@ -1095,6 +1106,9 @@ impl BlackshardApp {
         if let Some(kind) = requested {
             if matches!(kind, ScanRequestKind::Custom { .. }) {
                 self.start_custom_scan();
+            } else if kind == ScanRequestKind::Turbo {
+                // It removes files, so it asks first; the hidden shortcuts do not.
+                self.confirmation = Some(Confirmation::Emergency);
             } else {
                 self.start_scan(kind);
             }
@@ -1522,6 +1536,13 @@ impl BlackshardApp {
                 "delete permanently",
                 ALARM,
             ),
+            Confirmation::Emergency => (
+                "start an emergency scan?",
+                "Real-time protection is turned on, then every local drive is checked at full speed. Anything convicted is stopped, removed and cleaned up after. Your computer will be slower until it finishes."
+                    .to_owned(),
+                "start emergency scan",
+                ALARM,
+            ),
             Confirmation::ClearActivity => (
                 "clear activity history?",
                 "Delete the local activity history? This does not change quarantine or protection settings."
@@ -1570,6 +1591,7 @@ impl BlackshardApp {
                 Confirmation::Delete(record) => {
                     self.begin_quarantine_operation(QuarantineOperation::Delete, record.id)
                 }
+                Confirmation::Emergency => self.turbo(),
                 Confirmation::ClearActivity => match self.client.clear_activity() {
                     Ok(_) => {
                         self.activity.clear();
