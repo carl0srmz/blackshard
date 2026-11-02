@@ -60,7 +60,7 @@ jobs:
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Pick the commit to compare against
         id: baseline
@@ -141,7 +141,7 @@ jobs:
 
       - name: Keep the optimised service
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: blackshard-service-pgo
           path: |
