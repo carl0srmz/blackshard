@@ -44,7 +44,7 @@ walkdir = "2.5"
 # collections blackshard imports (YARA-Forge and Elastic); `console`, `math`, `string` and `time`
 # carry no extra dependencies and are widely used by the same rulesets.
 yara-x = { version = "1.19.0", default-features = false, features = ["constant-folding", "exact-atoms", "fast-regexp", "console-module", "dotnet-module", "hash-module", "math-module", "pe-module", "string-module", "time-module"] }
-zip = { version = "8.2.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 ureq = { version = "2.9.6", default-features = false, features = ["tls"] }
 log = "0.4.33"
 env_logger = "0.11.11"
