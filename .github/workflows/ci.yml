@@ -372,7 +372,20 @@ jobs:
           $subject = (gh api "repos/$env:GITHUB_REPOSITORY/commits/$env:GITHUB_SHA" --jq .commit.message) |
             Select-Object -First 1
           $sums = Get-Content release/SHA256SUMS.txt -Raw
+
+          # The prototype banner heads every testing candidate's notes. It is pinned to this
+          # commit, and a release without it is not published.
+          $banner = "assets/proto.png"
+          gh api "repos/$env:GITHUB_REPOSITORY/contents/$banner`?ref=$env:GITHUB_SHA" --jq .sha | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "$banner is missing at $env:GITHUB_SHA; the testing candidate must show it."
+            exit 1
+          }
+          $bannerUrl = "https://raw.githubusercontent.com/$env:GITHUB_REPOSITORY/$env:GITHUB_SHA/$banner"
+
           $notes = @"
+          ![blackshard prototype]($bannerUrl)
+
           Rolling preview build of ``main``. Expect breakage.
 
           **Version:** $version
