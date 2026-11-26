@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const WINDOW_MILLIS: u64 = 10_000;
@@ -10,6 +10,7 @@ const UNKNOWN_THRESHOLD: usize = 32;
 const TRUSTED_THRESHOLD: usize = 80;
 const MAX_TRACKED_PROCESSES: usize = 256;
 const MAX_EVENTS_PER_PROCESS: usize = 128;
+const MAX_REMEMBERED_STARTS: usize = 1024;
 const UNTRUSTED_ENCRYPTED_THRESHOLD: usize = 3;
 const UNKNOWN_ENCRYPTED_THRESHOLD: usize = 5;
 const HIGH_ENTROPY_WRITE: u8 = 1;
@@ -56,9 +57,22 @@ struct ProcessActivity {
     last_alert_millis: Option<u64>,
 }
 
+/// How a process was started, as the driver reported it. Kept so a decision about the process
+/// later can say where it came from, and for command-line rules on living-off-the-land tools.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessStart {
+    pub process_id: u32,
+    pub process_start_key: u64,
+    pub parent_process_id: u32,
+    pub creating_process_id: u32,
+    pub image: PathBuf,
+    pub command_line: String,
+}
+
 pub struct RansomwareMonitor {
     started: Instant,
     processes: HashMap<(u32, u64), ProcessActivity>,
+    starts: VecDeque<ProcessStart>,
 }
 
 struct BehaviorObservation<'a> {
@@ -76,11 +90,26 @@ impl Default for RansomwareMonitor {
         Self {
             started: Instant::now(),
             processes: HashMap::new(),
+            starts: VecDeque::new(),
         }
     }
 }
 
 impl RansomwareMonitor {
+    /// Remembers the most recent process starts; the oldest is forgotten past the bound.
+    pub fn process_started(&mut self, start: ProcessStart) {
+        if self.starts.len() >= MAX_REMEMBERED_STARTS {
+            self.starts.pop_front();
+        }
+        self.starts.push_back(start);
+    }
+
+    pub fn process_start(&self, process_id: u32, process_start_key: u64) -> Option<&ProcessStart> {
+        self.starts.iter().rev().find(|start| {
+            start.process_id == process_id && start.process_start_key == process_start_key
+        })
+    }
+
     pub fn observe(
         &mut self,
         process_id: u32,
@@ -284,6 +313,30 @@ mod tests {
 
     fn document(index: usize) -> std::path::PathBuf {
         format!(r"\Device\HarddiskVolume3\Users\Alice\Documents\file-{index}.docx").into()
+    }
+
+    #[test]
+    fn process_starts_are_remembered_by_process_key_and_bounded() {
+        let mut monitor = RansomwareMonitor::default();
+        let start = |process_id: u32| ProcessStart {
+            process_id,
+            process_start_key: 7,
+            parent_process_id: 1,
+            creating_process_id: 1,
+            image: PathBuf::from(r"C:\Windows\System32\cmd.exe"),
+            command_line: format!("cmd.exe /c job-{process_id}"),
+        };
+        for process_id in 0..MAX_REMEMBERED_STARTS as u32 + 1 {
+            monitor.process_started(start(process_id));
+        }
+        assert_eq!(monitor.process_start(0, 7), None);
+        assert_eq!(monitor.process_start(1, 8), None);
+        assert_eq!(
+            monitor
+                .process_start(1, 7)
+                .map(|start| start.command_line.as_str()),
+            Some("cmd.exe /c job-1")
+        );
     }
 
     #[test]

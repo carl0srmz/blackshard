@@ -91,6 +91,9 @@ macOS (`cargo test --lib`), which is the fast way to work on detection without a
 the driver is test-signed, so installing it needs test-signing mode (`enable-test-signing.ps1`)
 and Secure Boot off. please only do that in a VM.
 
+the driver protects itself: `fltmc unload` and `sc stop blackshard` fail. updating it (running
+`install.ps1` again) or uninstalling it takes effect after a restart.
+
 
 ## Security
 

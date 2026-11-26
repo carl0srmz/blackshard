@@ -28,13 +28,17 @@ use windows_sys::Win32::System::Threading::{
 };
 
 const BLACKSHARD_PROTOCOL_MAGIC: u32 = 0x3548_5342;
-const BLACKSHARD_PROTOCOL_VERSION: u16 = 6;
+const BLACKSHARD_PROTOCOL_VERSION: u16 = 9;
 const CONTROL_GET_HEALTH: u32 = 1;
 const CONTROL_SET_READY_GENERATION: u32 = 2;
+const CONTROL_SET_STOPPING: u32 = 3;
 const OPERATION_EXECUTE_SECTION: u32 = 2;
 const OPERATION_PROTECTED_WRITE: u32 = 3;
 const OPERATION_PROTECTED_METADATA: u32 = 4;
+const OPERATION_PROCESS_CREATE: u32 = 5;
+pub(crate) const OPERATION_IMAGE_LOAD: u32 = 6;
 const MAX_FILE_PATH_LENGTH: usize = 1024;
+const MAX_COMMAND_LINE_LENGTH: usize = 2048;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[link(name = "FltLib")]
@@ -106,7 +110,7 @@ struct DriverHealthReply {
     queue_overloads: u64,
     ready_generation: u64,
     operational_phase: u32,
-    reserved: u32,
+    features: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -156,6 +160,24 @@ pub struct DriverHealthCounters {
     pub queue_overloads: u64,
     pub ready_generation: u64,
     pub operational_phase: DriverOperationalPhase,
+    pub features: u32,
+}
+
+/// Parts of the driver's protection that register separately at load and can be missing.
+const DRIVER_FEATURES: &[(u32, &str)] = &[
+    (0x1, "service process protection"),
+    (0x2, "service registry protection"),
+    (0x4, "process start notifications"),
+    (0x8, "image load notifications"),
+];
+
+/// The protection parts a driver reporting `features` loaded without.
+pub(crate) fn missing_driver_features(features: u32) -> Vec<&'static str> {
+    DRIVER_FEATURES
+        .iter()
+        .filter(|(bit, _)| features & bit == 0)
+        .map(|(_, name)| *name)
+        .collect()
 }
 
 #[repr(C)]
@@ -188,6 +210,11 @@ pub(crate) struct BlackshardNotification {
     pub process_start_key: u64,
     pub must_enforce: u32,
     pub reserved: u32,
+    pub parent_process_id: u32,
+    pub creating_process_id: u32,
+    pub command_line_length: u32,
+    pub reserved2: u32,
+    pub command_line: [u16; MAX_COMMAND_LINE_LENGTH],
 }
 
 #[repr(C)]
@@ -330,6 +357,15 @@ impl RealtimeProtection {
 
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        // Tell the driver this is on purpose; a disconnect it is not told about is treated as a
+        // crash or a kill, and unjudged programs outside Windows and Program Files stay blocked.
+        let told = match self.port.load(Ordering::Acquire) {
+            0 => Ok(()),
+            _ => self.send_control(CONTROL_SET_STOPPING, 0),
+        };
+        if let Err(error) = told {
+            log::warn!("Could not tell the minifilter the service is stopping: {error}");
+        }
         let handle = self.port.swap(0, Ordering::AcqRel);
         if handle != 0 {
             unsafe { CloseHandle(handle) };
@@ -340,66 +376,17 @@ impl RealtimeProtection {
     }
 
     pub fn driver_health(&self) -> Result<DriverHealthCounters, String> {
-        let port = self.port.load(Ordering::Acquire);
-        if port == 0 {
-            return Err("the kernel communication port is not connected".to_owned());
-        }
-        let request = DriverControlRequest {
-            magic: BLACKSHARD_PROTOCOL_MAGIC,
-            version: BLACKSHARD_PROTOCOL_VERSION,
-            size: mem::size_of::<DriverControlRequest>() as u16,
-            command: CONTROL_GET_HEALTH,
-            generation: 0,
-        };
-        let mut reply = unsafe { mem::zeroed::<DriverHealthReply>() };
-        let mut returned = 0u32;
-        let result = unsafe {
-            FilterSendMessage(
-                port,
-                (&request as *const DriverControlRequest).cast(),
-                mem::size_of::<DriverControlRequest>() as u32,
-                (&mut reply as *mut DriverHealthReply).cast(),
-                mem::size_of::<DriverHealthReply>() as u32,
-                &mut returned,
-            )
-        };
-        if result != S_OK {
-            return Err(hresult_text(result));
-        }
-        if returned as usize != mem::size_of::<DriverHealthReply>()
-            || reply.magic != BLACKSHARD_PROTOCOL_MAGIC
-            || reply.version != BLACKSHARD_PROTOCOL_VERSION
-            || reply.size as usize != mem::size_of::<DriverHealthReply>()
-        {
-            return Err("the minifilter returned an invalid health record".to_owned());
-        }
-        Ok(DriverHealthCounters {
-            scan_requests: reply.scan_requests,
-            blocks: reply.blocks,
-            timeouts: reply.timeouts,
-            service_unavailable_bypasses: reply.service_unavailable_bypasses,
-            object_resolution_bypasses: reply.object_resolution_bypasses,
-            oversize_path_bypasses: reply.oversize_path_bypasses,
-            irql_bypasses: reply.irql_bypasses,
-            invalid_replies: reply.invalid_replies,
-            dirty_writes: reply.dirty_writes,
-            enforcement_bypasses: reply.enforcement_bypasses,
-            content_race_blocks: reply.content_race_blocks,
-            path_resolution_failures: reply.path_resolution_failures,
-            protocol_mismatches: reply.protocol_mismatches,
-            cache_allows: reply.cache_allows,
-            boot_policy_allows: reply.boot_policy_allows,
-            required_enforcement_blocks: reply.required_enforcement_blocks,
-            queue_overloads: reply.queue_overloads,
-            ready_generation: reply.ready_generation,
-            operational_phase: reply.operational_phase.into(),
-        })
+        query_driver_health(self.port.load(Ordering::Acquire))
     }
 
     pub fn set_ready_generation(&self, generation: u64) -> Result<(), String> {
         if generation == 0 {
             return Err("driver readiness generation zero is reserved".to_owned());
         }
+        self.send_control(CONTROL_SET_READY_GENERATION, generation)
+    }
+
+    fn send_control(&self, command: u32, generation: u64) -> Result<(), String> {
         let port = self.port.load(Ordering::Acquire);
         if port == 0 {
             return Err("the kernel communication port is not connected".to_owned());
@@ -408,7 +395,7 @@ impl RealtimeProtection {
             magic: BLACKSHARD_PROTOCOL_MAGIC,
             version: BLACKSHARD_PROTOCOL_VERSION,
             size: mem::size_of::<DriverControlRequest>() as u16,
-            command: CONTROL_SET_READY_GENERATION,
+            command,
             generation,
         };
         let mut returned = 0u32;
@@ -426,10 +413,67 @@ impl RealtimeProtection {
             return Err(hresult_text(result));
         }
         if returned != 0 {
-            return Err("the minifilter returned unexpected readiness data".to_owned());
+            return Err("the minifilter returned unexpected control data".to_owned());
         }
         Ok(())
     }
+}
+
+pub(crate) fn query_driver_health(port: HANDLE) -> Result<DriverHealthCounters, String> {
+    if port == 0 {
+        return Err("the kernel communication port is not connected".to_owned());
+    }
+    let request = DriverControlRequest {
+        magic: BLACKSHARD_PROTOCOL_MAGIC,
+        version: BLACKSHARD_PROTOCOL_VERSION,
+        size: mem::size_of::<DriverControlRequest>() as u16,
+        command: CONTROL_GET_HEALTH,
+        generation: 0,
+    };
+    let mut reply = unsafe { mem::zeroed::<DriverHealthReply>() };
+    let mut returned = 0u32;
+    let result = unsafe {
+        FilterSendMessage(
+            port,
+            (&request as *const DriverControlRequest).cast(),
+            mem::size_of::<DriverControlRequest>() as u32,
+            (&mut reply as *mut DriverHealthReply).cast(),
+            mem::size_of::<DriverHealthReply>() as u32,
+            &mut returned,
+        )
+    };
+    if result != S_OK {
+        return Err(hresult_text(result));
+    }
+    if returned as usize != mem::size_of::<DriverHealthReply>()
+        || reply.magic != BLACKSHARD_PROTOCOL_MAGIC
+        || reply.version != BLACKSHARD_PROTOCOL_VERSION
+        || reply.size as usize != mem::size_of::<DriverHealthReply>()
+    {
+        return Err("the minifilter returned an invalid health record".to_owned());
+    }
+    Ok(DriverHealthCounters {
+        scan_requests: reply.scan_requests,
+        blocks: reply.blocks,
+        timeouts: reply.timeouts,
+        service_unavailable_bypasses: reply.service_unavailable_bypasses,
+        object_resolution_bypasses: reply.object_resolution_bypasses,
+        oversize_path_bypasses: reply.oversize_path_bypasses,
+        irql_bypasses: reply.irql_bypasses,
+        invalid_replies: reply.invalid_replies,
+        dirty_writes: reply.dirty_writes,
+        enforcement_bypasses: reply.enforcement_bypasses,
+        content_race_blocks: reply.content_race_blocks,
+        path_resolution_failures: reply.path_resolution_failures,
+        protocol_mismatches: reply.protocol_mismatches,
+        cache_allows: reply.cache_allows,
+        boot_policy_allows: reply.boot_policy_allows,
+        required_enforcement_blocks: reply.required_enforcement_blocks,
+        queue_overloads: reply.queue_overloads,
+        ready_generation: reply.ready_generation,
+        operational_phase: reply.operational_phase.into(),
+        features: reply.features,
+    })
 }
 
 impl Drop for RealtimeProtection {
@@ -502,6 +546,9 @@ pub(crate) fn realtime_worker(
             continue;
         }
         let openable_path = device_path_to_openable_path(&kernel_path);
+        if notification.operation == OPERATION_PROCESS_CREATE {
+            record_process_start(&notification, &kernel_path, &ransomware_monitor);
+        }
         let enabled = settings
             .read()
             .map(|value| value.real_time_active() && !value.is_excluded(&openable_path))
@@ -617,6 +664,8 @@ pub(crate) fn realtime_worker(
                             scan_result
                         }
                     }
+                    // A process start the driver had no file identity for: scanned, uncached.
+                    Ok(_) if notification.file_id == 0 => active_engine.scan_open_file(&file),
                     Ok(identity) => DetectionReport::error(
                         format!(
                             "kernel/user file identity mismatch (expected {:016x}, opened {:016x})",
@@ -683,7 +732,7 @@ pub(crate) fn realtime_worker(
                         report.risk_score,
                         hash,
                         report.file_size,
-                        Some(notification.file_id),
+                        Some(notification.file_id).filter(|id| *id != 0),
                     ),
                     None => Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -764,8 +813,16 @@ pub(crate) fn realtime_worker(
             event.threat_name = report.threat_name.clone();
             event.risk_score = Some(report.risk_score);
             event.details = Some(format!(
-                "block_reply_accepted={reply_accepted}; pid={}",
-                item.message.notification.process_id
+                "block_reply_accepted={reply_accepted}; pid={}{}",
+                item.message.notification.process_id,
+                if notification.operation == OPERATION_PROCESS_CREATE {
+                    format!(
+                        "; command_line={}",
+                        notification_command_line(&notification)
+                    )
+                } else {
+                    String::new()
+                }
             ));
             let _ = history.append(&event);
         }
@@ -959,6 +1016,15 @@ fn handle_protected_modification(
         },
         decision.distinct_files
     ));
+    if let Some(command_line) = monitor.lock().ok().and_then(|monitor| {
+        monitor
+            .process_start(notification.process_id, notification.process_start_key)
+            .map(|start| start.command_line.clone())
+    }) {
+        if let Some(details) = event.details.as_mut() {
+            details.push_str(&format!("; command_line={command_line}"));
+        }
+    }
     let _ = history.append(&event);
     let _ = events.try_send(RealtimeEvent::Decision(Box::new(RealtimeDecision {
         process_id: notification.process_id,
@@ -1136,6 +1202,37 @@ pub(crate) fn reply(
     }
 }
 
+/// Logs a process start and hands it to the behaviour monitor, which keeps how each recent
+/// process was started for the decisions made about it later.
+fn record_process_start(
+    notification: &BlackshardNotification,
+    image: &Path,
+    monitor: &Mutex<RansomwareMonitor>,
+) {
+    let command_line = notification_command_line(notification);
+    log::info!(
+        "Process {} started by {} (parent {}): {image:?} {command_line}",
+        notification.process_id,
+        notification.creating_process_id,
+        notification.parent_process_id
+    );
+    if let Ok(mut monitor) = monitor.lock() {
+        monitor.process_started(crate::behavior::ProcessStart {
+            process_id: notification.process_id,
+            process_start_key: notification.process_start_key,
+            parent_process_id: notification.parent_process_id,
+            creating_process_id: notification.creating_process_id,
+            image: image.to_path_buf(),
+            command_line,
+        });
+    }
+}
+
+pub(crate) fn notification_command_line(notification: &BlackshardNotification) -> String {
+    let length = (notification.command_line_length as usize).min(MAX_COMMAND_LINE_LENGTH - 1);
+    String::from_utf16_lossy(&notification.command_line[..length])
+}
+
 pub(crate) fn notification_path(notification: &BlackshardNotification) -> PathBuf {
     let path_length = (notification.path_length as usize).min(MAX_FILE_PATH_LENGTH - 1);
     PathBuf::from(String::from_utf16_lossy(
@@ -1144,19 +1241,24 @@ pub(crate) fn notification_path(notification: &BlackshardNotification) -> PathBu
 }
 
 pub(crate) fn valid_notification(notification: &BlackshardNotification) -> bool {
+    // Scans need the file's identity. A protected-document change reported before the file is
+    // open (a truncating open) has none, a process start has it only when the section scan left
+    // it behind, and an image load never does.
+    let identity_required = matches!(notification.operation, 1..=2);
     notification.magic == BLACKSHARD_PROTOCOL_MAGIC
         && notification.version == BLACKSHARD_PROTOCOL_VERSION
         && notification.size as usize == mem::size_of::<BlackshardNotification>()
-        && matches!(notification.operation, 1..=4)
-        && notification.file_id != 0
-        && notification.content_generation != 0
+        && matches!(notification.operation, 1..=6)
+        && (!identity_required
+            || (notification.file_id != 0 && notification.content_generation != 0))
         && notification.process_start_key != 0
-        && ((notification.operation == 1 && notification.must_enforce == 0)
-            || (notification.operation == 2 && notification.must_enforce == 1)
-            || (matches!(notification.operation, 3..=4) && notification.must_enforce == 0))
+        && notification.must_enforce
+            == u32::from(notification.operation == OPERATION_EXECUTE_SECTION)
         && notification.reserved == 0
+        && notification.reserved2 == 0
         && notification.path_length > 0
         && notification.path_length < MAX_FILE_PATH_LENGTH as u32
+        && (notification.command_line_length as usize) < MAX_COMMAND_LINE_LENGTH
 }
 
 fn opened_final_path(file: &File) -> std::io::Result<PathBuf> {
@@ -2028,6 +2130,34 @@ mod tests {
     }
 
     #[test]
+    fn notifications_need_a_file_identity_only_for_scans() {
+        let notification = |operation: u32, file_id: u64| {
+            let mut notification = unsafe { mem::zeroed::<BlackshardNotification>() };
+            notification.magic = BLACKSHARD_PROTOCOL_MAGIC;
+            notification.version = BLACKSHARD_PROTOCOL_VERSION;
+            notification.size = mem::size_of::<BlackshardNotification>() as u16;
+            notification.operation = operation;
+            notification.must_enforce = u32::from(operation == OPERATION_EXECUTE_SECTION);
+            notification.file_id = file_id;
+            notification.content_generation = file_id;
+            notification.process_start_key = 1;
+            notification.path_length = 1;
+            notification
+        };
+        for operation in [1, 2] {
+            assert!(valid_notification(&notification(operation, 9)));
+            assert!(!valid_notification(&notification(operation, 0)));
+        }
+        for operation in 3..=6 {
+            assert!(valid_notification(&notification(operation, 0)));
+        }
+        assert!(!valid_notification(&notification(7, 9)));
+        let mut enforced_open = notification(1, 9);
+        enforced_open.must_enforce = 1;
+        assert!(!valid_notification(&enforced_open));
+    }
+
+    #[test]
     fn device_paths_use_globalroot() {
         assert_eq!(
             device_path_to_openable_path(Path::new(r"\Device\HarddiskVolume3\sample.exe")),
@@ -2040,8 +2170,13 @@ mod tests {
         assert_eq!(mem::size_of::<DriverControlRequest>(), 24);
         assert_eq!(mem::size_of::<DriverHealthReply>(), 160);
         assert_eq!(mem::size_of::<FilterMessageHeader>(), 16);
-        assert_eq!(mem::size_of::<BlackshardNotification>(), 2104);
-        assert_eq!(mem::size_of::<BlackshardMessage>(), 2120);
+        assert_eq!(
+            mem::offset_of!(BlackshardNotification, parent_process_id),
+            2104
+        );
+        assert_eq!(mem::offset_of!(BlackshardNotification, command_line), 2120);
+        assert_eq!(mem::size_of::<BlackshardNotification>(), 6216);
+        assert_eq!(mem::size_of::<BlackshardMessage>(), 6232);
         assert_eq!(mem::size_of::<FilterReplyHeader>(), 16);
         assert_eq!(mem::size_of::<BlackshardReplyMessage>(), 32);
     }

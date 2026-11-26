@@ -7,6 +7,27 @@ changes are listed here, newest first.
 ## Unreleased
 
 ### Security
+- blackshard also starts in Safe Mode (with and without networking), so rebooting into Safe Mode
+  no longer gets around it, and those Safe Mode entries are protected like its service keys.
+- More ways of destroying a protected document now count as modifications, and the original is
+  copied to the rollback vault first: opening it with truncation (overwrite or supersede),
+  shrinking it through its end of file or allocation size, mapping it for writing, opening it
+  delete-on-close, and giving it a hard link. Edits through a mapped view also invalidate cached
+  verdicts for the file.
+- The driver now reports every process start (image, command line, parent and creating process)
+  and every DLL load to the service. A process whose image is detected is refused at creation,
+  process starts are logged with their command lines, and ransomware alerts name how the
+  offending program was started.
+- The driver protects itself and the service: `fltmc unload` and `sc stop blackshard` fail, other
+  processes (administrators included) can no longer terminate, suspend or inject into the service,
+  and the driver's and service's registry keys can only be changed after the service was stopped
+  on purpose. Updating or removing the driver now takes effect at the next restart.
+- Once real-time protection has been ready, a program the service cannot judge in time (hung,
+  crashed or killed service, bad reply) is blocked instead of allowed, unless it lives in Windows'
+  own folders or Program Files. The driver waits up to 30 s for an execution verdict instead of
+  1.5 s. Stopping the service through the service manager still turns enforcement off.
+- A protected document write now waits up to 5 s for the service to copy the original to the
+  rollback vault, instead of 0.1 s, so the copy is no longer racing the write it should precede.
 - The CI auto-repair job no longer trusts branch names coming back from the job that ran the
   failed commit's code; it re-reads them from the run and only pushes to `autofix/` branches.
 - Turbo freezes and repairs only once per administrator-approved pause, from a baseline taken when

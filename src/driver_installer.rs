@@ -373,7 +373,11 @@ pub fn uninstall_driver(inf_path: &Path) -> Result<DriverChange, String> {
     let inf_path = wide(inf_path.as_os_str())?;
     let unload_result = unsafe { FilterUnload(filter_name().as_ptr()) };
 
-    if unload_result != 0
+    // ERROR_FLT_DO_NOT_DETACH: the running driver protects itself from unloading. Its package is
+    // removed anyway; it stays loaded until the next restart and is gone after it.
+    if unload_result as u32 == 0x801F_0010 {
+        log::warn!("The blackshard minifilter stays loaded until Windows restarts");
+    } else if unload_result != 0
         && unload_result as u32 != 0x801F_0013
         && unload_result as u32 != 0x8007_0424
     {

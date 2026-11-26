@@ -2,21 +2,81 @@
 #include <dontuse.h>
 
 #define BLACKSHARD_PROTOCOL_MAGIC 0x35485342UL
-#define BLACKSHARD_PROTOCOL_VERSION 6
+#define BLACKSHARD_PROTOCOL_VERSION 9
 #define BLACKSHARD_PORT_NAME L"\\BlackshardPort"
 #define BLACKSHARD_STREAM_CONTEXT_TAG 'cShB'
+#define BLACKSHARD_NOTIFICATION_TAG 'nShB'
 #define MAX_FILE_PATH_LENGTH 1024
+#define MAX_COMMAND_LINE_LENGTH 2048
 
 #define BLACKSHARD_OPERATION_OPEN 1UL
 #define BLACKSHARD_OPERATION_EXECUTE_SECTION 2UL
 #define BLACKSHARD_OPERATION_PROTECTED_WRITE 3UL
 #define BLACKSHARD_OPERATION_PROTECTED_METADATA 4UL
+#define BLACKSHARD_OPERATION_PROCESS_CREATE 5UL
+#define BLACKSHARD_OPERATION_IMAGE_LOAD 6UL
 #define BLACKSHARD_CONTROL_GET_HEALTH 1UL
 #define BLACKSHARD_CONTROL_SET_READY_GENERATION 2UL
+#define BLACKSHARD_CONTROL_SET_STOPPING 3UL
 #define BLACKSHARD_ENTROPY_NOT_MEASURED 0UL
 #define BLACKSHARD_ENTROPY_LOW 1UL
 #define BLACKSHARD_ENTROPY_NORMAL 2UL
 #define BLACKSHARD_ENTROPY_HIGH 3UL
+
+//
+// How long each operation waits for the service. An execution waits as long as a scan of a large
+// program can take: the image section cannot be created without the verdict, and this FsFilter
+// operation cannot be pended to a worker (only IRP-based operations can), so the thread creating
+// the section waits here. A protected write waits for the service to copy the original document
+// (at most 16 MB) to the rollback vault before the write may change it. An open only audits.
+//
+#define BLACKSHARD_FEATURE_HANDLE_PROTECTION 0x1UL
+#define BLACKSHARD_FEATURE_REGISTRY_PROTECTION 0x2UL
+#define BLACKSHARD_FEATURE_PROCESS_NOTIFY 0x4UL
+#define BLACKSHARD_FEATURE_IMAGE_NOTIFY 0x8UL
+#define BLACKSHARD_CALLBACK_ALTITUDE L"320000.4242"
+
+#ifndef PROCESS_TERMINATE
+#define PROCESS_TERMINATE 0x0001
+#endif
+#ifndef PROCESS_CREATE_THREAD
+#define PROCESS_CREATE_THREAD 0x0002
+#endif
+#ifndef PROCESS_VM_OPERATION
+#define PROCESS_VM_OPERATION 0x0008
+#endif
+#ifndef PROCESS_VM_WRITE
+#define PROCESS_VM_WRITE 0x0020
+#endif
+#ifndef PROCESS_SUSPEND_RESUME
+#define PROCESS_SUSPEND_RESUME 0x0800
+#endif
+#ifndef THREAD_TERMINATE
+#define THREAD_TERMINATE 0x0001
+#endif
+#ifndef THREAD_SUSPEND_RESUME
+#define THREAD_SUSPEND_RESUME 0x0002
+#endif
+#ifndef THREAD_SET_CONTEXT
+#define THREAD_SET_CONTEXT 0x0010
+#endif
+
+//
+// Rights other processes, administrators included, never get on the service: enough to kill,
+// freeze or inject into it. Its threads are covered too, or killing each thread would do.
+//
+#define BLACKSHARD_DENIED_PROCESS_ACCESS \
+    (PROCESS_TERMINATE | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | \
+     PROCESS_SUSPEND_RESUME | PROCESS_CREATE_THREAD)
+#define BLACKSHARD_DENIED_THREAD_ACCESS \
+    (THREAD_TERMINATE | THREAD_SUSPEND_RESUME | THREAD_SET_CONTEXT)
+
+#define BLACKSHARD_EXECUTE_TIMEOUT_MS 30000LL
+#define BLACKSHARD_PROTECTED_TIMEOUT_MS 5000LL
+#define BLACKSHARD_OPEN_TIMEOUT_MS 1500LL
+// The image was already judged when its section was created; this second look is usually a cache
+// hit, and a slow one lets the process start rather than hold up its parent.
+#define BLACKSHARD_PROCESS_TIMEOUT_MS 10000LL
 
 typedef enum _BLACKSHARD_OPERATIONAL_PHASE {
     BlackshardPhaseEarlyBoot = 0,
@@ -67,6 +127,11 @@ typedef struct _BLACKSHARD_NOTIFICATION {
     ULONGLONG ProcessStartKey;
     ULONG MustEnforce;
     ULONG Reserved;
+    ULONG ParentProcessId;
+    ULONG CreatingProcessId;
+    ULONG CommandLineLength;
+    ULONG Reserved2;
+    WCHAR CommandLine[MAX_COMMAND_LINE_LENGTH];
 } BLACKSHARD_NOTIFICATION, *PBLACKSHARD_NOTIFICATION;
 
 typedef enum _BLACKSHARD_VERDICT {
@@ -113,7 +178,7 @@ typedef struct _BLACKSHARD_HEALTH_REPLY {
     ULONGLONG QueueOverloads;
     ULONGLONG ReadyGeneration;
     ULONG OperationalPhase;
-    ULONG Reserved;
+    ULONG Features;
 } BLACKSHARD_HEALTH_REPLY, *PBLACKSHARD_HEALTH_REPLY;
 
 typedef struct _BLACKSHARD_STREAM_CONTEXT {
@@ -131,6 +196,10 @@ typedef struct _BLACKSHARD_DATA {
     PFLT_PORT ServerPort;
     PFLT_PORT ClientPort;
     HANDLE ClientProcessId;
+    PEPROCESS volatile ClientProcess;
+    PVOID ObjectCallbacks;
+    LARGE_INTEGER RegistryCookie;
+    ULONG Features;
     volatile LONG64 ScanRequests;
     volatile LONG64 Blocks;
     volatile LONG64 Timeouts;
@@ -150,6 +219,8 @@ typedef struct _BLACKSHARD_DATA {
     volatile LONG64 QueueOverloads;
     volatile LONG64 ReadyGeneration;
     volatile LONG OperationalPhase;
+    volatile LONG EverReady;
+    PFLT_VOLUME SystemVolume;
 } BLACKSHARD_DATA, *PBLACKSHARD_DATA;
 
 C_ASSERT(FIELD_OFFSET(BLACKSHARD_NOTIFICATION, FilePath) == 24);
@@ -157,7 +228,9 @@ C_ASSERT(FIELD_OFFSET(BLACKSHARD_NOTIFICATION, FileId) == 2072);
 C_ASSERT(FIELD_OFFSET(BLACKSHARD_NOTIFICATION, ContentGeneration) == 2080);
 C_ASSERT(FIELD_OFFSET(BLACKSHARD_NOTIFICATION, ProcessStartKey) == 2088);
 C_ASSERT(FIELD_OFFSET(BLACKSHARD_NOTIFICATION, MustEnforce) == 2096);
-C_ASSERT(sizeof(BLACKSHARD_NOTIFICATION) == 2104);
+C_ASSERT(FIELD_OFFSET(BLACKSHARD_NOTIFICATION, ParentProcessId) == 2104);
+C_ASSERT(FIELD_OFFSET(BLACKSHARD_NOTIFICATION, CommandLine) == 2120);
+C_ASSERT(sizeof(BLACKSHARD_NOTIFICATION) == 6216);
 C_ASSERT(sizeof(BLACKSHARD_REPLY) == 16);
 C_ASSERT(sizeof(BLACKSHARD_CONTROL_REQUEST) == 24);
 C_ASSERT(sizeof(BLACKSHARD_HEALTH_REPLY) == 160);
@@ -266,13 +339,103 @@ BlackshardClassifyWriteEntropy (
 BLACKSHARD_FAILURE_DECISION
 BlackshardApplyFailurePolicy (
     _In_ BLACKSHARD_FAILURE_REASON Reason,
-    _In_ ULONG MustEnforce
+    _In_ ULONG MustEnforce,
+    _In_ BOOLEAN AdministratorOnlyImage
     );
 
 BOOLEAN
 BlackshardFailureRequiresBlock (
     _In_ BLACKSHARD_FAILURE_REASON Reason,
-    _In_ ULONG MustEnforce
+    _In_ ULONG MustEnforce,
+    _In_ BOOLEAN AdministratorOnlyImage
+    );
+
+BOOLEAN
+BlackshardFailsClosed (
+    VOID
+    );
+
+BOOLEAN
+BlackshardIsAdministratorOnlyImage (
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _In_ PFLT_FILE_NAME_INFORMATION NameInfo
+    );
+
+VOID
+BlackshardRememberSystemVolume (
+    VOID
+    );
+
+VOID
+BlackshardRegisterSelfProtection (
+    _In_ PDRIVER_OBJECT DriverObject
+    );
+
+VOID
+BlackshardUnregisterSelfProtection (
+    VOID
+    );
+
+BOOLEAN
+BlackshardSelfProtectionActive (
+    VOID
+    );
+
+OB_PREOP_CALLBACK_STATUS
+BlackshardPreObjectHandle (
+    _In_ PVOID RegistrationContext,
+    _Inout_ POB_PRE_OPERATION_INFORMATION OperationInformation
+    );
+
+EX_CALLBACK_FUNCTION BlackshardRegistryCallback;
+
+BOOLEAN
+BlackshardIsProtectedRegistryKey (
+    _In_ PCUNICODE_STRING KeyName
+    );
+
+VOID
+BlackshardRegisterProcessNotifications (
+    VOID
+    );
+
+VOID
+BlackshardUnregisterProcessNotifications (
+    VOID
+    );
+
+VOID
+BlackshardProcessNotify (
+    _Inout_ PEPROCESS Process,
+    _In_ HANDLE ProcessId,
+    _Inout_opt_ PPS_CREATE_NOTIFY_INFO CreateInfo
+    );
+
+VOID
+BlackshardLoadImageNotify (
+    _In_opt_ PUNICODE_STRING FullImageName,
+    _In_ HANDLE ProcessId,
+    _In_ PIMAGE_INFO ImageInfo
+    );
+
+PBLACKSHARD_NOTIFICATION
+BlackshardAllocateNotification (
+    _In_ ULONG Operation,
+    _In_ ULONG ProcessId,
+    _In_ PCUNICODE_STRING Path
+    );
+
+BOOLEAN
+BlackshardAskService (
+    _In_ __drv_freesMem(Mem) PBLACKSHARD_NOTIFICATION Notification,
+    _In_ LONGLONG TimeoutMs,
+    _Out_ PBOOLEAN Block,
+    _Out_ BLACKSHARD_FAILURE_REASON *Failure
+    );
+
+BOOLEAN
+BlackshardEvaluateTruncatingOpen (
+    _Inout_ PFLT_CALLBACK_DATA Data
     );
 
 NTSTATUS
@@ -292,6 +455,16 @@ BlackshardGetOrCreateStreamContext (
 #pragma alloc_text(PAGE, BlackshardIsProtectedDocumentName)
 #pragma alloc_text(PAGE, BlackshardNameContainsInsensitive)
 #pragma alloc_text(PAGE, BlackshardEvaluateOpenedObject)
+#pragma alloc_text(PAGE, BlackshardIsAdministratorOnlyImage)
+#pragma alloc_text(INIT, BlackshardRememberSystemVolume)
+#pragma alloc_text(INIT, BlackshardRegisterSelfProtection)
+#pragma alloc_text(PAGE, BlackshardUnregisterSelfProtection)
+#pragma alloc_text(PAGE, BlackshardRegistryCallback)
+#pragma alloc_text(PAGE, BlackshardIsProtectedRegistryKey)
+#pragma alloc_text(INIT, BlackshardRegisterProcessNotifications)
+#pragma alloc_text(PAGE, BlackshardUnregisterProcessNotifications)
+#pragma alloc_text(PAGE, BlackshardProcessNotify)
+#pragma alloc_text(PAGE, BlackshardEvaluateTruncatingOpen)
 
 CONST FLT_CONTEXT_REGISTRATION Contexts[] = {
     {
@@ -335,10 +508,14 @@ CONST FLT_OPERATION_REGISTRATION Callbacks[] = {
     { IRP_MJ_OPERATION_END }
 };
 
+//
+// Not stoppable through the service control manager, and the unload callback refuses every
+// unload it may refuse, so `sc stop` and `fltmc unload` both fail. A new driver loads at restart.
+//
 CONST FLT_REGISTRATION FilterRegistration = {
     sizeof(FLT_REGISTRATION),
     FLT_REGISTRATION_VERSION,
-    0,
+    FLTFL_REGISTRATION_DO_NOT_SUPPORT_SERVICE_STOP,
     Contexts,
     Callbacks,
     BlackshardUnload,
@@ -415,21 +592,104 @@ DriverEntry (
         return status;
     }
 
+    BlackshardRegisterSelfProtection(DriverObject);
+    BlackshardRegisterProcessNotifications();
+
     status = FltStartFiltering(gBlackshardData.FilterHandle);
     if (!NT_SUCCESS(status)) {
+        BlackshardUnregisterProcessNotifications();
+        BlackshardUnregisterSelfProtection();
         FltCloseCommunicationPort(gBlackshardData.ServerPort);
         gBlackshardData.ServerPort = NULL;
         FltUnregisterFilter(gBlackshardData.FilterHandle);
         gBlackshardData.FilterHandle = NULL;
+        return status;
     }
 
+    BlackshardRememberSystemVolume();
     return status;
+}
+
+VOID
+BlackshardRememberSystemVolume (
+    VOID
+    )
+{
+    UNICODE_STRING systemRoot = RTL_CONSTANT_STRING(L"\\SystemRoot");
+    OBJECT_ATTRIBUTES attributes;
+    IO_STATUS_BLOCK ioStatus;
+    HANDLE handle;
+    PFILE_OBJECT fileObject;
+    NTSTATUS status;
+
+    InitializeObjectAttributes(
+        &attributes,
+        &systemRoot,
+        OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE,
+        NULL,
+        NULL
+        );
+    status = ZwCreateFile(
+        &handle,
+        FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        &attributes,
+        &ioStatus,
+        NULL,
+        0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+        FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+        NULL,
+        0
+        );
+    if (!NT_SUCCESS(status)) {
+        return;
+    }
+    status = ObReferenceObjectByHandle(
+        handle,
+        0,
+        *IoFileObjectType,
+        KernelMode,
+        (PVOID *)&fileObject,
+        NULL
+        );
+    if (NT_SUCCESS(status)) {
+        status = FltGetVolumeFromFileObject(
+            gBlackshardData.FilterHandle,
+            fileObject,
+            &gBlackshardData.SystemVolume
+            );
+        if (!NT_SUCCESS(status)) {
+            gBlackshardData.SystemVolume = NULL;
+        }
+        ObDereferenceObject(fileObject);
+    }
+    ZwClose(handle);
+}
+
+BOOLEAN
+BlackshardFailsClosed (
+    VOID
+    )
+{
+    //
+    // Once protection has been established this boot, an execution the service cannot judge is
+    // refused: a hung, crashed or killed service must not open the door. Before that (early boot,
+    // or a service that never got ready) nothing was promised, and an orderly stop through the
+    // service control manager announces itself as Stopping and keeps the old allow behaviour.
+    //
+    return (BOOLEAN)(
+        InterlockedCompareExchange(&gBlackshardData.EverReady, 0, 0) != 0 &&
+        InterlockedCompareExchange(&gBlackshardData.OperationalPhase, 0, 0) !=
+            BlackshardPhaseStopping
+        );
 }
 
 BLACKSHARD_FAILURE_DECISION
 BlackshardApplyFailurePolicy (
     _In_ BLACKSHARD_FAILURE_REASON Reason,
-    _In_ ULONG MustEnforce
+    _In_ ULONG MustEnforce,
+    _In_ BOOLEAN AdministratorOnlyImage
     )
 {
     BLACKSHARD_OPERATIONAL_PHASE phase;
@@ -493,6 +753,20 @@ BlackshardApplyFailurePolicy (
         return BlackshardFailureBlock;
     }
 
+    //
+    // Windows' own folders and Program Files stay runnable without a verdict, so the service can
+    // restart and the desktop keeps working while it does; standard users cannot write there.
+    //
+    if (!AdministratorOnlyImage &&
+        BlackshardFailsClosed() &&
+        (Reason == BlackshardFailureServiceUnavailable ||
+         Reason == BlackshardFailureTimeout ||
+         Reason == BlackshardFailureInvalidReply ||
+         Reason == BlackshardFailureProtocolMismatch)) {
+        InterlockedIncrement64(&gBlackshardData.RequiredEnforcementBlocks);
+        return BlackshardFailureBlock;
+    }
+
     InterlockedIncrement64(&gBlackshardData.EnforcementBypasses);
     if (phase == BlackshardPhaseReady) {
         return BlackshardFailureAuditAllow;
@@ -504,11 +778,12 @@ BlackshardApplyFailurePolicy (
 BOOLEAN
 BlackshardFailureRequiresBlock (
     _In_ BLACKSHARD_FAILURE_REASON Reason,
-    _In_ ULONG MustEnforce
+    _In_ ULONG MustEnforce,
+    _In_ BOOLEAN AdministratorOnlyImage
     )
 {
     return (BOOLEAN)(
-        BlackshardApplyFailurePolicy(Reason, MustEnforce) ==
+        BlackshardApplyFailurePolicy(Reason, MustEnforce, AdministratorOnlyImage) ==
         BlackshardFailureBlock
         );
 }
@@ -518,13 +793,23 @@ BlackshardUnload (
     _In_ FLT_FILTER_UNLOAD_FLAGS Flags
     )
 {
-    UNREFERENCED_PARAMETER(Flags);
-
     PAGED_CODE();
+
+    if (!FlagOn(Flags, FLTFL_FILTER_UNLOAD_MANDATORY)) {
+        return STATUS_FLT_DO_NOT_DETACH;
+    }
+
+    BlackshardUnregisterProcessNotifications();
+    BlackshardUnregisterSelfProtection();
 
     if (gBlackshardData.ServerPort != NULL) {
         FltCloseCommunicationPort(gBlackshardData.ServerPort);
         gBlackshardData.ServerPort = NULL;
+    }
+
+    if (gBlackshardData.SystemVolume != NULL) {
+        FltObjectDereference(gBlackshardData.SystemVolume);
+        gBlackshardData.SystemVolume = NULL;
     }
 
     if (gBlackshardData.FilterHandle != NULL) {
@@ -567,22 +852,41 @@ BlackshardPreCreate (
     }
 
     createDisposition = (UCHAR)(Data->Iopb->Parameters.Create.Options >> 24);
-    if (createDisposition == FILE_CREATE ||
-        createDisposition == FILE_SUPERSEDE ||
+    if (createDisposition == FILE_SUPERSEDE ||
         createDisposition == FILE_OVERWRITE ||
         createDisposition == FILE_OVERWRITE_IF) {
+        //
+        // An open that replaces a file empties it before any write is seen, so a protected
+        // document is reported (and copied to the rollback vault) now. A file being replaced is
+        // not scanned.
+        //
+        if (gBlackshardData.ClientPort != NULL &&
+            KeGetCurrentIrql() == PASSIVE_LEVEL &&
+            !KeAreAllApcsDisabled() &&
+            IoGetTopLevelIrp() == NULL &&
+            BlackshardEvaluateTruncatingOpen(Data)) {
+            Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+            Data->IoStatus.Information = 0;
+            InterlockedIncrement64(&gBlackshardData.Blocks);
+            return FLT_PREOP_COMPLETE;
+        }
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+    if (createDisposition == FILE_CREATE) {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
     desiredAccess = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
     if ((desiredAccess &
-         (FILE_READ_DATA | FILE_EXECUTE | GENERIC_READ | GENERIC_EXECUTE)) == 0) {
+         (FILE_READ_DATA | FILE_EXECUTE | GENERIC_READ | GENERIC_EXECUTE)) == 0 &&
+        !FlagOn(Data->Iopb->Parameters.Create.Options, FILE_DELETE_ON_CLOSE)) {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
     if (gBlackshardData.ClientPort == NULL) {
         (VOID)BlackshardApplyFailurePolicy(
             BlackshardFailureServiceUnavailable,
+            FALSE,
             FALSE
             );
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
@@ -624,19 +928,39 @@ BlackshardPostCreate (
         IoGetTopLevelIrp() != NULL) {
         (VOID)BlackshardApplyFailurePolicy(
             BlackshardFailureUnsupportedIrql,
+            FALSE,
             FALSE
             );
         return FLT_POSTOP_FINISHED_PROCESSING;
     }
 
-    block = BlackshardEvaluateOpenedObject(
-        Data,
-        FltObjects,
-        BLACKSHARD_OPERATION_OPEN,
-        FALSE,
-        desiredAccess,
-        TRUE
-        );
+    //
+    // A delete-on-close open deletes the file when its last handle closes, so it is reported as a
+    // deletion now, while the document can still be copied and the open still refused.
+    //
+    if (FlagOn(Data->Iopb->Parameters.Create.Options, FILE_DELETE_ON_CLOSE) &&
+        BlackshardEvaluateOpenedObject(
+            Data,
+            FltObjects,
+            BLACKSHARD_OPERATION_PROTECTED_METADATA,
+            FALSE,
+            0,
+            TRUE
+            )) {
+        block = TRUE;
+    } else if ((desiredAccess &
+                (FILE_READ_DATA | FILE_EXECUTE | GENERIC_READ | GENERIC_EXECUTE)) != 0) {
+        block = BlackshardEvaluateOpenedObject(
+            Data,
+            FltObjects,
+            BLACKSHARD_OPERATION_OPEN,
+            FALSE,
+            desiredAccess,
+            TRUE
+            );
+    } else {
+        block = FALSE;
+    }
 
     if (!block) {
         return FLT_POSTOP_FINISHED_PROCESSING;
@@ -677,12 +1001,30 @@ BlackshardPreWrite (
         *CompletionContext = NULL;
     }
 
-    if (Data->RequestorMode != UserMode ||
-        KeGetCurrentIrql() > APC_LEVEL ||
+    if (KeGetCurrentIrql() > APC_LEVEL ||
         Data->Iopb->Parameters.Write.Length == 0 ||
         FltObjects->Instance == NULL ||
         FltObjects->FileObject == NULL ||
         FlagOn(FltObjects->FileObject->Flags, FO_STREAM_FILE | FO_VOLUME_OPEN)) {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    //
+    // Paging writes (a mapped view being flushed, or the cache writing out earlier writes) are
+    // made by the system, not the program. The program was reported when it wrote through the
+    // cache or mapped the file for writing; here the content still changes, so any verdict
+    // cached for the old content stops matching.
+    //
+    if (Data->RequestorMode != UserMode) {
+        if (FlagOn(Data->Iopb->IrpFlags, IRP_PAGING_IO) &&
+            NT_SUCCESS(FltGetStreamContext(
+                FltObjects->Instance,
+                FltObjects->FileObject,
+                &streamContext
+                ))) {
+            InterlockedIncrement64(&streamContext->ContentGeneration);
+            FltReleaseContext(streamContext);
+        }
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
@@ -822,6 +1164,7 @@ BlackshardPreSetInformation (
     )
 {
     FILE_INFORMATION_CLASS informationClass;
+    BOOLEAN truncation;
     BOOLEAN relevant;
     BOOLEAN block;
 
@@ -838,11 +1181,23 @@ BlackshardPreSetInformation (
 
     informationClass =
         Data->Iopb->Parameters.SetFileInformation.FileInformationClass;
+    //
+    // Shrinking a file through its end or its allocation destroys content like a write does. A
+    // hard link to a document gives it a second name, outside the protected folders, that later
+    // writes would go through unseen, so it counts with renames and deletions.
+    //
+    truncation = (BOOLEAN)(
+        informationClass == FileEndOfFileInformation ||
+        informationClass == FileAllocationInformation
+        );
     relevant = (BOOLEAN)(
+        truncation ||
         informationClass == FileDispositionInformation ||
         informationClass == FileDispositionInformationEx ||
         informationClass == FileRenameInformation ||
-        informationClass == FileRenameInformationEx
+        informationClass == FileRenameInformationEx ||
+        informationClass == FileLinkInformation ||
+        informationClass == FileLinkInformationEx
         );
     if (!relevant) {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
@@ -853,6 +1208,7 @@ BlackshardPreSetInformation (
         IoGetTopLevelIrp() != NULL) {
         (VOID)BlackshardApplyFailurePolicy(
             BlackshardFailureUnsupportedIrql,
+            FALSE,
             FALSE
             );
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
@@ -861,9 +1217,11 @@ BlackshardPreSetInformation (
     block = BlackshardEvaluateOpenedObject(
         Data,
         FltObjects,
-        BLACKSHARD_OPERATION_PROTECTED_METADATA,
+        truncation
+        ? BLACKSHARD_OPERATION_PROTECTED_WRITE
+        : BLACKSHARD_OPERATION_PROTECTED_METADATA,
         FALSE,
-        0,
+        BLACKSHARD_ENTROPY_NOT_MEASURED,
         TRUE
         );
     if (block) {
@@ -905,12 +1263,25 @@ BlackshardPreAcquireForSectionSynchronization (
           PAGE_EXECUTE_READ |
           PAGE_EXECUTE_READWRITE |
           PAGE_EXECUTE_WRITECOPY)) == 0) {
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
-    }
-
-    if (gBlackshardData.ClientPort == NULL) {
-        if (BlackshardFailureRequiresBlock(
-                BlackshardFailureServiceUnavailable,
+        //
+        // A program that maps a document for writing changes it through the view, and those
+        // changes reach the disk later as paging writes the system makes. The mapping is the
+        // last point where the program is known and the document is still intact.
+        //
+        if ((pageProtection & PAGE_READWRITE) == 0 ||
+            !FltObjects->FileObject->WriteAccess ||
+            gBlackshardData.ClientPort == NULL ||
+            KeGetCurrentIrql() != PASSIVE_LEVEL ||
+            KeAreAllApcsDisabled() ||
+            IoGetTopLevelIrp() != NULL) {
+            return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        }
+        if (BlackshardEvaluateOpenedObject(
+                Data,
+                FltObjects,
+                BLACKSHARD_OPERATION_PROTECTED_WRITE,
+                FALSE,
+                BLACKSHARD_ENTROPY_NOT_MEASURED,
                 TRUE
                 )) {
             Data->IoStatus.Status = STATUS_ACCESS_DENIED;
@@ -921,13 +1292,27 @@ BlackshardPreAcquireForSectionSynchronization (
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
+    //
+    // Without the service an image is allowed unless protection was already established. When it
+    // was, the image's location decides, so the name is resolved below before refusing it.
+    //
+    if (gBlackshardData.ClientPort == NULL && !BlackshardFailsClosed()) {
+        (VOID)BlackshardApplyFailurePolicy(
+            BlackshardFailureServiceUnavailable,
+            TRUE,
+            FALSE
+            );
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
 
     if (KeGetCurrentIrql() != PASSIVE_LEVEL ||
         KeAreAllApcsDisabled() ||
         IoGetTopLevelIrp() != NULL) {
         if (BlackshardFailureRequiresBlock(
                 BlackshardFailureUnsupportedIrql,
-                TRUE
+                TRUE,
+                FALSE
                 )) {
             Data->IoStatus.Status = STATUS_ACCESS_DENIED;
             Data->IoStatus.Information = 0;
@@ -971,22 +1356,23 @@ BlackshardEvaluateOpenedObject (
     FILE_INTERNAL_INFORMATION internalInformation;
     PFLT_FILE_NAME_INFORMATION nameInformation;
     PBLACKSHARD_STREAM_CONTEXT streamContext;
-    BLACKSHARD_NOTIFICATION notification;
-    BLACKSHARD_REPLY reply;
-    ULONG replyLength;
+    PBLACKSHARD_NOTIFICATION notification;
     ULONG requestorProcessId;
     PEPROCESS requestorProcess;
     ULONGLONG processStartKey;
     ULONG pathLength;
     ULONGLONG contentGeneration;
-    LARGE_INTEGER timeout;
+    BOOLEAN administratorOnlyImage;
+    BOOLEAN block;
+    BLACKSHARD_FAILURE_REASON failure;
 
     PAGED_CODE();
 
     if (FltObjects->Instance == NULL || FltObjects->FileObject == NULL) {
         return BlackshardFailureRequiresBlock(
             BlackshardFailureObjectResolution,
-            MustEnforce
+            MustEnforce,
+            FALSE
             );
     }
 
@@ -998,21 +1384,24 @@ BlackshardEvaluateOpenedObject (
     if (requestorProcessId == 0) {
         return BlackshardFailureRequiresBlock(
             BlackshardFailureObjectResolution,
-            MustEnforce
+            MustEnforce,
+            FALSE
             );
     }
     requestorProcess = FltGetRequestorProcess(Data);
     if (requestorProcess == NULL) {
         return BlackshardFailureRequiresBlock(
             BlackshardFailureObjectResolution,
-            MustEnforce
+            MustEnforce,
+            FALSE
             );
     }
     processStartKey = PsGetProcessStartKey(requestorProcess);
     if (processStartKey == 0) {
         return BlackshardFailureRequiresBlock(
             BlackshardFailureObjectResolution,
-            MustEnforce
+            MustEnforce,
+            FALSE
             );
     }
 
@@ -1025,7 +1414,8 @@ BlackshardEvaluateOpenedObject (
     if (!NT_SUCCESS(status)) {
         return BlackshardFailureRequiresBlock(
             BlackshardFailurePathResolution,
-            MustEnforce
+            MustEnforce,
+            FALSE
             );
     }
 
@@ -1034,9 +1424,15 @@ BlackshardEvaluateOpenedObject (
         FltReleaseFileNameInformation(nameInformation);
         return BlackshardFailureRequiresBlock(
             BlackshardFailurePathResolution,
-            MustEnforce
+            MustEnforce,
+            FALSE
             );
     }
+
+    administratorOnlyImage = (BOOLEAN)(
+        MustEnforce != 0 &&
+        BlackshardIsAdministratorOnlyImage(FltObjects, nameInformation)
+        );
 
     if (RestrictToHighRiskName) {
         if ((Operation == BLACKSHARD_OPERATION_PROTECTED_WRITE ||
@@ -1070,7 +1466,8 @@ BlackshardEvaluateOpenedObject (
         FltReleaseFileNameInformation(nameInformation);
         return BlackshardFailureRequiresBlock(
             BlackshardFailureObjectResolution,
-            MustEnforce
+            MustEnforce,
+            administratorOnlyImage
             );
     }
     if (standardInformation.Directory) {
@@ -1091,7 +1488,8 @@ BlackshardEvaluateOpenedObject (
         FltReleaseFileNameInformation(nameInformation);
         return BlackshardFailureRequiresBlock(
             BlackshardFailureObjectResolution,
-            MustEnforce
+            MustEnforce,
+            administratorOnlyImage
             );
     }
 
@@ -1114,7 +1512,8 @@ BlackshardEvaluateOpenedObject (
         FltReleaseFileNameInformation(nameInformation);
         return BlackshardFailureRequiresBlock(
             BlackshardFailureObjectResolution,
-            MustEnforce
+            MustEnforce,
+            administratorOnlyImage
             );
     }
 
@@ -1123,7 +1522,8 @@ BlackshardEvaluateOpenedObject (
         FltReleaseFileNameInformation(nameInformation);
         return BlackshardFailureRequiresBlock(
             BlackshardFailurePathTooLong,
-            MustEnforce
+            MustEnforce,
+            administratorOnlyImage
             );
     }
 
@@ -1131,82 +1531,47 @@ BlackshardEvaluateOpenedObject (
         FltReleaseFileNameInformation(nameInformation);
         return BlackshardFailureRequiresBlock(
             BlackshardFailureServiceUnavailable,
-            MustEnforce
+            MustEnforce,
+            administratorOnlyImage
             );
     }
 
-    RtlZeroMemory(&notification, sizeof(notification));
-    RtlZeroMemory(&reply, sizeof(reply));
-
-    notification.Magic = BLACKSHARD_PROTOCOL_MAGIC;
-    notification.Version = BLACKSHARD_PROTOCOL_VERSION;
-    notification.Size = (USHORT)sizeof(notification);
-    notification.ProcessId = requestorProcessId;
-    notification.DesiredAccess = DesiredAccess;
-    notification.Operation = Operation;
-    notification.PathLength = pathLength;
-    RtlCopyMemory(
-        notification.FilePath,
-        nameInformation->Name.Buffer,
-        nameInformation->Name.Length
+    notification = BlackshardAllocateNotification(
+        Operation,
+        requestorProcessId,
+        &nameInformation->Name
         );
-    notification.FilePath[pathLength] = L'\0';
-    notification.FileId = (ULONGLONG)internalInformation.IndexNumber.QuadPart;
-    notification.ContentGeneration = contentGeneration;
-    notification.ProcessStartKey = processStartKey;
-    notification.MustEnforce = MustEnforce;
-
     FltReleaseFileNameInformation(nameInformation);
-
-    replyLength = sizeof(reply);
-    timeout.QuadPart =
-        (Operation == BLACKSHARD_OPERATION_PROTECTED_WRITE ||
-         Operation == BLACKSHARD_OPERATION_PROTECTED_METADATA)
-        ? -1LL * 1000LL * 1000LL
-        : -15LL * 1000LL * 1000LL;
-    InterlockedIncrement64(&gBlackshardData.ScanRequests);
-
-    status = FltSendMessage(
-        gBlackshardData.FilterHandle,
-        &gBlackshardData.ClientPort,
-        &notification,
-        sizeof(notification),
-        &reply,
-        &replyLength,
-        &timeout
-        );
-
-
-    if (status == STATUS_TIMEOUT) {
+    if (notification == NULL) {
         return BlackshardFailureRequiresBlock(
-            BlackshardFailureTimeout,
-            MustEnforce
+            BlackshardFailureInternalError,
+            MustEnforce,
+            administratorOnlyImage
             );
     }
+    notification->DesiredAccess = DesiredAccess;
+    notification->FileId = (ULONGLONG)internalInformation.IndexNumber.QuadPart;
+    notification->ContentGeneration = contentGeneration;
+    notification->ProcessStartKey = processStartKey;
+    notification->MustEnforce = MustEnforce;
 
-    if (status != STATUS_SUCCESS) {
+    if (!BlackshardAskService(
+            notification,
+            Operation == BLACKSHARD_OPERATION_EXECUTE_SECTION
+            ? BLACKSHARD_EXECUTE_TIMEOUT_MS
+            : (Operation == BLACKSHARD_OPERATION_PROTECTED_WRITE ||
+               Operation == BLACKSHARD_OPERATION_PROTECTED_METADATA)
+            ? BLACKSHARD_PROTECTED_TIMEOUT_MS
+            : BLACKSHARD_OPEN_TIMEOUT_MS,
+            &block,
+            &failure
+            )) {
         return BlackshardFailureRequiresBlock(
-            BlackshardFailureServiceUnavailable,
-            MustEnforce
+            failure,
+            MustEnforce,
+            administratorOnlyImage
             );
     }
-
-    if (replyLength != sizeof(reply) ||
-        (reply.Verdict != VERDICT_ALLOW && reply.Verdict != VERDICT_BLOCK)) {
-        return BlackshardFailureRequiresBlock(
-            BlackshardFailureInvalidReply,
-            MustEnforce
-            );
-    }
-    if (reply.Magic != BLACKSHARD_PROTOCOL_MAGIC ||
-        reply.Version != BLACKSHARD_PROTOCOL_VERSION ||
-        reply.Size != sizeof(reply)) {
-        return BlackshardFailureRequiresBlock(
-            BlackshardFailureProtocolMismatch,
-            MustEnforce
-            );
-    }
-
 
 
 
@@ -1230,18 +1595,20 @@ BlackshardEvaluateOpenedObject (
             if (currentGeneration != contentGeneration) {
                 return BlackshardFailureRequiresBlock(
                     BlackshardFailureContentRace,
-                    MustEnforce
+                    MustEnforce,
+                    administratorOnlyImage
                     );
             }
         } else {
             return BlackshardFailureRequiresBlock(
                 BlackshardFailureContentRace,
-                MustEnforce
+                MustEnforce,
+                administratorOnlyImage
                 );
         }
     }
 
-    return (BOOLEAN)(reply.Verdict == VERDICT_BLOCK);
+    return block;
 }
 
 NTSTATUS
@@ -1440,6 +1807,65 @@ BlackshardIsProtectedDocumentName (
 }
 
 BOOLEAN
+BlackshardIsAdministratorOnlyImage (
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _In_ PFLT_FILE_NAME_INFORMATION NameInfo
+    )
+{
+    static const UNICODE_STRING roots[] = {
+        RTL_CONSTANT_STRING(L"\\Windows\\"),
+        RTL_CONSTANT_STRING(L"\\Program Files\\"),
+        RTL_CONSTANT_STRING(L"\\Program Files (x86)\\")
+    };
+    /* Folders below \Windows that standard users can create files in. */
+    static const UNICODE_STRING userWritable[] = {
+        RTL_CONSTANT_STRING(L"\\Temp\\"), RTL_CONSTANT_STRING(L"\\Tasks\\"),
+        RTL_CONSTANT_STRING(L"\\tracing\\"), RTL_CONSTANT_STRING(L"\\CRMLog\\"),
+        RTL_CONSTANT_STRING(L"\\FxsTmp\\"), RTL_CONSTANT_STRING(L"\\com\\dmp\\"),
+        RTL_CONSTANT_STRING(L"\\MachineKeys\\"), RTL_CONSTANT_STRING(L"\\spool\\"),
+        RTL_CONSTANT_STRING(L"\\debug\\"), RTL_CONSTANT_STRING(L"\\PLA\\")
+    };
+    UNICODE_STRING relative;
+    ULONG index;
+    BOOLEAN underRoot;
+
+    PAGED_CODE();
+
+    if (NameInfo->Name.Length <= NameInfo->Volume.Length) {
+        return FALSE;
+    }
+    //
+    // Anyone can create \Windows on a USB stick or a second disk. Only the volume Windows runs
+    // from counts; if it could not be found at load, the folder test alone decides rather than
+    // refusing Windows itself whenever the service is down.
+    //
+    if (gBlackshardData.SystemVolume != NULL &&
+        FltObjects->Volume != gBlackshardData.SystemVolume) {
+        return FALSE;
+    }
+    relative.Buffer = NameInfo->Name.Buffer + NameInfo->Volume.Length / sizeof(WCHAR);
+    relative.Length = (USHORT)(NameInfo->Name.Length - NameInfo->Volume.Length);
+    relative.MaximumLength = relative.Length;
+
+    underRoot = FALSE;
+    for (index = 0; index < RTL_NUMBER_OF(roots); index++) {
+        if (RtlPrefixUnicodeString(&roots[index], &relative, TRUE)) {
+            underRoot = TRUE;
+            break;
+        }
+    }
+    if (!underRoot) {
+        return FALSE;
+    }
+    for (index = 0; index < RTL_NUMBER_OF(userWritable); index++) {
+        if (BlackshardNameContainsInsensitive(&relative, &userWritable[index])) {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+BOOLEAN
 BlackshardNameContainsInsensitive (
     _In_ PCUNICODE_STRING Name,
     _In_ PCUNICODE_STRING Fragment
@@ -1502,6 +1928,11 @@ BlackshardPortConnect (
     }
 
     gBlackshardData.ClientProcessId = PsGetCurrentProcessId();
+    ObReferenceObject(PsGetCurrentProcess());
+    InterlockedExchangePointer(
+        (PVOID volatile *)&gBlackshardData.ClientProcess,
+        PsGetCurrentProcess()
+        );
     gBlackshardData.ClientPort = ClientPort;
     InterlockedExchange(
         &gBlackshardData.OperationalPhase,
@@ -1517,6 +1948,8 @@ BlackshardPortDisconnect (
     _In_opt_ PVOID ConnectionCookie
     )
 {
+    PEPROCESS clientProcess;
+
     UNREFERENCED_PARAMETER(ConnectionCookie);
 
     PAGED_CODE();
@@ -1526,11 +1959,25 @@ BlackshardPortDisconnect (
         &gBlackshardData.ClientPort
         );
     gBlackshardData.ClientProcessId = NULL;
-    InterlockedExchange64(&gBlackshardData.ReadyGeneration, 0);
-    InterlockedExchange(
-        &gBlackshardData.OperationalPhase,
-        BlackshardPhaseRecovering
+    clientProcess = (PEPROCESS)InterlockedExchangePointer(
+        (PVOID volatile *)&gBlackshardData.ClientProcess,
+        NULL
         );
+    if (clientProcess != NULL) {
+        ObDereferenceObject(clientProcess);
+    }
+    InterlockedExchange64(&gBlackshardData.ReadyGeneration, 0);
+    //
+    // A service that said it was stopping left on purpose; any other disconnect is a crash or a
+    // kill, and executions stay refused until it is back.
+    //
+    if (InterlockedCompareExchange(&gBlackshardData.OperationalPhase, 0, 0) !=
+        BlackshardPhaseStopping) {
+        InterlockedExchange(
+            &gBlackshardData.OperationalPhase,
+            BlackshardPhaseRecovering
+            );
+    }
 }
 
 NTSTATUS
@@ -1589,6 +2036,16 @@ BlackshardPortMessage (
         InterlockedExchange(
             &gBlackshardData.OperationalPhase,
             BlackshardPhaseReady
+            );
+        InterlockedExchange(&gBlackshardData.EverReady, TRUE);
+        return STATUS_SUCCESS;
+    }
+
+    if (request.Command == BLACKSHARD_CONTROL_SET_STOPPING) {
+        InterlockedExchange64(&gBlackshardData.ReadyGeneration, 0);
+        InterlockedExchange(
+            &gBlackshardData.OperationalPhase,
+            BlackshardPhaseStopping
             );
         return STATUS_SUCCESS;
     }
@@ -1653,6 +2110,7 @@ BlackshardPortMessage (
             &gBlackshardData.ReadyGeneration, 0, 0);
     reply.OperationalPhase = (ULONG)InterlockedCompareExchange(
         &gBlackshardData.OperationalPhase, 0, 0);
+    reply.Features = gBlackshardData.Features;
 
     status = STATUS_SUCCESS;
     __try {
@@ -1666,4 +2124,631 @@ BlackshardPortMessage (
 
     *ReturnOutputBufferLength = sizeof(reply);
     return STATUS_SUCCESS;
+}
+
+VOID
+BlackshardRegisterSelfProtection (
+    _In_ PDRIVER_OBJECT DriverObject
+    )
+{
+    OB_OPERATION_REGISTRATION operations[2];
+    OB_CALLBACK_REGISTRATION registration;
+    UNICODE_STRING altitude = RTL_CONSTANT_STRING(BLACKSHARD_CALLBACK_ALTITUDE);
+    NTSTATUS status;
+
+    //
+    // Each part is optional: a driver that loads without one still filters files, and the
+    // service logs which parts the health reply says are missing.
+    //
+    RtlZeroMemory(operations, sizeof(operations));
+    operations[0].ObjectType = PsProcessType;
+    operations[0].Operations = OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
+    operations[0].PreOperation = BlackshardPreObjectHandle;
+    operations[1].ObjectType = PsThreadType;
+    operations[1].Operations = OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
+    operations[1].PreOperation = BlackshardPreObjectHandle;
+
+    RtlZeroMemory(&registration, sizeof(registration));
+    registration.Version = OB_FLT_REGISTRATION_VERSION;
+    registration.OperationRegistrationCount = (USHORT)RTL_NUMBER_OF(operations);
+    registration.Altitude = altitude;
+    registration.OperationRegistration = operations;
+    status = ObRegisterCallbacks(&registration, &gBlackshardData.ObjectCallbacks);
+    if (NT_SUCCESS(status)) {
+        gBlackshardData.Features |= BLACKSHARD_FEATURE_HANDLE_PROTECTION;
+    } else {
+        gBlackshardData.ObjectCallbacks = NULL;
+    }
+
+    status = CmRegisterCallbackEx(
+        BlackshardRegistryCallback,
+        &altitude,
+        DriverObject,
+        NULL,
+        &gBlackshardData.RegistryCookie,
+        NULL
+        );
+    if (NT_SUCCESS(status)) {
+        gBlackshardData.Features |= BLACKSHARD_FEATURE_REGISTRY_PROTECTION;
+    }
+}
+
+VOID
+BlackshardUnregisterSelfProtection (
+    VOID
+    )
+{
+    PAGED_CODE();
+
+    if (FlagOn(gBlackshardData.Features, BLACKSHARD_FEATURE_REGISTRY_PROTECTION)) {
+        (VOID)CmUnRegisterCallback(gBlackshardData.RegistryCookie);
+        ClearFlag(gBlackshardData.Features, BLACKSHARD_FEATURE_REGISTRY_PROTECTION);
+    }
+    if (gBlackshardData.ObjectCallbacks != NULL) {
+        ObUnRegisterCallbacks(gBlackshardData.ObjectCallbacks);
+        gBlackshardData.ObjectCallbacks = NULL;
+        ClearFlag(gBlackshardData.Features, BLACKSHARD_FEATURE_HANDLE_PROTECTION);
+    }
+}
+
+BOOLEAN
+BlackshardSelfProtectionActive (
+    VOID
+    )
+{
+    LONG phase;
+
+    //
+    // Off before the service first connects this boot and after it stopped on purpose, so a
+    // broken install can still be repaired and an uninstall can run. On while it runs, and
+    // after it crashed or was killed until it is back.
+    //
+    phase = InterlockedCompareExchange(&gBlackshardData.OperationalPhase, 0, 0);
+    return (BOOLEAN)(
+        phase == BlackshardPhaseStarting ||
+        phase == BlackshardPhaseReady ||
+        phase == BlackshardPhaseRecovering
+        );
+}
+
+OB_PREOP_CALLBACK_STATUS
+BlackshardPreObjectHandle (
+    _In_ PVOID RegistrationContext,
+    _Inout_ POB_PRE_OPERATION_INFORMATION OperationInformation
+    )
+{
+    PEPROCESS protectedProcess;
+    PEPROCESS target;
+    ACCESS_MASK denied;
+
+    UNREFERENCED_PARAMETER(RegistrationContext);
+
+    protectedProcess = (PEPROCESS)InterlockedCompareExchangePointer(
+        (PVOID volatile *)&gBlackshardData.ClientProcess,
+        NULL,
+        NULL
+        );
+    if (protectedProcess == NULL ||
+        OperationInformation->KernelHandle ||
+        PsGetCurrentProcess() == protectedProcess) {
+        return OB_PREOP_SUCCESS;
+    }
+
+    if (OperationInformation->ObjectType == *PsProcessType) {
+        target = (PEPROCESS)OperationInformation->Object;
+        denied = BLACKSHARD_DENIED_PROCESS_ACCESS;
+    } else {
+        target = IoThreadToProcess((PETHREAD)OperationInformation->Object);
+        denied = BLACKSHARD_DENIED_THREAD_ACCESS;
+    }
+    if (target != protectedProcess) {
+        return OB_PREOP_SUCCESS;
+    }
+
+    if (OperationInformation->Operation == OB_OPERATION_HANDLE_CREATE) {
+        OperationInformation->Parameters->CreateHandleInformation.DesiredAccess &= ~denied;
+    } else {
+        OperationInformation->Parameters->DuplicateHandleInformation.DesiredAccess &= ~denied;
+    }
+    return OB_PREOP_SUCCESS;
+}
+
+NTSTATUS
+BlackshardRegistryCallback (
+    _In_ PVOID CallbackContext,
+    _In_opt_ PVOID Argument1,
+    _In_opt_ PVOID Argument2
+    )
+{
+    PEPROCESS service;
+    PVOID keyObject;
+    PCUNICODE_STRING keyName;
+    BOOLEAN protectedKey;
+    NTSTATUS status;
+
+    UNREFERENCED_PARAMETER(CallbackContext);
+
+    PAGED_CODE();
+
+    //
+    // Kernel-mode callers are not refused: the I/O manager records the driver's Enum key itself,
+    // and kernel code could undo this callback anyway.
+    //
+    if (Argument2 == NULL ||
+        ExGetPreviousMode() == KernelMode ||
+        !BlackshardSelfProtectionActive()) {
+        return STATUS_SUCCESS;
+    }
+    service = (PEPROCESS)InterlockedCompareExchangePointer(
+        (PVOID volatile *)&gBlackshardData.ClientProcess,
+        NULL,
+        NULL
+        );
+    if (service != NULL && PsGetCurrentProcess() == service) {
+        return STATUS_SUCCESS;
+    }
+
+    switch ((REG_NOTIFY_CLASS)(ULONG_PTR)Argument1) {
+    case RegNtPreSetValueKey:
+        keyObject = ((PREG_SET_VALUE_KEY_INFORMATION)Argument2)->Object;
+        break;
+    case RegNtPreDeleteValueKey:
+        keyObject = ((PREG_DELETE_VALUE_KEY_INFORMATION)Argument2)->Object;
+        break;
+    case RegNtPreDeleteKey:
+        keyObject = ((PREG_DELETE_KEY_INFORMATION)Argument2)->Object;
+        break;
+    case RegNtPreRenameKey:
+        keyObject = ((PREG_RENAME_KEY_INFORMATION)Argument2)->Object;
+        break;
+    case RegNtPreSetInformationKey:
+        keyObject = ((PREG_SET_INFORMATION_KEY_INFORMATION)Argument2)->Object;
+        break;
+    case RegNtPreRestoreKey:
+        keyObject = ((PREG_RESTORE_KEY_INFORMATION)Argument2)->Object;
+        break;
+    case RegNtPreReplaceKey:
+        keyObject = ((PREG_REPLACE_KEY_INFORMATION)Argument2)->Object;
+        break;
+    default:
+        return STATUS_SUCCESS;
+    }
+
+    keyName = NULL;
+    status = CmCallbackGetKeyObjectIDEx(
+        &gBlackshardData.RegistryCookie,
+        keyObject,
+        NULL,
+        &keyName,
+        0
+        );
+    if (!NT_SUCCESS(status) || keyName == NULL) {
+        return STATUS_SUCCESS;
+    }
+    protectedKey = BlackshardIsProtectedRegistryKey(keyName);
+    CmCallbackReleaseKeyObjectIDEx(keyName);
+    return protectedKey ? STATUS_ACCESS_DENIED : STATUS_SUCCESS;
+}
+
+BOOLEAN
+BlackshardIsProtectedRegistryKey (
+    _In_ PCUNICODE_STRING KeyName
+    )
+{
+    static const UNICODE_STRING systemHive = RTL_CONSTANT_STRING(L"\\REGISTRY\\MACHINE\\SYSTEM\\");
+    /*
+     * Below a control set, so ControlSet001, ControlSet002 and CurrentControlSet all match. The
+     * Safe Mode entries are covered too: removing them and rebooting into Safe Mode would start
+     * Windows without blackshard.
+     */
+    static const UNICODE_STRING protectedKeys[] = {
+        RTL_CONSTANT_STRING(L"\\Services\\blackshard"),
+        RTL_CONSTANT_STRING(L"\\Services\\blackshard-protection-service"),
+        RTL_CONSTANT_STRING(L"\\Control\\SafeBoot\\Minimal\\blackshard"),
+        RTL_CONSTANT_STRING(L"\\Control\\SafeBoot\\Minimal\\blackshard-protection-service"),
+        RTL_CONSTANT_STRING(L"\\Control\\SafeBoot\\Network\\blackshard"),
+        RTL_CONSTANT_STRING(L"\\Control\\SafeBoot\\Network\\blackshard-protection-service")
+    };
+    UNICODE_STRING rest;
+    USHORT skipped;
+    ULONG index;
+    USHORT keyCharacters;
+
+    PAGED_CODE();
+
+    if (!RtlPrefixUnicodeString(&systemHive, KeyName, TRUE)) {
+        return FALSE;
+    }
+    rest.Buffer = KeyName->Buffer + systemHive.Length / sizeof(WCHAR);
+    rest.Length = (USHORT)(KeyName->Length - systemHive.Length);
+    for (skipped = 0;
+         skipped < rest.Length / sizeof(WCHAR) && rest.Buffer[skipped] != L'\\';
+         skipped++) {
+    }
+    rest.Buffer += skipped;
+    rest.Length = (USHORT)(rest.Length - skipped * sizeof(WCHAR));
+    rest.MaximumLength = rest.Length;
+
+    for (index = 0; index < RTL_NUMBER_OF(protectedKeys); index++) {
+        keyCharacters = (USHORT)(protectedKeys[index].Length / sizeof(WCHAR));
+        if (RtlPrefixUnicodeString(&protectedKeys[index], &rest, TRUE) &&
+            (rest.Length == protectedKeys[index].Length ||
+             rest.Buffer[keyCharacters] == L'\\')) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+//
+// The notification is over 6 KB, too much for a kernel stack several filters deep, so it comes
+// from pool. The path must already fit; callers check its length.
+//
+PBLACKSHARD_NOTIFICATION
+BlackshardAllocateNotification (
+    _In_ ULONG Operation,
+    _In_ ULONG ProcessId,
+    _In_ PCUNICODE_STRING Path
+    )
+{
+    PBLACKSHARD_NOTIFICATION notification;
+    ULONG pathLength;
+
+    pathLength = (ULONG)(Path->Length / sizeof(WCHAR));
+    if (pathLength == 0 || pathLength >= MAX_FILE_PATH_LENGTH) {
+        return NULL;
+    }
+    notification = (PBLACKSHARD_NOTIFICATION)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
+        sizeof(BLACKSHARD_NOTIFICATION),
+        BLACKSHARD_NOTIFICATION_TAG
+        );
+    if (notification == NULL) {
+        return NULL;
+    }
+    notification->Magic = BLACKSHARD_PROTOCOL_MAGIC;
+    notification->Version = BLACKSHARD_PROTOCOL_VERSION;
+    notification->Size = (USHORT)sizeof(BLACKSHARD_NOTIFICATION);
+    notification->ProcessId = ProcessId;
+    notification->Operation = Operation;
+    notification->PathLength = pathLength;
+    RtlCopyMemory(notification->FilePath, Path->Buffer, Path->Length);
+    return notification;
+}
+
+VOID
+BlackshardRegisterProcessNotifications (
+    VOID
+    )
+{
+    if (NT_SUCCESS(PsSetCreateProcessNotifyRoutineEx(BlackshardProcessNotify, FALSE))) {
+        gBlackshardData.Features |= BLACKSHARD_FEATURE_PROCESS_NOTIFY;
+    }
+    //
+    // Also reports images of the other architecture (the 64-bit system DLLs a 32-bit process
+    // maps), so nothing a process loads is left out.
+    //
+    if (NT_SUCCESS(PsSetLoadImageNotifyRoutineEx(
+            BlackshardLoadImageNotify,
+            PS_IMAGE_NOTIFY_CONFLICTING_ARCHITECTURE
+            ))) {
+        gBlackshardData.Features |= BLACKSHARD_FEATURE_IMAGE_NOTIFY;
+    }
+}
+
+VOID
+BlackshardUnregisterProcessNotifications (
+    VOID
+    )
+{
+    PAGED_CODE();
+
+    if (FlagOn(gBlackshardData.Features, BLACKSHARD_FEATURE_IMAGE_NOTIFY)) {
+        (VOID)PsRemoveLoadImageNotifyRoutine(BlackshardLoadImageNotify);
+        ClearFlag(gBlackshardData.Features, BLACKSHARD_FEATURE_IMAGE_NOTIFY);
+    }
+    if (FlagOn(gBlackshardData.Features, BLACKSHARD_FEATURE_PROCESS_NOTIFY)) {
+        (VOID)PsSetCreateProcessNotifyRoutineEx(BlackshardProcessNotify, TRUE);
+        ClearFlag(gBlackshardData.Features, BLACKSHARD_FEATURE_PROCESS_NOTIFY);
+    }
+}
+
+VOID
+BlackshardProcessNotify (
+    _Inout_ PEPROCESS Process,
+    _In_ HANDLE ProcessId,
+    _Inout_opt_ PPS_CREATE_NOTIFY_INFO CreateInfo
+    )
+{
+    PFLT_VOLUME volume;
+    PFLT_INSTANCE instance;
+    PFLT_FILE_NAME_INFORMATION nameInformation;
+    PBLACKSHARD_STREAM_CONTEXT streamContext;
+    PBLACKSHARD_NOTIFICATION notification;
+    ULONG creatingProcessId;
+    ULONG commandLineLength;
+    BOOLEAN block;
+    BLACKSHARD_FAILURE_REASON failure;
+
+    PAGED_CODE();
+
+    if (CreateInfo == NULL || gBlackshardData.ClientPort == NULL) {
+        return;
+    }
+    creatingProcessId = HandleToULong(CreateInfo->CreatingThreadId.UniqueProcess);
+    if (gBlackshardData.ClientProcessId != NULL &&
+        creatingProcessId == HandleToULong(gBlackshardData.ClientProcessId)) {
+        return;
+    }
+
+    //
+    // The section scan that just let this image map left its file ID and content generation in
+    // the stream context; sending them lets the service answer from its verdict cache.
+    //
+    volume = NULL;
+    instance = NULL;
+    nameInformation = NULL;
+    if (CreateInfo->FileObject != NULL &&
+        NT_SUCCESS(FltGetVolumeFromFileObject(
+            gBlackshardData.FilterHandle,
+            CreateInfo->FileObject,
+            &volume
+            ))) {
+        if (!NT_SUCCESS(FltGetVolumeInstanceFromName(
+                gBlackshardData.FilterHandle,
+                volume,
+                NULL,
+                &instance
+                ))) {
+            instance = NULL;
+        }
+        if (!NT_SUCCESS(FltGetFileNameInformationUnsafe(
+                CreateInfo->FileObject,
+                instance,
+                FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT,
+                &nameInformation
+                ))) {
+            nameInformation = NULL;
+        }
+    }
+
+    notification = NULL;
+    if (nameInformation != NULL) {
+        notification = BlackshardAllocateNotification(
+            BLACKSHARD_OPERATION_PROCESS_CREATE,
+            HandleToULong(ProcessId),
+            &nameInformation->Name
+            );
+        FltReleaseFileNameInformation(nameInformation);
+    } else if (CreateInfo->ImageFileName != NULL) {
+        notification = BlackshardAllocateNotification(
+            BLACKSHARD_OPERATION_PROCESS_CREATE,
+            HandleToULong(ProcessId),
+            CreateInfo->ImageFileName
+            );
+    }
+
+    if (notification != NULL && instance != NULL &&
+        NT_SUCCESS(FltGetStreamContext(instance, CreateInfo->FileObject, &streamContext))) {
+        if (InterlockedCompareExchange(&streamContext->IdentityValid, 0, 0) != 0) {
+            notification->FileId = (ULONGLONG)InterlockedCompareExchange64(
+                &streamContext->FileId, 0, 0);
+            notification->ContentGeneration = (ULONGLONG)InterlockedCompareExchange64(
+                &streamContext->ContentGeneration, 0, 0);
+        }
+        FltReleaseContext(streamContext);
+    }
+    if (instance != NULL) {
+        FltObjectDereference(instance);
+    }
+    if (volume != NULL) {
+        FltObjectDereference(volume);
+    }
+    if (notification == NULL) {
+        return;
+    }
+
+    notification->ProcessStartKey = PsGetProcessStartKey(Process);
+    notification->ParentProcessId = HandleToULong(CreateInfo->ParentProcessId);
+    notification->CreatingProcessId = creatingProcessId;
+    if (CreateInfo->CommandLine != NULL) {
+        commandLineLength = min(
+            (ULONG)(CreateInfo->CommandLine->Length / sizeof(WCHAR)),
+            MAX_COMMAND_LINE_LENGTH - 1UL
+            );
+        RtlCopyMemory(
+            notification->CommandLine,
+            CreateInfo->CommandLine->Buffer,
+            commandLineLength * sizeof(WCHAR)
+            );
+        notification->CommandLineLength = commandLineLength;
+    }
+
+    if (BlackshardAskService(
+            notification,
+            BLACKSHARD_PROCESS_TIMEOUT_MS,
+            &block,
+            &failure
+            ) &&
+        block) {
+        CreateInfo->CreationStatus = STATUS_ACCESS_DENIED;
+        InterlockedIncrement64(&gBlackshardData.Blocks);
+    }
+}
+
+VOID
+BlackshardLoadImageNotify (
+    _In_opt_ PUNICODE_STRING FullImageName,
+    _In_ HANDLE ProcessId,
+    _In_ PIMAGE_INFO ImageInfo
+    )
+{
+    PBLACKSHARD_NOTIFICATION notification;
+    PEPROCESS process;
+    ULONGLONG processStartKey;
+    LARGE_INTEGER timeout;
+
+    //
+    // Telemetry only: this routine cannot refuse the load, and it can run with all kernel APCs
+    // disabled, so it neither waits for the service nor queries file names. A message the
+    // service is not ready to receive at once is dropped.
+    //
+    if (FullImageName == NULL ||
+        ImageInfo->SystemModeImage ||
+        ProcessId == NULL ||
+        gBlackshardData.ClientPort == NULL ||
+        ProcessId == gBlackshardData.ClientProcessId) {
+        return;
+    }
+    if (!NT_SUCCESS(PsLookupProcessByProcessId(ProcessId, &process))) {
+        return;
+    }
+    processStartKey = PsGetProcessStartKey(process);
+    ObDereferenceObject(process);
+    if (processStartKey == 0) {
+        return;
+    }
+
+    notification = BlackshardAllocateNotification(
+        BLACKSHARD_OPERATION_IMAGE_LOAD,
+        HandleToULong(ProcessId),
+        FullImageName
+        );
+    if (notification == NULL) {
+        return;
+    }
+    notification->ProcessStartKey = processStartKey;
+    timeout.QuadPart = 0;
+    (VOID)FltSendMessage(
+        gBlackshardData.FilterHandle,
+        &gBlackshardData.ClientPort,
+        notification,
+        sizeof(*notification),
+        NULL,
+        NULL,
+        &timeout
+        );
+    ExFreePoolWithTag(notification, BLACKSHARD_NOTIFICATION_TAG);
+}
+
+//
+// Sends a notification and waits for the service's verdict, freeing the notification. FALSE
+// means there was no usable answer, and Failure says why, for the caller's failure policy.
+//
+BOOLEAN
+BlackshardAskService (
+    _In_ __drv_freesMem(Mem) PBLACKSHARD_NOTIFICATION Notification,
+    _In_ LONGLONG TimeoutMs,
+    _Out_ PBOOLEAN Block,
+    _Out_ BLACKSHARD_FAILURE_REASON *Failure
+    )
+{
+    BLACKSHARD_REPLY reply;
+    ULONG replyLength;
+    LARGE_INTEGER timeout;
+    NTSTATUS status;
+
+    *Block = FALSE;
+    *Failure = BlackshardFailureInternalError;
+    RtlZeroMemory(&reply, sizeof(reply));
+    replyLength = sizeof(reply);
+    timeout.QuadPart = -10000LL * TimeoutMs;
+    InterlockedIncrement64(&gBlackshardData.ScanRequests);
+
+    status = FltSendMessage(
+        gBlackshardData.FilterHandle,
+        &gBlackshardData.ClientPort,
+        Notification,
+        sizeof(*Notification),
+        &reply,
+        &replyLength,
+        &timeout
+        );
+    ExFreePoolWithTag(Notification, BLACKSHARD_NOTIFICATION_TAG);
+
+    if (status == STATUS_TIMEOUT) {
+        *Failure = BlackshardFailureTimeout;
+        return FALSE;
+    }
+    if (status != STATUS_SUCCESS) {
+        *Failure = BlackshardFailureServiceUnavailable;
+        return FALSE;
+    }
+    if (replyLength != sizeof(reply) ||
+        (reply.Verdict != VERDICT_ALLOW && reply.Verdict != VERDICT_BLOCK)) {
+        *Failure = BlackshardFailureInvalidReply;
+        return FALSE;
+    }
+    if (reply.Magic != BLACKSHARD_PROTOCOL_MAGIC ||
+        reply.Version != BLACKSHARD_PROTOCOL_VERSION ||
+        reply.Size != sizeof(reply)) {
+        *Failure = BlackshardFailureProtocolMismatch;
+        return FALSE;
+    }
+    *Block = (BOOLEAN)(reply.Verdict == VERDICT_BLOCK);
+    return TRUE;
+}
+
+//
+// A truncating open is judged before the file exists as an open object, so only its name and
+// the requesting process are known; the service needs no more to copy and count the document.
+//
+BOOLEAN
+BlackshardEvaluateTruncatingOpen (
+    _Inout_ PFLT_CALLBACK_DATA Data
+    )
+{
+    PFLT_FILE_NAME_INFORMATION nameInformation;
+    PBLACKSHARD_NOTIFICATION notification;
+    PEPROCESS requestorProcess;
+    ULONGLONG processStartKey;
+    BOOLEAN block;
+    BLACKSHARD_FAILURE_REASON failure;
+
+    PAGED_CODE();
+
+    requestorProcess = FltGetRequestorProcess(Data);
+    processStartKey = requestorProcess != NULL ? PsGetProcessStartKey(requestorProcess) : 0;
+    if (processStartKey == 0) {
+        (VOID)BlackshardApplyFailurePolicy(BlackshardFailureObjectResolution, FALSE, FALSE);
+        return FALSE;
+    }
+
+    nameInformation = NULL;
+    if (!NT_SUCCESS(FltGetFileNameInformation(
+            Data,
+            FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT,
+            &nameInformation
+            ))) {
+        (VOID)BlackshardApplyFailurePolicy(BlackshardFailurePathResolution, FALSE, FALSE);
+        return FALSE;
+    }
+    if (!NT_SUCCESS(FltParseFileNameInformation(nameInformation)) ||
+        !BlackshardIsProtectedDocumentName(nameInformation)) {
+        FltReleaseFileNameInformation(nameInformation);
+        return FALSE;
+    }
+    notification = BlackshardAllocateNotification(
+        BLACKSHARD_OPERATION_PROTECTED_WRITE,
+        FltGetRequestorProcessId(Data),
+        &nameInformation->Name
+        );
+    FltReleaseFileNameInformation(nameInformation);
+    if (notification == NULL) {
+        (VOID)BlackshardApplyFailurePolicy(BlackshardFailurePathTooLong, FALSE, FALSE);
+        return FALSE;
+    }
+    notification->ProcessStartKey = processStartKey;
+    notification->DesiredAccess = BLACKSHARD_ENTROPY_NOT_MEASURED;
+
+    if (!BlackshardAskService(
+            notification,
+            BLACKSHARD_PROTECTED_TIMEOUT_MS,
+            &block,
+            &failure
+            )) {
+        (VOID)BlackshardApplyFailurePolicy(failure, FALSE, FALSE);
+        return FALSE;
+    }
+    return block;
 }

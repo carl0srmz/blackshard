@@ -31,6 +31,12 @@ $destinationAmsiX86 = Join-Path $agentDirectory "blackshard-amsi-x86.dll"
 $dataDirectory = Join-Path $env:ProgramData "blackshard"
 $amsiClsid = "{73A5A75D-BF05-4A2C-8C51-64C1EC8B5C92}"
 $serviceRegistryPath = "HKLM:\System\CurrentControlSet\Services\$driverName"
+# Safe Mode starts only the drivers and services listed here. Without an entry, rebooting into Safe
+# Mode is a way around blackshard; some ransomware does exactly that.
+$safeBootRoots = @(
+    "HKLM:\SYSTEM\CurrentControlSet\Control\SafeBoot\Minimal",
+    "HKLM:\SYSTEM\CurrentControlSet\Control\SafeBoot\Network"
+)
 
 function Test-blackshardFilterLoaded {
     $filterOutput = & fltmc.exe filters 2>$null
@@ -149,17 +155,23 @@ function Remove-blackshardInstallation {
         Stop-blackshardServiceForReplacement -Name $serviceName
     }
 
+    # Writable now: the protection service stopped on purpose above, which lifts the driver's
+    # registry protection.
+    foreach ($safeBootRoot in $safeBootRoots) {
+        foreach ($name in @($driverName, $protectionServiceName)) {
+            Remove-Item -LiteralPath (Join-Path $safeBootRoot $name) -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     foreach ($registryView in @("32", "64")) {
         & reg.exe delete "HKLM\Software\Microsoft\AMSI\Providers\$amsiClsid" /f "/reg:$registryView" 2>$null | Out-Null
         & reg.exe delete "HKLM\Software\Classes\CLSID\$amsiClsid" /f "/reg:$registryView" 2>$null | Out-Null
     }
 
-    if (Test-blackshardFilterLoaded) {
-        Write-Host "[*] Unloading blackshard minifilter..." -ForegroundColor Cyan
-        & fltmc.exe unload $driverName | Out-Host
-    }
-
-    & sc.exe stop $driverName 2>$null | Out-Host
+    # The minifilter refuses to unload, so a loaded one is only marked for deletion here and its
+    # file moved aside: it does not load at the next restart, and Windows removes both then.
+    # Its registry key is writable now because the protection service stopped on purpose above.
+    $driverStillLoaded = [bool](Test-blackshardFilterLoaded)
     & sc.exe delete $driverName 2>$null | Out-Host
     Start-Sleep -Seconds 1
 
@@ -179,6 +191,9 @@ function Remove-blackshardInstallation {
     }
 
     Write-Host "[+] blackshard was removed." -ForegroundColor Green
+    if ($driverStillLoaded) {
+        Write-Host "    The minifilter stays loaded until Windows restarts; restart to finish removing it." -ForegroundColor Yellow
+    }
 }
 
 if ($Uninstall) {
@@ -303,10 +318,21 @@ foreach ($provider in @(
     if ($LASTEXITCODE -ne 0) { throw "Could not register the $($provider.View)-bit AMSI provider." }
 }
 
-if ($installDriver) {
+# Drivers since self-protection refuse to unload (`fltmc unload` and `sc stop` both fail), so an
+# upgrade over one replaces the file in place and the new driver loads at the next restart. An
+# older driver still unloads, and is then reinstalled from scratch as before.
+$driverReplacedForRestart = $false
+if ($installDriver -and (Test-blackshardFilterLoaded)) {
+    & fltmc.exe unload $driverName 2>&1 | Out-Host
     if (Test-blackshardFilterLoaded) {
-        & fltmc.exe unload $driverName | Out-Host
+        Remove-FileNowOrAtRestart $destinationDriver
+        Copy-Item -LiteralPath $sourceDriver -Destination $destinationDriver -Force
+        $driverReplacedForRestart = $true
+        Write-Host "[*] The running minifilter cannot be unloaded; the new one loads when Windows restarts." -ForegroundColor Yellow
     }
+}
+
+if ($installDriver -and -not $driverReplacedForRestart) {
     & sc.exe stop $driverName 2>$null | Out-Host
     & sc.exe delete $driverName 2>$null | Out-Host
 
@@ -381,7 +407,7 @@ $regDump
         throw "fltmc reported success, but blackshard is absent from the loaded filter list."
     }
 }
-else {
+elseif (-not $installDriver) {
     Write-Host "[*] Skipping the kernel minifilter; blackshard will run with AMSI coverage." -ForegroundColor Yellow
 }
 Write-Host "[*] Installing blackshard protection service..." -ForegroundColor Cyan
@@ -412,6 +438,13 @@ else {
 }
 
 & sc.exe failure $protectionServiceName "reset= 86400" "actions= restart/5000/restart/5000/restart/10000" | Out-Host
+
+foreach ($safeBootRoot in $safeBootRoots) {
+    New-Item -Path (Join-Path $safeBootRoot $protectionServiceName) -Value "Service" -Force | Out-Null
+    if ($installDriver) {
+        New-Item -Path (Join-Path $safeBootRoot $driverName) -Value "Driver" -Force | Out-Null
+    }
+}
 Start-Service -Name $protectionServiceName
 
 $serviceRunning = $false
@@ -430,6 +463,9 @@ if (-not $serviceRunning) {
 if ($installDriver) {
     Write-Host "[+] blackshard minifilter and protection service are running." -ForegroundColor Green
     & fltmc.exe instances -f $driverName | Out-Host
+    if ($driverReplacedForRestart) {
+        Write-Host "    Restart Windows to load the new minifilter; until then the service may report a protocol mismatch." -ForegroundColor Yellow
+    }
 }
 else {
     Write-Host "[+] blackshard protection service is running with AMSI coverage." -ForegroundColor Green

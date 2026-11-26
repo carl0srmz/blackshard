@@ -27,6 +27,8 @@ cargo test --workspace --all-targets
 - Inside the VM, as administrator, run `.\enable-test-signing.ps1` and reboot. Then run
   `.\install.ps1 -AllowUnsigned`. Install **with** the driver: without it, protection is only the
   script scanner (AMSI) and `.exe` samples simply run.
+- The driver can't be unloaded once it runs. To put a newer build on the VM, run `install.ps1`
+  again and **restart** before taking the `ready` snapshot; until then the old driver is running.
 - Open blackshard and wait until the status page is green and the definitions have downloaded.
   That needs internet.
 - **Cut the VM's network.** The samples don't need it.
