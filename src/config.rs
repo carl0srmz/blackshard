@@ -1,4 +1,5 @@
 use crate::atomic_file;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
@@ -8,6 +9,8 @@ use std::sync::OnceLock;
 pub const SETTINGS_SCHEMA_VERSION: u32 = 1;
 /// Far more than any real exclusion list; the service reads this file before it has anything else.
 const MAX_SETTINGS_BYTES: u64 = 1024 * 1024;
+/// The longest a pause may last; real-time protection comes back on by itself after it.
+pub const MAX_PAUSE_MINUTES: i64 = 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -30,6 +33,11 @@ pub struct Settings {
     pub worker_count: usize,
     pub definition_update_interval_hours: u64,
     pub exclusions: Vec<PathBuf>,
+    /// Real-time protection is off until this moment, then back on by itself.
+    pub paused_until: Option<DateTime<Utc>>,
+    /// When the latest pause began. Kept after it ends, so the turbo hunt that follows knows which
+    /// programs started while protection was down.
+    pub paused_at: Option<DateTime<Utc>>,
     /// `exclusions` resolved to comparison keys, computed on first use. See `is_excluded`.
     #[serde(skip)]
     exclusion_keys: OnceLock<Vec<String>>,
@@ -56,6 +64,8 @@ impl Default for Settings {
             worker_count: logical_cpus.saturating_sub(1).clamp(1, 4),
             definition_update_interval_hours: 4,
             exclusions: Vec::new(),
+            paused_until: None,
+            paused_at: None,
             exclusion_keys: OnceLock::new(),
         }
     }
@@ -96,6 +106,31 @@ impl Settings {
         validated.validate();
         let bytes = serde_json::to_vec_pretty(&validated).map_err(io::Error::other)?;
         atomic_file::write(path, &bytes)
+    }
+
+    /// Whether a timed pause is in effect right now.
+    pub fn is_paused(&self) -> bool {
+        self.paused_until.is_some_and(|until| Utc::now() < until)
+    }
+
+    /// Whether files are checked as they open and run: switched on and not paused. Every
+    /// real-time decision asks this rather than reading `real_time_protection` directly.
+    pub fn real_time_active(&self) -> bool {
+        self.real_time_protection && !self.is_paused()
+    }
+
+    /// Pauses real-time protection for `minutes`, at most [`MAX_PAUSE_MINUTES`].
+    pub fn pause_for(&mut self, minutes: i64) {
+        let now = Utc::now();
+        self.paused_at = Some(now);
+        self.paused_until =
+            Some(now + chrono::Duration::minutes(minutes.clamp(1, MAX_PAUSE_MINUTES)));
+    }
+
+    /// Ends any pause and switches real-time protection on.
+    pub fn resume(&mut self) {
+        self.real_time_protection = true;
+        self.paused_until = None;
     }
 
     /// In the private `State` folder: the exclusions say exactly where blackshard does not look.
@@ -147,6 +182,13 @@ impl Settings {
         self.max_file_size_mb = self.max_file_size_mb.clamp(1, 4_096);
         self.worker_count = self.worker_count.clamp(1, 16);
         self.definition_update_interval_hours = self.definition_update_interval_hours.clamp(1, 24);
+        // A pause that ends in the past is over; one set further out than the limit is cut back,
+        // so a hand-edited or stale file cannot leave protection off for days.
+        let latest = Utc::now() + chrono::Duration::minutes(MAX_PAUSE_MINUTES);
+        self.paused_until = self
+            .paused_until
+            .filter(|until| *until > Utc::now())
+            .map(|until| until.min(latest));
         self.exclusions.sort_by_key(|path| resolved_key(path));
         self.exclusions
             .dedup_by(|left, right| resolved_key(left) == resolved_key(right));
@@ -335,5 +377,30 @@ mod tests {
         settings.exclusions.clear();
         settings.validate();
         assert!(!settings.is_excluded(&root.join("a")));
+    }
+
+    #[test]
+    fn a_pause_ends_by_itself_and_cannot_outlast_the_limit() {
+        let mut settings = Settings::default();
+        assert!(settings.real_time_active());
+        settings.pause_for(5);
+        assert!(settings.is_paused());
+        assert!(!settings.real_time_active());
+        assert!(settings.paused_at.is_some());
+
+        settings.paused_until = Some(Utc::now() - chrono::Duration::seconds(1));
+        assert!(settings.real_time_active(), "an expired pause is over");
+
+        settings.paused_until = Some(Utc::now() + chrono::Duration::days(30));
+        settings.validate();
+        let longest = Utc::now() + chrono::Duration::minutes(MAX_PAUSE_MINUTES);
+        assert!(settings.paused_until.unwrap() <= longest);
+
+        settings.resume();
+        assert!(settings.real_time_active());
+        assert!(
+            settings.paused_at.is_some(),
+            "the hunt still needs to know when it began"
+        );
     }
 }

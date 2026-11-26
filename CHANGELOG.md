@@ -19,6 +19,15 @@ changes are listed here, newest first.
 - Self-tests are administrator-only and rate-limited; clearing the history is recorded.
 
 ### Added
+- Real-time protection can be paused for 1, 5 or 15 minutes from the status page. It comes back
+  on by itself and starts a turbo hunt; scripts through AMSI are not checked meanwhile either.
+  Pausing asks for administrator approval; ending a pause with turbo does not.
+- Turbo freezes every unsigned program started during the pause the moment it starts, kills
+  convicted programs only after suspending all their copies, and clears the critical-process flag
+  malware sets on itself, so watchdog malware cannot crash Windows as it is removed.
+- Turbo puts back what changed since the pause began: the boot record (unless the disk was
+  repartitioned), Task Manager, regedit and command prompt lock-outs, Winlogon shell hijacks,
+  debugger hijacks, UAC and the wallpaper, and the documents a convicted program changed.
 - HTML applications (`.hta`) that create a scripting object next to a command, download or run
   call are flagged.
 - RTF documents are read for embedded objects: self-updating linked objects, Equation Editor

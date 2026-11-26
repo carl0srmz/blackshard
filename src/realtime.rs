@@ -503,7 +503,7 @@ pub(crate) fn realtime_worker(
         let openable_path = device_path_to_openable_path(&kernel_path);
         let enabled = settings
             .read()
-            .map(|value| value.real_time_protection && !value.is_excluded(&openable_path))
+            .map(|value| value.real_time_active() && !value.is_excluded(&openable_path))
             .unwrap_or(false);
         if !enabled {
             let _ = reply(
@@ -782,19 +782,22 @@ fn handle_protected_modification(
     definition_generation: &AtomicU64,
 ) {
     let observed_at = std::time::SystemTime::now();
-    let (enabled, block_mode, keep_copies) = settings
+    let (enabled, paused, block_mode, keep_copies) = settings
         .read()
         .map(|settings| {
             (
                 settings.real_time_protection
                     && settings.ransomware_protection
                     && !settings.is_excluded(path),
+                settings.is_paused(),
                 settings.ransomware_block_mode,
                 settings.rollback_documents,
             )
         })
-        .unwrap_or((false, false, false));
-    if !enabled {
+        .unwrap_or((false, false, false, false));
+    // Paused, nothing is judged or blocked, but documents are still copied: the turbo hunt that
+    // ends the pause puts back what the programs it convicts changed meanwhile.
+    if !enabled || (paused && !keep_copies) {
         let _ = reply(
             item.port,
             item.message.header.message_id,
@@ -835,6 +838,15 @@ fn handle_protected_modification(
                 path,
             );
         }
+    }
+    if paused {
+        let _ = reply(
+            item.port,
+            item.message.header.message_id,
+            DriverVerdict::Allow,
+            0,
+        );
+        return;
     }
     let decision = monitor
         .lock()
@@ -1234,13 +1246,15 @@ fn termination_policy(
     if process_id == 0 || process_id == 4 || process_id == std::process::id() {
         return Err(SpareReason::ReservedProcessId);
     }
-    if critical {
-        // Terminating a critical process bugchecks the machine.
-        return Err(SpareReason::Critical);
-    }
     // Compared component by component, so `C:\WindowsApps` does not count as `C:\Windows`.
     let in_system_root = PathBuf::from(image.to_string_lossy().to_ascii_lowercase())
         .starts_with(system_root.to_string_lossy().to_ascii_lowercase());
+    if critical && in_system_root {
+        // Terminating a critical process bugchecks the machine. Outside the Windows folder it is
+        // malware that marked itself critical so that killing it crashes Windows; the flag is
+        // cleared before it is terminated.
+        return Err(SpareReason::Critical);
+    }
     let reserved_name = image
         .file_name()
         .and_then(|name| name.to_str())
@@ -1271,16 +1285,42 @@ fn terminate_ransomware_process(
 
 /// Terminates every process running `image`, so a convicted file that is already running can be
 /// removed: Windows refuses to delete an image that is mapped into a process. Returns how many
-/// processes were terminated. The same policy spares critical processes and the shell.
+/// processes were terminated. The same policy spares Windows' own critical processes and the shell.
+///
+/// All of them are suspended before any is terminated, since show-off malware such as MEMZ runs
+/// several copies that watch each other and crash Windows when one disappears. The documents each
+/// one changed are then put back from the rollback vault.
 pub(crate) fn terminate_processes_running(image: &Path) -> usize {
     let target = comparable_image_path(
         &std::fs::canonicalize(image).unwrap_or_else(|_| image.to_path_buf()),
     );
     let now = std::time::SystemTime::now();
-    running_process_ids()
+    let targets = running_process_ids()
         .into_iter()
-        .filter(|process_id| terminate_if_allowed(*process_id, now, Some(&target)).is_some())
-        .count()
+        .filter_map(|process_id| open_target(process_id, now, Some(&target)))
+        .collect();
+    let terminated = terminate_all(targets);
+    for (process_id, created_at, _) in &terminated {
+        undo_documents_changed_by(*process_id, *created_at);
+    }
+    terminated.len()
+}
+
+/// Puts back what a terminated program changed, from the copies the vault saved before it did.
+fn undo_documents_changed_by(process_id: u32, created_at: std::time::SystemTime) {
+    let Some(vault) = crate::rollback::global() else {
+        return;
+    };
+    let summary = vault.restore_process_id(process_id, created_at, |folder| {
+        crate::quarantine::pin_restore_directory(folder).map(drop)
+    });
+    if summary.restored + summary.failed > 0 {
+        log::warn!(
+            "Documents changed by PID {process_id}: {} restored, {} not restored",
+            summary.restored,
+            summary.failed
+        );
+    }
 }
 
 /// The image of every running process this service can query, for a quick scan.
@@ -1329,95 +1369,277 @@ fn terminate_if_allowed(
     observed_at: std::time::SystemTime,
     expected_image: Option<&Path>,
 ) -> Option<PathBuf> {
-    #[cfg(windows)]
-    unsafe {
-        use std::os::windows::ffi::OsStringExt;
-        use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
-        use windows_sys::Win32::System::Threading::{
-            GetProcessTimes, IsProcessCritical, OpenProcess, QueryFullProcessImageNameW,
-            TerminateProcess, WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION,
-            PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
-        };
+    let target = open_target(process_id, observed_at, expected_image)?;
+    terminate_all(vec![target])
+        .into_iter()
+        .next()
+        .map(|(_, _, image)| image)
+}
 
-        let handle = OpenProcess(
-            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+const PROCESS_SET_INFORMATION: u32 = 0x0200;
+const PROCESS_SUSPEND_RESUME: u32 = 0x0800;
+/// `PROCESS_INFORMATION_CLASS::ProcessBreakOnTermination`: the critical-process flag.
+const PROCESS_BREAK_ON_TERMINATION: u32 = 29;
+const SE_DEBUG_PRIVILEGE: u32 = 20;
+
+#[link(name = "ntdll")]
+extern "system" {
+    fn NtSuspendProcess(process: HANDLE) -> i32;
+    fn NtResumeProcess(process: HANDLE) -> i32;
+    fn NtSetInformationProcess(
+        process: HANDLE,
+        class: u32,
+        information: *const c_void,
+        length: u32,
+    ) -> i32;
+    fn RtlAdjustPrivilege(privilege: u32, enable: u8, current_thread: u8, previous: *mut u8)
+        -> i32;
+}
+
+/// An open process handle, closed when dropped.
+struct OwnedProcess(HANDLE);
+
+impl Drop for OwnedProcess {
+    fn drop(&mut self) {
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+/// A process the termination policy allows, opened for suspending and terminating.
+struct Target {
+    process: OwnedProcess,
+    process_id: u32,
+    image: PathBuf,
+    critical: bool,
+    created_at: std::time::SystemTime,
+}
+
+fn process_image(handle: HANDLE) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::Threading::QueryFullProcessImageNameW;
+    let mut image = vec![0u16; 32_768];
+    let mut length = image.len() as u32;
+    if unsafe { QueryFullProcessImageNameW(handle, 0, image.as_mut_ptr(), &mut length) } == 0 {
+        return None;
+    }
+    image.truncate(length as usize);
+    Some(PathBuf::from(std::ffi::OsString::from_wide(&image)))
+}
+
+fn process_created_at(handle: HANDLE) -> Option<std::time::SystemTime> {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::GetProcessTimes;
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+    if unsafe { GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) } == 0 {
+        return None;
+    }
+    let ticks = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
+    // FILETIME counts 100 ns intervals from 1601-01-01.
+    Some(
+        std::time::UNIX_EPOCH
+            + Duration::from_nanos(ticks.saturating_sub(116_444_736_000_000_000) * 100),
+    )
+}
+
+fn system_root() -> PathBuf {
+    std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+}
+
+/// Opens `process_id` if the policy lets it be terminated and, when `expected_image` is given, it
+/// runs that image.
+fn open_target(
+    process_id: u32,
+    observed_at: std::time::SystemTime,
+    expected_image: Option<&Path>,
+) -> Option<Target> {
+    use windows_sys::Win32::System::Threading::{
+        IsProcessCritical, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        PROCESS_TERMINATE,
+    };
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_TERMINATE
+                | PROCESS_QUERY_LIMITED_INFORMATION
+                | PROCESS_SYNCHRONIZE
+                | PROCESS_SUSPEND_RESUME
+                | PROCESS_SET_INFORMATION,
             0,
             process_id,
-        );
-        if handle == 0 {
-            return None;
-        }
-        let close = |reason: &str| {
-            if expected_image.is_none() {
-                log::warn!("Not terminating PID {process_id}: {reason}");
-            }
-            CloseHandle(handle);
-            None
-        };
-
-        let mut image = vec![0u16; 32_768];
-        let mut length = image.len() as u32;
-        if QueryFullProcessImageNameW(handle, 0, image.as_mut_ptr(), &mut length) == 0 {
-            return close("its image path could not be read");
-        }
-        image.truncate(length as usize);
-        let image = PathBuf::from(std::ffi::OsString::from_wide(&image));
-        // Canonical on both sides: a process started through an 8.3 name (C:\Users\RUNNER~1\...)
-        // reports that short form, which never equals the long canonical path.
-        if expected_image.is_some_and(|expected| {
-            comparable_image_path(&std::fs::canonicalize(&image).unwrap_or_else(|_| image.clone()))
-                != expected
-        }) {
-            return close("it runs a different image");
-        }
-
-        let mut critical = 0;
-        if IsProcessCritical(handle, &mut critical) == 0 {
-            return close("its critical status could not be read");
-        }
-
-        let zero = FILETIME {
-            dwLowDateTime: 0,
-            dwHighDateTime: 0,
-        };
-        let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
-        if GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) == 0 {
-            return close("its creation time could not be read");
-        }
-        let ticks = (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime);
-        // FILETIME counts 100 ns intervals from 1601-01-01.
-        let created_at = std::time::UNIX_EPOCH
-            + Duration::from_nanos(ticks.saturating_sub(116_444_736_000_000_000) * 100);
-
-        let system_root = std::env::var_os("SystemRoot")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-        match termination_policy(
-            process_id,
-            &image,
-            critical != 0,
-            created_at,
-            observed_at,
-            &system_root,
-        ) {
-            Ok(()) => {
-                let terminated = TerminateProcess(handle, 1) != 0;
-                // Wait for the exit, so the image is unmapped by the time the caller deletes it.
-                if terminated {
-                    WaitForSingleObject(handle, 5_000);
-                }
-                CloseHandle(handle);
-                log::warn!("Terminated PID {process_id} ({image:?})");
-                terminated.then_some(image)
-            }
-            Err(reason) => close(&format!("{reason:?} ({image:?})")),
-        }
+        )
+    };
+    if handle == 0 {
+        return None;
     }
-    #[cfg(not(windows))]
-    {
-        let _ = (process_id, observed_at, expected_image);
+    let process = OwnedProcess(handle);
+    let spare = |reason: &str| {
+        if expected_image.is_none() {
+            log::warn!("Not terminating PID {process_id}: {reason}");
+        }
         None
+    };
+
+    let Some(image) = process_image(handle) else {
+        return spare("its image path could not be read");
+    };
+    // Canonical on both sides: a process started through an 8.3 name (C:\Users\RUNNER~1\...)
+    // reports that short form, which never equals the long canonical path.
+    if expected_image.is_some_and(|expected| {
+        comparable_image_path(&std::fs::canonicalize(&image).unwrap_or_else(|_| image.clone()))
+            != expected
+    }) {
+        return spare("it runs a different image");
     }
+    let mut critical = 0;
+    if unsafe { IsProcessCritical(handle, &mut critical) } == 0 {
+        return spare("its critical status could not be read");
+    }
+    let Some(created_at) = process_created_at(handle) else {
+        return spare("its creation time could not be read");
+    };
+    match termination_policy(
+        process_id,
+        &image,
+        critical != 0,
+        created_at,
+        observed_at,
+        &system_root(),
+    ) {
+        Ok(()) => Some(Target {
+            process,
+            process_id,
+            image,
+            critical: critical != 0,
+            created_at,
+        }),
+        Err(reason) => spare(&format!("{reason:?} ({image:?})")),
+    }
+}
+
+/// Clears the critical flag a program set on itself, so terminating it does not crash Windows.
+fn clear_critical(handle: HANDLE) -> bool {
+    use windows_sys::Win32::System::Threading::IsProcessCritical;
+    let off = 0u32;
+    let mut previous = 0u8;
+    unsafe {
+        // LocalSystem holds the debug privilege, but it is not enabled by default.
+        RtlAdjustPrivilege(SE_DEBUG_PRIVILEGE, 1, 0, &mut previous);
+        NtSetInformationProcess(
+            handle,
+            PROCESS_BREAK_ON_TERMINATION,
+            (&off as *const u32).cast(),
+            mem::size_of::<u32>() as u32,
+        );
+        let mut critical = 1;
+        IsProcessCritical(handle, &mut critical) != 0 && critical == 0
+    }
+}
+
+/// Suspends every target first, so none can react to another's death, clears the critical flag
+/// of those that set it, then terminates them. Returns each terminated process's ID, creation
+/// time and image.
+fn terminate_all(targets: Vec<Target>) -> Vec<(u32, std::time::SystemTime, PathBuf)> {
+    use windows_sys::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+    for target in &targets {
+        unsafe { NtSuspendProcess(target.process.0) };
+    }
+    let mut terminated = Vec::new();
+    for target in targets {
+        if target.critical && !clear_critical(target.process.0) {
+            // Left suspended: it does no harm frozen, and killing it would crash Windows.
+            log::warn!(
+                "Not terminating PID {} ({:?}): its critical flag could not be cleared; it stays suspended",
+                target.process_id,
+                target.image
+            );
+            continue;
+        }
+        if unsafe { TerminateProcess(target.process.0, 1) } == 0 {
+            continue;
+        }
+        terminated.push(target);
+    }
+    terminated
+        .into_iter()
+        .map(|target| {
+            // Wait for the exit, so the image is unmapped by the time the caller deletes it.
+            unsafe { WaitForSingleObject(target.process.0, 5_000) };
+            log::warn!("Terminated PID {} ({:?})", target.process_id, target.image);
+            (target.process_id, target.created_at, target.image.clone())
+        })
+        .collect()
+}
+
+/// Programs suspended at the start of a turbo hunt. Dropping this resumes the ones still running:
+/// whatever the hunt convicted has been terminated by then.
+pub(crate) struct Frozen(Vec<OwnedProcess>);
+
+impl Drop for Frozen {
+    fn drop(&mut self) {
+        for process in &self.0 {
+            unsafe { NtResumeProcess(process.0) };
+        }
+    }
+}
+
+impl Frozen {
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+/// Suspends every program started since `since` that is not part of Windows, not blackshard and
+/// not signed by a trusted publisher. Whatever was let in while protection was paused stops the
+/// moment the hunt starts, before the scan has reached it, and cannot react as its copies are
+/// convicted one by one.
+pub(crate) fn freeze_programs_started_since(since: std::time::SystemTime) -> Frozen {
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    let system_root = comparable_image_path(&system_root());
+    let own_folder = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(comparable_image_path));
+    let mut frozen = Vec::new();
+    for process_id in running_process_ids() {
+        if process_id <= 4 || process_id == std::process::id() {
+            continue;
+        }
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SUSPEND_RESUME,
+                0,
+                process_id,
+            )
+        };
+        if handle == 0 {
+            continue;
+        }
+        let process = OwnedProcess(handle);
+        if process_created_at(handle).is_none_or(|created| created < since) {
+            continue;
+        }
+        let Some(image) = process_image(handle) else {
+            continue;
+        };
+        let comparable = comparable_image_path(&image);
+        if comparable.starts_with(&system_root)
+            || own_folder
+                .as_ref()
+                .is_some_and(|folder| comparable.starts_with(folder))
+            || trust::verify_file_cached(&image).is_trusted()
+        {
+            continue;
+        }
+        if unsafe { NtSuspendProcess(handle) } >= 0 {
+            log::warn!("Froze PID {process_id} ({image:?}), started while protection was paused");
+            frozen.push(process);
+        }
+    }
+    Frozen(frozen)
 }
 
 #[cfg(test)]
@@ -1472,6 +1694,11 @@ mod tests {
             policy(r"c:\windows\system32\SearchIndexer.EXE", false, -5_000),
             Err(SpareReason::ProtectedSystemBinary)
         );
+    }
+
+    #[test]
+    fn malware_that_marked_itself_critical_is_not_spared() {
+        assert_eq!(policy(r"C:\Users\x\Desktop\MEMZ.exe", true, -5_000), Ok(()));
     }
 
     #[test]

@@ -407,7 +407,7 @@ fn profile_path(sid: &str) -> Option<String> {
     (status == 0).then(|| utf16_bytes(bytemuck_u16(&buffer, size)))
 }
 
-fn subkeys(root: HKEY, path: &str) -> Vec<String> {
+pub(crate) fn subkeys(root: HKEY, path: &str) -> Vec<String> {
     let Some(key) = open(root, path, KEY_ENUMERATE_SUB_KEYS) else {
         return Vec::new();
     };
@@ -436,14 +436,14 @@ fn subkeys(root: HKEY, path: &str) -> Vec<String> {
     names
 }
 
-fn open(root: HKEY, path: &str, access: u32) -> Option<HKEY> {
+pub(crate) fn open(root: HKEY, path: &str, access: u32) -> Option<HKEY> {
     let path = wide(path);
     let mut key: HKEY = 0;
     (unsafe { RegOpenKeyExW(root, path.as_ptr(), 0, access | KEY_WOW64_64KEY, &mut key) } == 0)
         .then_some(key)
 }
 
-fn wide(text: &str) -> Vec<u16> {
+pub(crate) fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 

@@ -456,9 +456,15 @@ impl BlackshardApp {
                             format_duration(Duration::from_millis(snapshot.elapsed_millis)),
                             if removed == 1 { "threat" } else { "threats" }
                         ),
-                    },
+                    } + &repairs_summary(&snapshot.repairs),
                     created: Instant::now(),
                 });
+                refresh_desktop(
+                    snapshot
+                        .repairs
+                        .iter()
+                        .any(|repair| repair.starts_with("Wallpaper")),
+                );
             }
             self.refresh_persistent_views();
         }
@@ -517,15 +523,26 @@ impl BlackshardApp {
         });
     }
 
+    /// Pauses real-time protection for a few minutes. It comes back on by itself, with a turbo hunt,
+    /// or sooner with turbo. Asks for administrator approval, so malware cannot do this.
+    fn pause_protection(&mut self, minutes: i64) {
+        self.settings.pause_for(minutes);
+        self.save_settings();
+    }
+
     /// The secret turbo button: protection back on, then a full-speed hunt that stops, removes and
     /// cleans up after whatever it convicts. Triple-click the shard on the status page, or press
     /// Ctrl+Shift+T anywhere.
     fn turbo(&mut self) {
-        if !self.settings.real_time_protection {
-            self.settings.real_time_protection = true;
-            self.save_settings();
+        // The service switches protection back on when the hunt starts, with no administrator
+        // prompt in the way; this copy just follows.
+        self.settings.resume();
+        if let Ok(mut runtime) = self.runtime.lock() {
+            runtime.desired_real_time_protection = true;
         }
         self.start_scan(ScanRequestKind::Turbo);
+        // The service froze what started during the pause; repaint over whatever it drew.
+        refresh_desktop(false);
         // The hunt plays out on the status page, where the shard shows it.
         self.page = Page::Dashboard;
         if self
@@ -909,6 +926,42 @@ impl BlackshardApp {
             if let Ok(mut state) = self.runtime.lock() {
                 state.protection_test = ProtectionTestStatus::Requested;
             }
+        }
+
+        left.add_space(22.0);
+        let mut pause_minutes = None;
+        if let Some(until) = self
+            .settings
+            .paused_until
+            .filter(|_| self.settings.is_paused())
+        {
+            let seconds = (until - Utc::now()).num_seconds().max(0);
+            left.label(
+                RichText::new(format!(
+                    "paused. back on by itself in {}:{:02}",
+                    seconds / 60,
+                    seconds % 60
+                ))
+                .size(15.0)
+                .color(ATTENTION),
+            );
+            left.add_space(6.0);
+            if bracket_button(&mut left, "resume and hunt now", ALARM, hunt.is_none()).clicked() {
+                self.turbo();
+            }
+        } else if self.settings.real_time_protection && self.settings_loaded {
+            left.horizontal(|ui| {
+                ui.label(RichText::new("pause protection for").color(MUTED));
+                for minutes in [1, 5, 15] {
+                    if bracket_button(ui, &format!("{minutes} min"), TEXT, hunt.is_none()).clicked()
+                    {
+                        pause_minutes = Some(minutes);
+                    }
+                }
+            });
+        }
+        if let Some(minutes) = pause_minutes {
+            self.pause_protection(minutes);
         }
 
         right.add_space(40.0);
@@ -1698,6 +1751,17 @@ impl eframe::App for BlackshardApp {
         }) {
             self.turbo();
         }
+        // The service resumes by itself when a pause runs out; the hunt that cleans up after it
+        // starts from here.
+        if self
+            .settings
+            .paused_until
+            .is_some_and(|until| Utc::now() >= until)
+        {
+            self.turbo();
+        } else if self.settings.paused_until.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
 
         egui::Panel::top("blackshard_top")
             .exact_size(64.0)
@@ -2325,6 +2389,83 @@ fn format_bytes(bytes: u64) -> String {
         format!("{:.1} KiB", bytes / KIB)
     } else {
         format!("{} B", bytes as u64)
+    }
+}
+
+/// The turbo hunt's repairs as a sentence for the notice: the first few by name.
+fn repairs_summary(repairs: &[String]) -> String {
+    if repairs.is_empty() {
+        return String::new();
+    }
+    let names: Vec<&str> = repairs
+        .iter()
+        .take(3)
+        .map(|repair| repair.split(" (").next().unwrap_or(repair))
+        .collect();
+    let more = repairs.len().saturating_sub(names.len());
+    format!(
+        " repaired: {}{}.",
+        names.join("; "),
+        if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        }
+    )
+}
+
+/// Repaints every window, wiping whatever malware drew straight onto the screen, and reapplies
+/// the wallpaper the hunt put back. Runs here because the service cannot reach the desktop.
+fn refresh_desktop(wallpaper: bool) {
+    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ};
+    #[link(name = "user32")]
+    extern "system" {
+        fn RedrawWindow(
+            window: isize,
+            rect: *const std::ffi::c_void,
+            region: isize,
+            flags: u32,
+        ) -> i32;
+        fn SystemParametersInfoW(
+            action: u32,
+            parameter: u32,
+            value: *mut std::ffi::c_void,
+            flags: u32,
+        ) -> i32;
+    }
+    const SPI_SETDESKWALLPAPER: u32 = 0x0014;
+    const SPIF_UPDATEINIFILE_SENDCHANGE: u32 = 0x0003;
+    const RDW_INVALIDATE_ERASE_ALLCHILDREN_FRAME: u32 = 0x0001 | 0x0004 | 0x0080 | 0x0400;
+    unsafe {
+        if wallpaper {
+            let key: Vec<u16> = "Control Panel\\Desktop\0".encode_utf16().collect();
+            let name: Vec<u16> = "Wallpaper\0".encode_utf16().collect();
+            let mut path = vec![0u16; 1024];
+            let mut size = (path.len() * 2) as u32;
+            if RegGetValueW(
+                HKEY_CURRENT_USER,
+                key.as_ptr(),
+                name.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                path.as_mut_ptr().cast(),
+                &mut size,
+            ) == 0
+            {
+                SystemParametersInfoW(
+                    SPI_SETDESKWALLPAPER,
+                    0,
+                    path.as_mut_ptr().cast(),
+                    SPIF_UPDATEINIFILE_SENDCHANGE,
+                );
+            }
+        }
+        RedrawWindow(
+            0,
+            std::ptr::null(),
+            0,
+            RDW_INVALIDATE_ERASE_ALLCHILDREN_FRAME,
+        );
     }
 }
 

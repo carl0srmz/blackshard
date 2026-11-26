@@ -410,6 +410,10 @@ mod windows_service_host {
         if let Err(error) = crate::rollback::init(crate::paths::state_dir().join("Rollback")) {
             log::warn!("Ransomware rollback is unavailable: {error}");
         }
+        // How the boot record and the lock-out registry values look now, for the turbo hunt to
+        // put back. Off the startup path: reading the registry of every signed-in user takes a
+        // moment.
+        std::thread::spawn(crate::repair::take_baseline);
 
         let health_path = default_service_health_path();
         let started_at = Utc::now();
@@ -429,7 +433,7 @@ mod windows_service_host {
         let settings = Arc::new(RwLock::new(initial_settings));
         let real_time_enabled = settings
             .read()
-            .map(|value| value.real_time_protection)
+            .map(|value| value.real_time_active())
             .unwrap_or(true);
 
         // The minifilter's presence decides how much of the machine can be watched. Detected once
@@ -744,6 +748,15 @@ mod windows_service_host {
                     &mut snapshot,
                 );
                 last_settings_check = Instant::now();
+                // A timed pause ends without the settings file changing.
+                let active = settings
+                    .read()
+                    .map(|value| value.real_time_active())
+                    .unwrap_or(true);
+                if snapshot.real_time_enabled != active {
+                    snapshot.real_time_enabled = active;
+                    changed = true;
+                }
             }
 
             snapshot.external_rules_suppressed = engine
@@ -1201,7 +1214,7 @@ mod windows_service_host {
 
         match Settings::load(path) {
             Ok(updated) => {
-                snapshot.real_time_enabled = updated.real_time_protection;
+                snapshot.real_time_enabled = updated.real_time_active();
                 match settings.write() {
                     Ok(mut active) => {
                         *active = updated;

@@ -16,6 +16,10 @@ use walkdir::{DirEntry, WalkDir};
 
 const MAX_VISIBLE_FINDINGS: usize = 250;
 
+/// Work that runs once the files are scanned and before the scan reports itself finished, whatever
+/// its outcome. Returns a line for each thing it repaired.
+pub type FinishStep = Box<dyn FnOnce() -> Vec<String> + Send>;
+
 #[derive(Debug, Clone)]
 pub enum ScanKind {
     Quick,
@@ -70,6 +74,8 @@ pub struct ScanProgress {
     pub findings: VecDeque<ScanFinding>,
     pub elapsed: Duration,
     pub failure: Option<String>,
+    /// What the finishing step repaired, one line each.
+    pub repairs: Vec<String>,
 }
 
 impl ScanProgress {
@@ -92,6 +98,7 @@ impl ScanProgress {
             findings: VecDeque::new(),
             elapsed: Duration::ZERO,
             failure: None,
+            repairs: Vec::new(),
         }
     }
 
@@ -117,6 +124,25 @@ impl ScanJob {
         history: Arc<EventHistory>,
         settings: Settings,
     ) -> Self {
+        Self::start_with_finish(
+            kind,
+            engine,
+            quarantine,
+            history,
+            settings,
+            Box::new(Vec::new),
+        )
+    }
+
+    /// Like [`ScanJob::start`], with `finish` run after the files are scanned.
+    pub fn start_with_finish(
+        kind: ScanKind,
+        engine: Arc<DetectionEngine>,
+        quarantine: Arc<QuarantineStore>,
+        history: Arc<EventHistory>,
+        settings: Settings,
+        finish: FinishStep,
+    ) -> Self {
         let progress = Arc::new(Mutex::new(ScanProgress::new(kind.clone())));
         let cancelled = Arc::new(AtomicBool::new(false));
         let worker_progress = Arc::clone(&progress);
@@ -130,6 +156,7 @@ impl ScanJob {
                 settings,
                 worker_progress,
                 worker_cancelled,
+                finish,
             )
         });
 
@@ -180,6 +207,7 @@ impl Drop for ScanJob {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_scan(
     kind: ScanKind,
     engine: Arc<DetectionEngine>,
@@ -188,6 +216,7 @@ fn run_scan(
     settings: Settings,
     progress: Arc<Mutex<ScanProgress>>,
     cancelled: Arc<AtomicBool>,
+    finish: FinishStep,
 ) {
     let started = Instant::now();
     let mut start_event = SecurityEvent::new(EventKind::ScanStarted, kind.display_name());
@@ -197,10 +226,12 @@ fn run_scan(
     let roots = match scan_roots(&kind, &settings) {
         Ok(roots) if !roots.is_empty() => roots,
         Ok(_) => {
+            lock_progress(&progress).repairs = finish();
             finish_failed(&progress, started, "no accessible scan roots were found");
             return;
         }
         Err(error) => {
+            lock_progress(&progress).repairs = finish();
             finish_failed(&progress, started, error);
             return;
         }
@@ -251,8 +282,11 @@ fn run_scan(
         let _ = worker.join();
     }
 
+    // Outside the progress lock: repairs take a while, and the UI keeps polling meanwhile.
+    let repairs = finish();
     let was_cancelled = cancelled.load(Ordering::Acquire);
     let mut current = lock_progress(&progress);
+    current.repairs = repairs;
     current.current_path = None;
     current.elapsed = started.elapsed();
     current.finished_at = Some(Utc::now());

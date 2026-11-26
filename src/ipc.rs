@@ -171,6 +171,8 @@ fn component_allows_command(component: TrustedClientComponent, command: &RpcComm
     }
 }
 
+// One per pipe message and gone right after; boxing the response would only add an allocation.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 enum RpcResult {
@@ -291,6 +293,9 @@ pub struct ScanProgressView {
     pub findings: Vec<ScanFindingView>,
     pub elapsed_millis: u64,
     pub failure: Option<String>,
+    /// What a turbo hunt repaired after removing what it found, one line each.
+    #[serde(default)]
+    pub repairs: Vec<String>,
 }
 
 impl ScanProgressView {
@@ -402,6 +407,12 @@ impl From<&ScanProgress> for ScanProgressView {
             findings,
             elapsed_millis: progress.elapsed.as_millis().min(u64::MAX as u128) as u64,
             failure: progress.failure.clone(),
+            repairs: progress
+                .repairs
+                .iter()
+                .take(64)
+                .map(|repair| bounded_string(repair, 512))
+                .collect(),
         }
     }
 }
@@ -1346,6 +1357,14 @@ mod windows_transport {
             .try_fold(0usize, |total, chunk| total.checked_add(chunk.len()))
             .filter(|total| *total <= MAX_AMSI_CONTENT_BYTES)
             .ok_or_else(|| invalid("AMSI content exceeds the bounded scan limit"))?;
+        // A pause covers scripts too; turbo or the timer ends it.
+        if resources
+            .settings
+            .read()
+            .is_ok_and(|settings| settings.is_paused())
+        {
+            return Ok(DetectionVerdictView::Clean);
+        }
         let mut content = Vec::with_capacity(total);
         for chunk in request.chunks {
             content.extend_from_slice(&chunk);
@@ -1422,6 +1441,16 @@ mod windows_transport {
                 Ok(RpcResponse::Settings { settings })
             }
             RpcCommand::SaveSettings { settings } => {
+                // A new pause: record how the machine looks first, so the turbo hunt can put back
+                // whatever the programs let in meanwhile change.
+                let previous_pause = resources
+                    .settings
+                    .read()
+                    .map_err(|_| internal("settings lock"))?
+                    .paused_at;
+                if settings.is_paused() && settings.paused_at != previous_pause {
+                    crate::repair::take_baseline();
+                }
                 settings
                     .save(&resources.settings_path)
                     .map_err(|error| RpcFailure {
@@ -1466,19 +1495,59 @@ mod windows_transport {
                     .read()
                     .map_err(|_| internal("settings lock"))?
                     .clone();
+                let mut finish: crate::scan_manager::FinishStep = Box::new(Vec::new);
                 if kind == ScanRequestKind::Turbo {
+                    // Turning protection back on needs no administrator: it is never the harmful
+                    // direction, and the hunt should not wait on a prompt.
+                    if !settings.real_time_active() {
+                        let mut resumed = settings.clone();
+                        resumed.resume();
+                        resumed
+                            .save(&resources.settings_path)
+                            .map_err(|error| RpcFailure {
+                                code: RpcErrorCode::Internal,
+                                message: format!("could not switch protection back on: {error}"),
+                            })?;
+                        *resources
+                            .settings
+                            .write()
+                            .map_err(|_| internal("settings lock"))? = resumed.clone();
+                        settings = resumed;
+                    }
+                    // What started while protection was down stops now, before the scan reaches
+                    // it. The vault keeps copies for six hours, so an older pause is not chased.
+                    let frozen = settings
+                        .paused_at
+                        .filter(|at| *at > Utc::now() - chrono::Duration::hours(6))
+                        .map(|at| crate::realtime::freeze_programs_started_since(at.into()));
+                    finish = Box::new(move || {
+                        let mut repairs = Vec::new();
+                        if let Some(frozen) = frozen {
+                            if frozen.len() > 0 {
+                                repairs.push(format!(
+                                    "froze {} program(s) started during the pause",
+                                    frozen.len()
+                                ));
+                            }
+                            // Resumes whatever the hunt did not convict.
+                            drop(frozen);
+                        }
+                        repairs.extend(crate::repair::repair_from_baseline());
+                        repairs
+                    });
                     settings.low_resource_mode = false;
                     settings.worker_count = std::thread::available_parallelism()
                         .map(usize::from)
                         .unwrap_or(4)
                         .clamp(1, 16);
                 }
-                let job = ScanJob::start(
+                let job = ScanJob::start_with_finish(
                     scan_kind,
                     engine,
                     Arc::clone(&resources.quarantine),
                     Arc::clone(&resources.history),
                     settings,
+                    finish,
                 );
                 let progress =
                     ScanProgressView::from_with_requested_kind(&job.snapshot(), kind.clone());

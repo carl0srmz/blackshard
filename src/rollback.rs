@@ -200,6 +200,34 @@ impl RollbackVault {
         summary
     }
 
+    /// Puts back every file saved for a program known only by its process ID, as user mode sees
+    /// it: the driver's start key is not available there. Only copies saved after `created_at`
+    /// count, so a program that held the same ID earlier is not mistaken for this one.
+    pub fn restore_process_id(
+        &self,
+        process_id: u32,
+        created_at: SystemTime,
+        verify_parent: impl Fn(&Path) -> io::Result<()>,
+    ) -> RestoreSummary {
+        let keys: Vec<ProcessKey> = self
+            .lock()
+            .by_process
+            .iter()
+            .filter(|(key, entries)| {
+                key.0 == process_id && entries.iter().all(|entry| entry.saved_at >= created_at)
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        let mut total = RestoreSummary::default();
+        for key in keys {
+            let summary = self.restore(key, &verify_parent);
+            total.restored += summary.restored;
+            total.unchanged += summary.unchanged;
+            total.failed += summary.failed;
+        }
+        total
+    }
+
     fn restore_one(
         &self,
         entry: &Entry,
@@ -409,6 +437,33 @@ mod tests {
             .count();
         assert_eq!(kept, 1);
         assert_eq!(vault.total_bytes(), 0);
+    }
+
+    #[test]
+    fn a_program_known_only_by_its_id_gets_its_files_back_but_not_an_earlier_holders() {
+        let (directory, vault) = vault();
+        let note = directory.path().join("note.txt");
+        fs::write(&note, b"before").unwrap();
+        let earlier_holder = (WRITER.0, WRITER.1 + 1);
+        assert!(vault.preserve(earlier_holder, &note));
+        let created_at = SystemTime::now();
+        let photo = directory.path().join("photo.jpg");
+        fs::write(&photo, b"jpeg bytes").unwrap();
+        assert!(vault.preserve(WRITER, &photo));
+        fs::write(&photo, b"garbage").unwrap();
+        fs::write(&note, b"edited by the earlier program's user").unwrap();
+
+        assert_eq!(
+            vault
+                .restore_process_id(WRITER.0, created_at, allow)
+                .restored,
+            1
+        );
+        assert_eq!(fs::read(&photo).unwrap(), b"jpeg bytes");
+        assert_eq!(
+            fs::read(&note).unwrap(),
+            b"edited by the earlier program's user"
+        );
     }
 
     #[test]
