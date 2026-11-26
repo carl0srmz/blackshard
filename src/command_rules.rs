@@ -136,6 +136,26 @@ const AUTOIT_LOADER: RuleHit = hit(
     "running a compiled AutoIt script from outside Program Files, as DarkGate-style loaders do",
     false,
 );
+const CREDENTIAL_DUMP: RuleHit = hit(
+    "Behavior.Win.CredentialDumping",
+    "dumping the memory of lsass.exe or saving the SAM and SECURITY hives, where Windows keeps credentials",
+    true,
+);
+const DISGUISED_DLL: RuleHit = hit(
+    "Behavior.Win.DisguisedDllRun",
+    "running code from a file that is not a DLL, or a DLL from Downloads or a temporary folder",
+    false,
+);
+const LATERAL_MOVEMENT: RuleHit = hit(
+    "Behavior.Win.RemoteExecution",
+    "starting a program on another computer, as worms and ransomware spreading through a network do",
+    true,
+);
+const BROWSER_HIJACK: RuleHit = hit(
+    "Behavior.Win.BrowserHijack",
+    "starting a browser with an extension from a user folder, or with remote control on for a hidden window",
+    false,
+);
 
 /// Shells and script hosts: a document or a loader starting one of these is how code runs.
 const SHELLS_AND_HOSTS: &[&str] = &[
@@ -346,6 +366,14 @@ pub fn judge_launch(launch: &Launch<'_>) -> Option<RuleHit> {
             if arguments.contains("shadowcopy") && arguments.contains("delete") {
                 return Some(SHADOW_COPY_DELETION);
             }
+            if arguments.contains("/node:")
+                && !arguments.contains("/node:localhost")
+                && !arguments.contains("/node:127.0.0.1")
+                && arguments.contains("process")
+                && arguments.contains("create")
+            {
+                return Some(LATERAL_MOVEMENT);
+            }
         }
         "wbadmin.exe" => {
             if arguments.contains("delete catalog")
@@ -393,6 +421,14 @@ pub fn judge_launch(launch: &Launch<'_>) -> Option<RuleHit> {
         }
         "sc.exe" | "net.exe" | "net1.exe" => {
             let words = words(&arguments);
+            if program == "sc.exe"
+                && words.first().is_some_and(|host| host.starts_with("\\\\"))
+                && words
+                    .iter()
+                    .any(|word| word == "create" || word == "config")
+            {
+                return Some(LATERAL_MOVEMENT);
+            }
             let verb = words
                 .iter()
                 .any(|word| matches!(word.as_str(), "stop" | "delete" | "config" | "pause"));
@@ -450,6 +486,18 @@ pub fn judge_launch(launch: &Launch<'_>) -> Option<RuleHit> {
             if writes && (hijacks_launch || hijacks_sign_in || locks_out) {
                 return Some(REGISTRY_TAMPERING);
             }
+            if (arguments.starts_with("save") || arguments.starts_with("export"))
+                && [
+                    "hklm\\sam",
+                    "hklm\\security",
+                    "hkey_local_machine\\sam",
+                    "hkey_local_machine\\security",
+                ]
+                .iter()
+                .any(|hive| arguments.contains(hive))
+            {
+                return Some(CREDENTIAL_DUMP);
+            }
         }
         "powershell.exe" | "pwsh.exe" | "powershell_ise.exe" => {
             let mut texts = vec![arguments.clone()];
@@ -481,6 +529,54 @@ pub fn judge_launch(launch: &Launch<'_>) -> Option<RuleHit> {
                 || has_web_address(&arguments)
             {
                 return Some(REMOTE_SCRIPT);
+            }
+            if arguments.contains("comsvcs") && arguments.contains("minidump") {
+                return Some(CREDENTIAL_DUMP);
+            }
+            // The file rundll32 loads: what comes before the comma.
+            let library = arguments.split(',').next().unwrap_or_default().trim();
+            let extension = library
+                .rsplit_once('.')
+                .map(|(_, extension)| extension)
+                .filter(|extension| !extension.contains('\\'));
+            let disguised = extension.is_some_and(|extension| {
+                !matches!(
+                    extension,
+                    "dll" | "cpl" | "ocx" | "drv" | "ax" | "acm" | "exe" | "inf"
+                )
+            });
+            if disguised || in_downloads_or_temp(library) {
+                return Some(DISGUISED_DLL);
+            }
+        }
+        "procdump.exe" | "procdump64.exe" => {
+            if arguments.contains("lsass") {
+                return Some(CREDENTIAL_DUMP);
+            }
+        }
+        "ntdsutil.exe" => {
+            if arguments.contains("ifm") || arguments.contains("ac i ntds") {
+                return Some(CREDENTIAL_DUMP);
+            }
+        }
+        "psexec.exe" | "psexec64.exe" | "paexec.exe" | "winrs.exe" => {
+            if arguments.contains("\\\\") || arguments.contains("-r:") || arguments.contains("/r:")
+            {
+                return Some(LATERAL_MOVEMENT);
+            }
+        }
+        "chrome.exe" | "msedge.exe" | "brave.exe" | "vivaldi.exe" | "opera.exe" => {
+            let from_browser = creator
+                .as_deref()
+                .is_some_and(|creator| creator == program.as_str());
+            let user_extension = arguments
+                .split(' ')
+                .filter_map(|word| word.strip_prefix("--load-extension="))
+                .any(in_user_writable_place);
+            let remote_control =
+                arguments.contains("--remote-debugging-port") && arguments.contains("--headless");
+            if !from_browser && (user_extension || remote_control) {
+                return Some(BROWSER_HIJACK);
             }
         }
         "regsvr32.exe" => {
@@ -534,6 +630,14 @@ pub fn judge_launch(launch: &Launch<'_>) -> Option<RuleHit> {
             }
         }
         "schtasks.exe" => {
+            if has_option(&arguments, &["create"])
+                && option_value(launch.command_line, "s").is_some_and(|host| {
+                    let host = host.to_ascii_lowercase();
+                    host != "localhost" && host != "127.0.0.1"
+                })
+            {
+                return Some(LATERAL_MOVEMENT);
+            }
             // A task that would run something these rules refuse is refused when it is made.
             if let Some(action) = option_value(launch.command_line, "tr") {
                 if let Some(hit) = judge_autostart(&action) {
@@ -1104,6 +1208,147 @@ mod tests {
                 .is_some()
         );
         assert!(judge_script("wscript.echo \"hello\"").is_none());
+    }
+
+    #[test]
+    fn credential_dumping_is_refused_and_blames_the_launcher() {
+        for (image, command_line) in [
+            (
+                r"C:\Windows\System32\rundll32.exe",
+                "rundll32.exe C:\\Windows\\System32\\comsvcs.dll, MiniDump 624 C:\\temp\\l.dmp full",
+            ),
+            (r"C:\Tools\procdump64.exe", "procdump64.exe -accepteula -ma lsass.exe out.dmp"),
+            (r"C:\Windows\System32\reg.exe", "reg save HKLM\\SAM C:\\temp\\sam"),
+            (r"C:\Windows\System32\reg.exe", "reg save hklm\\security sec.hiv"),
+        ] {
+            let hit = judge_launch(&Launch {
+                image,
+                command_line,
+                creator_image: Some(r"C:\Windows\System32\cmd.exe"),
+            })
+            .unwrap_or_else(|| panic!("{command_line} was allowed"));
+            assert_eq!(hit.name, "Behavior.Win.CredentialDumping");
+            assert!(hit.convict_launcher);
+        }
+        assert_eq!(
+            start(
+                r"C:\Windows\System32\reg.exe",
+                "reg save HKCU\\Software\\App app.hiv"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn rundll32_running_a_disguised_or_downloaded_file_is_refused() {
+        let rundll32 = r"C:\Windows\System32\rundll32.exe";
+        // NotPetya's loader, as PsExec and WMIC started it on each machine it reached.
+        assert_eq!(
+            start(
+                rundll32,
+                "C:\\Windows\\system32\\rundll32.exe \"C:\\Windows\\perfc.dat\",#1 30"
+            ),
+            Some("Behavior.Win.DisguisedDllRun")
+        );
+        assert_eq!(
+            start(
+                rundll32,
+                "rundll32.exe C:\\Users\\x\\AppData\\Local\\Temp\\a.dll,DllRegisterServer"
+            ),
+            Some("Behavior.Win.DisguisedDllRun")
+        );
+        assert_eq!(
+            start(rundll32, "rundll32.exe shell32.dll,Control_RunDLL"),
+            None
+        );
+        assert_eq!(
+            start(rundll32, "rundll32.exe advapi32,ProcessIdleTasks"),
+            None
+        );
+        assert_eq!(
+            start(rundll32, "rundll32.exe printui.dll,PrintUIEntry /il"),
+            None
+        );
+    }
+
+    #[test]
+    fn starting_programs_on_other_computers_is_refused() {
+        for (image, command_line) in [
+            (
+                r"C:\Windows\System32\wbem\WMIC.exe",
+                "wmic /node:10.0.0.5 /user:admin process call create \"rundll32 perfc.dat,#1\"",
+            ),
+            (
+                r"C:\Windows\System32\sc.exe",
+                "sc \\\\fileserver create svc binpath= c:\\x.exe",
+            ),
+            (
+                r"C:\Windows\System32\schtasks.exe",
+                "schtasks /create /s 10.0.0.7 /tn up /tr c:\\x.exe /sc once /st 00:00",
+            ),
+            (
+                r"C:\Tools\PsExec64.exe",
+                "psexec64 \\\\10.0.0.9 -s cmd /c x.exe",
+            ),
+        ] {
+            assert_eq!(
+                start(image, command_line),
+                Some("Behavior.Win.RemoteExecution"),
+                "{command_line}"
+            );
+        }
+        assert_eq!(
+            start(
+                r"C:\Windows\System32\wbem\WMIC.exe",
+                "wmic process list brief"
+            ),
+            None
+        );
+        assert_eq!(
+            start(
+                r"C:\Windows\System32\schtasks.exe",
+                "schtasks /create /tn local /tr c:\\backup.exe /sc daily"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn browsers_started_with_a_user_folder_extension_or_hidden_remote_control_are_refused() {
+        let chrome = r"C:\Program Files\Google\Chrome\Application\chrome.exe";
+        assert_eq!(
+            started_by(
+                chrome,
+                "chrome.exe --load-extension=C:\\Users\\x\\AppData\\Local\\chrome --restore-last-session",
+                r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+            ),
+            Some("Behavior.Win.BrowserHijack")
+        );
+        assert_eq!(
+            started_by(
+                chrome,
+                "chrome.exe --headless --remote-debugging-port=9222 --user-data-dir=C:\\Users\\x\\AppData\\Local\\Google\\Chrome\\User Data",
+                r"C:\Users\x\AppData\Local\Temp\stealer.exe"
+            ),
+            Some("Behavior.Win.BrowserHijack")
+        );
+        assert_eq!(
+            started_by(
+                chrome,
+                "chrome.exe --type=renderer --load-extension=C:\\Users\\x\\ext",
+                chrome
+            ),
+            None,
+            "Chrome starting its own processes"
+        );
+        assert_eq!(
+            started_by(
+                chrome,
+                "chrome.exe https://example.test",
+                r"C:\Windows\explorer.exe"
+            ),
+            None
+        );
     }
 
     #[test]

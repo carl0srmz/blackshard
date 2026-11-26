@@ -1278,6 +1278,9 @@ fn execution_reputation(
             }
         }
     }
+    if hidden_on_removable_drive(path) && !trust::verify_file_cached(path).is_trusted() {
+        return Some("Behavior.Win.RemovableDriveWorm");
+    }
     if report.verdict == DetectionVerdict::Suspicious {
         let downloaded = std::fs::read_to_string(format!("{text}:Zone.Identifier"))
             .ok()
@@ -1288,6 +1291,30 @@ fn execution_reputation(
         }
     }
     None
+}
+
+/// Whether a file is hidden and on a removable drive. USB worms (XWorm, Raspberry Robin's
+/// droppers) hide their own copy on the stick and leave a shortcut that runs it; a person's own
+/// portable programs are not hidden.
+fn hidden_on_removable_drive(path: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+    const DRIVE_REMOVABLE: u32 = 2;
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+    let text = path.to_string_lossy();
+    let text = text.trim_start_matches(r"\\?\");
+    let bytes = text.as_bytes();
+    if bytes.len() < 3 || bytes[1] != b':' || !bytes[0].is_ascii_alphabetic() {
+        return false;
+    }
+    let root: Vec<u16> = format!("{}:\\", bytes[0] as char)
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let removable = unsafe { GetDriveTypeW(root.as_ptr()) } == DRIVE_REMOVABLE;
+    removable
+        && std::fs::metadata(path)
+            .is_ok_and(|metadata| metadata.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0)
 }
 
 /// The command-line rules' verdict on a process start.
