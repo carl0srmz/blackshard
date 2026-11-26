@@ -831,6 +831,50 @@ pub fn looks_side_loaded(dll: &str, host: &str) -> bool {
         && in_user_writable_place(&format!("{dll_folder}\\"))
 }
 
+/// Whether a path is a browser's saved passwords, cookies or keys, as the driver reports opens of
+/// them: Chromium browsers keep `Login Data`, `Cookies`, `Web Data` and `Local State` under
+/// `User Data`, Firefox and Thunderbird keep `logins.json`, `key4.db` and `cookies.sqlite` in
+/// their profiles.
+pub fn is_credential_store(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase().replace('/', "\\");
+    let name = file_name(&lower);
+    (lower.contains("\\user data\\")
+        && matches!(
+            name.as_str(),
+            "login data" | "login data for account" | "cookies" | "web data" | "local state"
+        ))
+        || (lower.contains("\\profiles\\")
+            && matches!(name.as_str(), "logins.json" | "key4.db" | "cookies.sqlite"))
+}
+
+/// The programs that open a browser's credential stores in normal use: the browsers themselves,
+/// their embedded web views, Chrome's elevation service (app-bound encryption) and mail clients
+/// built on Firefox.
+const CREDENTIAL_STORE_OWNERS: &[&str] = &[
+    "chrome.exe",
+    "msedge.exe",
+    "msedgewebview2.exe",
+    "brave.exe",
+    "vivaldi.exe",
+    "opera.exe",
+    "browser.exe",
+    "firefox.exe",
+    "thunderbird.exe",
+    "elevation_service.exe",
+    "chromium.exe",
+];
+
+/// Whether `requester` is a browser opening its own credential store.
+pub fn owns_credential_store(requester: &str) -> bool {
+    CREDENTIAL_STORE_OWNERS.contains(&file_name(requester).as_str())
+}
+
+pub const CREDENTIAL_THEFT: RuleHit = hit(
+    "Behavior.Win.CredentialTheft",
+    "reading a browser's saved passwords, cookies or keys, as infostealers do",
+    true,
+);
+
 /// The security zone in a file's `Zone.Identifier` stream, which browsers and mail clients
 /// attach to what they save: 3 is the internet, 4 untrusted sites.
 pub fn download_zone(zone_identifier: &str) -> Option<u32> {
@@ -871,6 +915,29 @@ mod tests {
             ),
             "installed software bundling its own copy"
         );
+    }
+
+    #[test]
+    fn browser_credential_stores_are_recognised_and_their_owners_known() {
+        for path in [
+            r"C:\Users\x\AppData\Local\Google\Chrome\User Data\Default\Login Data",
+            r"\Device\HarddiskVolume3\Users\x\AppData\Local\Microsoft\Edge\User Data\Default\Network\Cookies",
+            r"C:\Users\x\AppData\Local\BraveSoftware\Brave-Browser\User Data\Local State",
+            r"C:\Users\x\AppData\Roaming\Mozilla\Firefox\Profiles\ab12.default\logins.json",
+            r"C:\Users\x\AppData\Roaming\Mozilla\Firefox\Profiles\ab12.default\key4.db",
+        ] {
+            assert!(is_credential_store(path), "{path}");
+        }
+        assert!(!is_credential_store(r"C:\Users\x\Documents\Cookies"));
+        assert!(!is_credential_store(
+            r"C:\Users\x\AppData\Local\Google\Chrome\User Data\Default\History"
+        ));
+        assert!(owns_credential_store(
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+        ));
+        assert!(!owns_credential_store(
+            r"C:\Users\x\AppData\Local\Temp\stealer.exe"
+        ));
     }
 
     #[test]

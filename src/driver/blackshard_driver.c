@@ -311,6 +311,11 @@ BlackshardShouldScanName (
     );
 
 BOOLEAN
+BlackshardIsCredentialStoreName (
+    _In_ PFLT_FILE_NAME_INFORMATION NameInfo
+    );
+
+BOOLEAN
 BlackshardIsProtectedDocumentName (
     _In_ PFLT_FILE_NAME_INFORMATION NameInfo
     );
@@ -452,6 +457,7 @@ BlackshardGetOrCreateStreamContext (
 #pragma alloc_text(PAGE, BlackshardPortDisconnect)
 #pragma alloc_text(PAGE, BlackshardPortMessage)
 #pragma alloc_text(PAGE, BlackshardShouldScanName)
+#pragma alloc_text(PAGE, BlackshardIsCredentialStoreName)
 #pragma alloc_text(PAGE, BlackshardIsProtectedDocumentName)
 #pragma alloc_text(PAGE, BlackshardNameContainsInsensitive)
 #pragma alloc_text(PAGE, BlackshardEvaluateOpenedObject)
@@ -1729,6 +1735,14 @@ BlackshardShouldScanName (
         return TRUE;
     }
 
+    //
+    // A browser's saved passwords, cookies and keys: the service judges who is opening them
+    // rather than scanning them. Several have no extension, so this comes first.
+    //
+    if (BlackshardIsCredentialStoreName(NameInfo)) {
+        return TRUE;
+    }
+
     if (NameInfo->Extension.Length == 0) {
         return FALSE;
     }
@@ -1739,6 +1753,49 @@ BlackshardShouldScanName (
         }
     }
 
+    return FALSE;
+}
+
+BOOLEAN
+BlackshardIsCredentialStoreName (
+    _In_ PFLT_FILE_NAME_INFORMATION NameInfo
+    )
+{
+    static const UNICODE_STRING chromiumFolder = RTL_CONSTANT_STRING(L"\\user data\\");
+    static const UNICODE_STRING mozillaFolder = RTL_CONSTANT_STRING(L"\\profiles\\");
+    static const UNICODE_STRING chromiumFiles[] = {
+        RTL_CONSTANT_STRING(L"Login Data"),
+        RTL_CONSTANT_STRING(L"Login Data For Account"),
+        RTL_CONSTANT_STRING(L"Cookies"),
+        RTL_CONSTANT_STRING(L"Web Data"),
+        RTL_CONSTANT_STRING(L"Local State")
+    };
+    static const UNICODE_STRING mozillaFiles[] = {
+        RTL_CONSTANT_STRING(L"logins.json"),
+        RTL_CONSTANT_STRING(L"key4.db"),
+        RTL_CONSTANT_STRING(L"cookies.sqlite")
+    };
+    ULONG index;
+
+    PAGED_CODE();
+
+    if (NameInfo->FinalComponent.Length == 0) {
+        return FALSE;
+    }
+    if (BlackshardNameContainsInsensitive(&NameInfo->Name, &chromiumFolder)) {
+        for (index = 0; index < RTL_NUMBER_OF(chromiumFiles); index++) {
+            if (RtlEqualUnicodeString(&NameInfo->FinalComponent, &chromiumFiles[index], TRUE)) {
+                return TRUE;
+            }
+        }
+    }
+    if (BlackshardNameContainsInsensitive(&NameInfo->Name, &mozillaFolder)) {
+        for (index = 0; index < RTL_NUMBER_OF(mozillaFiles); index++) {
+            if (RtlEqualUnicodeString(&NameInfo->FinalComponent, &mozillaFiles[index], TRUE)) {
+                return TRUE;
+            }
+        }
+    }
     return FALSE;
 }
 

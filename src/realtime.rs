@@ -32,6 +32,7 @@ const BLACKSHARD_PROTOCOL_VERSION: u16 = 9;
 const CONTROL_GET_HEALTH: u32 = 1;
 const CONTROL_SET_READY_GENERATION: u32 = 2;
 const CONTROL_SET_STOPPING: u32 = 3;
+const OPERATION_OPEN: u32 = 1;
 const OPERATION_EXECUTE_SECTION: u32 = 2;
 const OPERATION_PROTECTED_WRITE: u32 = 3;
 const OPERATION_PROTECTED_METADATA: u32 = 4;
@@ -559,6 +560,23 @@ pub(crate) fn realtime_worker(
                 item.message.header.message_id,
                 DriverVerdict::Allow,
                 0,
+            );
+            continue;
+        }
+
+        // A browser's saved passwords and cookies: judged by who is opening them, not scanned.
+        if notification.operation == OPERATION_OPEN
+            && crate::command_rules::is_credential_store(&kernel_path.to_string_lossy())
+        {
+            judge_credential_store_open(
+                &item,
+                &notification,
+                &kernel_path,
+                &history,
+                &counters,
+                &engine,
+                &quarantine,
+                &definition_generation,
             );
             continue;
         }
@@ -1315,6 +1333,70 @@ fn hidden_on_removable_drive(path: &Path) -> bool {
     removable
         && std::fs::metadata(path)
             .is_ok_and(|metadata| metadata.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0)
+}
+
+/// Lets a browser, or a program signed by a trusted publisher, open a browser's credential store,
+/// and refuses anything else: an infostealer copying `Login Data` or `Cookies`. The refused program
+/// is stopped and, where a user or download could have put it, learned and quarantined.
+#[allow(clippy::too_many_arguments)]
+fn judge_credential_store_open(
+    item: &WorkItem,
+    notification: &BlackshardNotification,
+    kernel_path: &Path,
+    history: &EventHistory,
+    counters: &Mutex<RealtimeCounters>,
+    engine: &SharedDetectionEngine,
+    quarantine: &QuarantineStore,
+    definition_generation: &AtomicU64,
+) {
+    let requester = process_image_path(notification.process_id);
+    let allowed = requester.as_ref().is_some_and(|image| {
+        crate::command_rules::owns_credential_store(&image.to_string_lossy())
+            || trust::verify_file_cached(image).is_trusted()
+    });
+    let verdict = if allowed {
+        DriverVerdict::Allow
+    } else {
+        DriverVerdict::Block
+    };
+    let accepted = reply(item.port, item.message.header.message_id, verdict, 0);
+    if allowed {
+        return;
+    }
+    let hit = crate::command_rules::CREDENTIAL_THEFT;
+    if let Ok(mut value) = counters.lock() {
+        value.detected += 1;
+        if accepted {
+            value.blocked_replies += 1;
+        }
+    }
+    let store = device_path_to_dos_path(kernel_path).unwrap_or_else(|| kernel_path.to_path_buf());
+    log::warn!(
+        "Refused PID {} ({requester:?}) access to {store:?}",
+        notification.process_id
+    );
+    let mut event = SecurityEvent::new(EventKind::Detection, "Browser credential theft refused");
+    event.path = Some(store);
+    event.threat_name = Some(hit.name.to_owned());
+    event.risk_score = Some(100);
+    event.details = Some(format!(
+        "block_reply_accepted={accepted}; reason={}; pid={}; program={}",
+        hit.reason,
+        notification.process_id,
+        requester
+            .as_ref()
+            .map(|image| image.display().to_string())
+            .unwrap_or_default()
+    ));
+    let _ = history.append(&event);
+    convict_process(
+        notification.process_id,
+        hit.name,
+        history,
+        engine,
+        quarantine,
+        definition_generation,
+    );
 }
 
 /// The command-line rules' verdict on a process start.
