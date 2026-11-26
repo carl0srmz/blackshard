@@ -65,6 +65,18 @@ changes are listed here, newest first.
 - Self-tests are administrator-only and rate-limited; clearing the history is recorded.
 
 ### Added
+- Browser credential stores (Chromium's Login Data, Cookies, Web Data and Local State, Firefox's
+  logins.json, key4.db and cookies.sqlite) can only be opened by the browser or a signed program;
+  an infostealer is refused, stopped and removed.
+- Rules for credential dumping (comsvcs MiniDump, procdump of lsass, saving the SAM and SECURITY
+  hives), starting programs on other computers (remote WMIC, sc, schtasks, PsExec, winrs),
+  rundll32 running a disguised file (NotPetya's perfc.dat) and browsers started with a user-folder
+  extension or hidden remote debugging. Hidden unsigned programs on removable drives are blocked.
+- The memory hunt detects process hollowing. Turbo also finds processes hidden from the process
+  list, scans loaded kernel drivers (disabling and quarantining malicious ones), removes program
+  images and loader scripts stored in users' registry hives, and reports attack tools' default
+  pipe names.
+- The rollback vault keeps up to 2,048 files and 1 GB per program, 4 GB in all.
 - Program starts are judged by their command line: shadow-copy, backup and recovery deletion,
   Safe Mode reboots, tampering with blackshard, Defender or the firewall, launch and sign-in
   hijacks, download-and-run and in-memory loader PowerShell (also encoded), mshta, rundll32 and

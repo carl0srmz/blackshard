@@ -20,9 +20,11 @@ use uuid::Uuid;
 
 /// A file larger than this is not saved: the copy happens while the driver waits for a reply.
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
-const MAX_FILES_PER_PROCESS: usize = 256;
-const MAX_BYTES_PER_PROCESS: u64 = 512 * 1024 * 1024;
-const MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// A fast encryptor (WannaCry) gets through hundreds of files before the heuristic convicts it;
+/// the decoys usually stop it sooner, and these bounds keep the rest of its damage undoable.
+const MAX_FILES_PER_PROCESS: usize = 2_048;
+const MAX_BYTES_PER_PROCESS: u64 = 1024 * 1024 * 1024;
+const MAX_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_AGE: Duration = Duration::from_secs(6 * 60 * 60);
 const COPY_BUFFER: usize = 128 * 1024;
 

@@ -80,9 +80,9 @@ outside the watched list.
 | # | Name | What it is | Needs | Where |
 |---|------|-----------|-------|-------|
 | 26 | Petya (2016) | MBR bootlocker, encrypts the MFT on reboot | ✓ kill before reboot; ✓ MBR restore; ✓ boot-record scan | MB, ZOO |
-| 27 | NotPetya | Wiper posing as ransomware, spreads with EternalBlue and credentials | ✓ early kill; ✓ MBR; ✓ shadow-copy rule; **lateral-movement visibility** | MB, ZOO |
-| 28 | WannaCry | SMB worm ransomware | ✓ kill; ✓ decoys; **vault limits (256 files, 512 MB per program)** | MB, ZOO |
-| 29 | Bad Rabbit | Fake Flash, disk encryption via a signed driver | ✓ shadow-copy rule; **driver-based disk encryption** | MB, ZOO |
+| 27 | NotPetya | Wiper posing as ransomware, spreads with EternalBlue and credentials | ✓ early kill; ✓ MBR; ✓ shadow-copy rule; ✓ remote-execution and disguised-DLL rules | MB, ZOO |
+| 28 | WannaCry | SMB worm ransomware | ✓ kill; ✓ decoys; ✓ larger rollback vault | MB, ZOO |
+| 29 | Bad Rabbit | Fake Flash, disk encryption via a signed driver | ✓ shadow-copy rule; ✓ loaded-driver scan; **driver-based disk encryption** | MB, ZOO |
 | 30 | CryptoLocker | Classic ransomware | ✓ heuristic; ✓ decoys; ✓ rollback | MB, ZOO |
 | 31 | CryptoWall | Ransomware, injects into explorer | ✓ memory hunt stops injected threads in Explorer | MB, ZOO |
 | 32 | TeslaCrypt | Ransomware | ✓ heuristic; ✓ decoys; ✓ rollback | MB, ZOO |
@@ -103,7 +103,7 @@ outside the watched list.
 | 47 | Superfish | Adware with a root certificate | ✓ root certificate repair | ✱ |
 | 48 | Wajam | Evasive adware | ✓ PUA; ✓ browser policy repair; **browser settings outside policy** | MB ✱ |
 | 49 | Adrozek | Browser modifier | ✓ browser policy repair; **browser files it patches** | MB ✱ |
-| 50 | ChromeLoader | Malicious extension plus PowerShell scheduled task | ✓ task cleanup by rule; ✓ forced-extension policy repair; **extensions installed outside policy** | MB |
+| 50 | ChromeLoader | Malicious extension plus PowerShell scheduled task | ✓ task cleanup by rule; ✓ forced-extension policy repair; ✓ `--load-extension` rule | MB |
 
 ## Tier 3 (51–75): modern crimeware
 
@@ -112,19 +112,19 @@ live off Windows' own binaries, and phone home. Signatures alone lose here.
 
 | # | Name | What it is | Needs | Where |
 |---|------|-----------|-------|-------|
-| 51 | RedLine | Infostealer | ✓ memory scanning; **credential-theft behaviour** | MB |
-| 52 | Raccoon | Infostealer | ✓ memory scanning; **credential-theft behaviour** | MB |
-| 53 | Vidar | Infostealer | ✓ memory scanning; **credential-theft behaviour** | MB |
+| 51 | RedLine | Infostealer | ✓ memory scanning; ✓ browser credential-store guard | MB |
+| 52 | Raccoon | Infostealer | ✓ memory scanning; ✓ browser credential-store guard | MB |
+| 53 | Vidar | Infostealer | ✓ memory scanning; ✓ browser credential-store guard | MB |
 | 54 | Lumma | Infostealer, often delivered by a pasted command ("ClickFix") | ✓ ClickFix command-line rules; ✓ AMSI | MB |
 | 55 | Agent Tesla | .NET stealer and keylogger | ✓ memory scanning; ✓ in-memory loader rule | MB |
-| 56 | FormBook/XLoader | Stealer, process hollowing | ✓ memory scanning; **hollowed image memory** | MB |
+| 56 | FormBook/XLoader | Stealer, process hollowing | ✓ memory scanning; ✓ hollowing detection | MB |
 | 57 | Remcos | RAT | ✓ signature; ✓ injected-thread kill | MB |
 | 58 | njRAT | .NET RAT | ✓ signature; ✓ firewall-rule repair | MB |
 | 59 | AsyncRAT | .NET RAT | ✓ signature; ✓ in-memory loader rule; ✓ memory scanning | MB |
 | 60 | Quasar | .NET RAT | ✓ signature | MB |
 | 61 | DarkComet | RAT | ✓ signature | MB |
 | 62 | NanoCore | .NET RAT | ✓ signature | MB |
-| 63 | XWorm | RAT and worm | ✓ signature; **USB spread** | MB |
+| 63 | XWorm | RAT and worm | ✓ signature; ✓ hidden-USB-program block | MB |
 | 64 | DarkGate | Loader delivered as an AutoIt script | ✓ AutoIt-loader rule | MB |
 | 65 | Zeus/Zbot | Banking trojan, injects into explorer | ✓ injected-thread kill | MB |
 | 66 | Emotet | Loader with service persistence | ✓ service cleanup; ✓ memory scanning; **polymorphism** | MB |
@@ -132,7 +132,7 @@ live off Windows' own binaries, and phone home. Signatures alone lose here.
 | 68 | QakBot | Loader, injects into wermgr and explorer | ✓ injected-thread kill | MB |
 | 69 | IcedID | Loader, DLL side-loading | ✓ side-loading rule | MB |
 | 70 | Dridex | Banking, DLL hijacking | ✓ side-loading rule | MB |
-| 71 | Ursnif/Gozi | Banking, registry-stored payloads | ✓ autostart sweep by rule; **registry payloads outside autostarts** | MB |
+| 71 | Ursnif/Gozi | Banking, registry-stored payloads | ✓ autostart sweep; ✓ registry payload removal | MB |
 | 72 | SmokeLoader | Loader, injects into explorer | ✓ injected-thread kill | MB |
 | 73 | GuLoader | Shellcode loader, anti-VM | ✓ memory scanning; ✓ works in VMs | MB |
 | 74 | SocGholish | Fake browser update in JavaScript | ✓ downloaded-script rule; ✓ download-zone rule | MB |
@@ -156,17 +156,17 @@ These kill or blind security products, run below the OS, or never touch disk. No
 | 84 | Royal/BlackSuit | Partial encryption | ✓ decoys catch partial encryption | MB |
 | 85 | Cl0p | Ransomware and data theft | ✓ decoys; **data-theft visibility** | MB |
 | 86 | Rhysida | Ransomware | ✓ shadow-copy rule; ✓ decoys | MB |
-| 87 | Cobalt Strike Beacon | Post-exploitation, reflective loading | ✓ memory scanning; **named-pipe and network visibility** | MB |
+| 87 | Cobalt Strike Beacon | Post-exploitation, reflective loading | ✓ memory scanning; ✓ default pipe names; **network visibility** | MB |
 | 88 | Sliver | Open-source C2 implant | ✓ memory scanning; **network visibility** | GitHub (build the implant) |
 | 89 | Brute Ratel C4 | C2 built to evade EDRs | ✓ memory scanning; **unhooking and direct-syscall evasion** | MB |
-| 90 | Kovter | Fileless: payload stored in the registry | ✓ autostart sweep removes the Run value that starts it | MB, VXU |
-| 91 | Poweliks | Fileless: registry plus rundll32 and JavaScript | ✓ rundll32 and mshta rules; ✓ autostart sweep | VXU |
-| 92 | Purple Fox | Rootkit and worm, MSI-delivered | ✓ msiexec rule; **kernel rootkit** | MB |
-| 93 | ZeroAccess | Rootkit, click-fraud | **kernel rootkit** | ZOO, VXU |
+| 90 | Kovter | Fileless: payload stored in the registry | ✓ autostart sweep; ✓ registry payload removal | MB, VXU |
+| 91 | Poweliks | Fileless: registry plus rundll32 and JavaScript | ✓ rundll32 and mshta rules; ✓ autostart sweep; ✓ registry payload removal | VXU |
+| 92 | Purple Fox | Rootkit and worm, MSI-delivered | ✓ msiexec rule; ✓ hidden-process and loaded-driver scan | MB |
+| 93 | ZeroAccess | Rootkit, click-fraud | ✓ hidden-process and loaded-driver scan; **removal needs an offline scan** | ZOO, VXU |
 | 94 | TDL4/TDSS | MBR bootkit | ✓ MBR restore; ✓ boot-record scan | ZOO, VXU |
-| 95 | Necurs | Rootkit driver | ✓ vulnerable driver blocklist; **driver detection and removal** | MB, VXU |
-| 96 | FiveSys | Microsoft-signed rootkit driver | **driver trust beyond signatures** | ✱ VirusTotal only |
+| 95 | Necurs | Rootkit driver | ✓ vulnerable driver blocklist; ✓ loaded-driver scan, disable and quarantine | MB, VXU |
+| 96 | FiveSys | Microsoft-signed rootkit driver | ✓ loaded-driver scan by signature; **trust beyond Microsoft's signature** | ✱ VirusTotal only |
 | 97 | AuKill / Terminator | Bring-your-own-vulnerable-driver AV killers | ✓ self-protection; ✓ vulnerable driver blocklist | MB |
 | 98 | BlackLotus | UEFI bootkit, bypasses Secure Boot | ✓ EFI partition scan; **repair needs bcdboot and Secure Boot updates** | MB; GitHub proof of concept |
-| 99 | Mimikatz | Credential dumper, the standard post-exploitation tool | ✓ LSA protection (Windows 11 22H2+); ✓ signature | GitHub |
+| 99 | Mimikatz | Credential dumper, the standard post-exploitation tool | ✓ LSA protection (Windows 11 22H2+); ✓ credential-dumping rules; ✓ signature | GitHub |
 | 100 | Meterpreter | Memory-only implant, reflective DLL injection | ✓ memory scanning; **network visibility** | GitHub (Metasploit) |
