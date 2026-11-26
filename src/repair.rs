@@ -259,6 +259,11 @@ pub fn take_baseline(pause: DateTime<Utc>) {
         .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(baseline);
 }
 
+/// The boot disk's number and the first megabyte of it, for the bootkit scan.
+pub fn read_boot_region() -> Option<(u32, Vec<u8>)> {
+    boot_disk::read().ok()
+}
+
 fn hosts_path() -> Option<std::path::PathBuf> {
     std::env::var_os("SystemRoot").map(|root| {
         std::path::PathBuf::from(root)
