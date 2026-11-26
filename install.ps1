@@ -6,6 +6,9 @@ param(
     # Install without the kernel minifilter. Real-time coverage then comes from AMSI, which needs
     # no kernel code and therefore no EV certificate or test-signing.
     [switch]$SkipDriver,
+    # Leave Windows' own defences as they are: by default the install turns on Microsoft's
+    # vulnerable driver blocklist and, on Windows 11 22H2 and later, LSA protection.
+    [switch]$SkipSystemHardening,
     # Where the service downloads ClamAV definitions from, for a private mirror. Also settable
     # through the BLACKSHARD_CLAMAV_MIRROR environment variable of the installing process.
     [string]$DefinitionMirror = $env:BLACKSHARD_CLAMAV_MIRROR
@@ -149,11 +152,61 @@ function Get-DriverLoadDiagnostics {
     return $lines -join "`n"
 }
 
+$ciConfigKey = "HKLM:\SYSTEM\CurrentControlSet\Control\CI\Config"
+$lsaKey = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa"
+
+# Turns on two of Windows' own defences against what blackshard cannot stop from user mode, and
+# notes in the service's Parameters key which ones it turned on, so uninstalling turns off only
+# those:
+# - Microsoft's vulnerable driver blocklist, which refuses the signed-but-exploitable drivers
+#   "bring your own vulnerable driver" tools (AuKill, Terminator) load to kill security software.
+# - LSA protection, which runs lsass.exe as a protected process so credential dumpers (Mimikatz)
+#   cannot read it. Only on Windows 11 22H2 and later, where value 2 enables it without a UEFI
+#   lock; on older Windows the only setting locks it into firmware, which an installer should not
+#   do on its own.
+function Enable-SystemHardening([string]$ParametersKey) {
+    $blocklist = (Get-ItemProperty -Path $ciConfigKey -Name VulnerableDriverBlocklistEnable -ErrorAction SilentlyContinue)
+    if (-not $blocklist -or $blocklist.VulnerableDriverBlocklistEnable -ne 1) {
+        New-Item -Path $ciConfigKey -Force | Out-Null
+        New-ItemProperty -Path $ciConfigKey -Name VulnerableDriverBlocklistEnable -Value 1 -PropertyType DWord -Force | Out-Null
+        New-ItemProperty -Path $ParametersKey -Name EnabledDriverBlocklist -Value 1 -PropertyType DWord -Force | Out-Null
+        Write-Host "[+] Microsoft's vulnerable driver blocklist is on." -ForegroundColor Green
+    }
+    $build = [Environment]::OSVersion.Version.Build
+    $lsa = (Get-ItemProperty -Path $lsaKey -Name RunAsPPL -ErrorAction SilentlyContinue)
+    if ($build -ge 22621) {
+        if (-not $lsa -or $lsa.RunAsPPL -eq 0) {
+            New-ItemProperty -Path $lsaKey -Name RunAsPPL -Value 2 -PropertyType DWord -Force | Out-Null
+            New-ItemProperty -Path $ParametersKey -Name EnabledLsaProtection -Value 1 -PropertyType DWord -Force | Out-Null
+            Write-Host "[+] LSA protection is on from the next restart." -ForegroundColor Green
+        }
+    }
+    elseif (-not $lsa -or $lsa.RunAsPPL -eq 0) {
+        Write-Host "    LSA protection is off. On this Windows version it can only be turned on with a UEFI lock; see Microsoft's 'Configure added LSA protection' to do it by hand." -ForegroundColor Gray
+    }
+}
+
+# Turns off only what Enable-SystemHardening turned on.
+function Disable-SystemHardening([string]$ParametersKey) {
+    $markers = Get-ItemProperty -Path $ParametersKey -ErrorAction SilentlyContinue
+    if (-not $markers) {
+        return
+    }
+    if ($markers.PSObject.Properties['EnabledDriverBlocklist']) {
+        New-ItemProperty -Path $ciConfigKey -Name VulnerableDriverBlocklistEnable -Value 0 -PropertyType DWord -Force | Out-Null
+    }
+    if ($markers.PSObject.Properties['EnabledLsaProtection']) {
+        Remove-ItemProperty -Path $lsaKey -Name RunAsPPL -ErrorAction SilentlyContinue
+    }
+}
+
 function Remove-blackshardInstallation {
     Write-Host "[*] Stopping blackshard protection service..." -ForegroundColor Cyan
     foreach ($serviceName in @($protectionServiceName, $legacyProtectionServiceName)) {
         Stop-blackshardServiceForReplacement -Name $serviceName
     }
+    # Read before the service, and its Parameters key with the markers, is deleted.
+    Disable-SystemHardening -ParametersKey "HKLM:\SYSTEM\CurrentControlSet\Services\$protectionServiceName\Parameters"
 
     # Writable now: the protection service stopped on purpose above, which lifts the driver's
     # registry protection.
@@ -427,6 +480,10 @@ if ($unsignedComponents) {
 }
 else {
     Remove-ItemProperty -Path $serviceParameters -Name AllowUnsignedComponents -ErrorAction SilentlyContinue
+}
+
+if (-not $SkipSystemHardening) {
+    Enable-SystemHardening -ParametersKey $serviceParameters
 }
 
 if ([string]::IsNullOrWhiteSpace($DefinitionMirror)) {
