@@ -26,6 +26,45 @@
 // the section waits here. A protected write waits for the service to copy the original document
 // (at most 16 MB) to the rollback vault before the write may change it. An open only audits.
 //
+#define BLACKSHARD_FEATURE_HANDLE_PROTECTION 0x1UL
+#define BLACKSHARD_FEATURE_REGISTRY_PROTECTION 0x2UL
+#define BLACKSHARD_CALLBACK_ALTITUDE L"320000.4242"
+
+#ifndef PROCESS_TERMINATE
+#define PROCESS_TERMINATE 0x0001
+#endif
+#ifndef PROCESS_CREATE_THREAD
+#define PROCESS_CREATE_THREAD 0x0002
+#endif
+#ifndef PROCESS_VM_OPERATION
+#define PROCESS_VM_OPERATION 0x0008
+#endif
+#ifndef PROCESS_VM_WRITE
+#define PROCESS_VM_WRITE 0x0020
+#endif
+#ifndef PROCESS_SUSPEND_RESUME
+#define PROCESS_SUSPEND_RESUME 0x0800
+#endif
+#ifndef THREAD_TERMINATE
+#define THREAD_TERMINATE 0x0001
+#endif
+#ifndef THREAD_SUSPEND_RESUME
+#define THREAD_SUSPEND_RESUME 0x0002
+#endif
+#ifndef THREAD_SET_CONTEXT
+#define THREAD_SET_CONTEXT 0x0010
+#endif
+
+//
+// Rights other processes, administrators included, never get on the service: enough to kill,
+// freeze or inject into it. Its threads are covered too, or killing each thread would do.
+//
+#define BLACKSHARD_DENIED_PROCESS_ACCESS \
+    (PROCESS_TERMINATE | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | \
+     PROCESS_SUSPEND_RESUME | PROCESS_CREATE_THREAD)
+#define BLACKSHARD_DENIED_THREAD_ACCESS \
+    (THREAD_TERMINATE | THREAD_SUSPEND_RESUME | THREAD_SET_CONTEXT)
+
 #define BLACKSHARD_EXECUTE_TIMEOUT_MS 30000LL
 #define BLACKSHARD_PROTECTED_TIMEOUT_MS 5000LL
 #define BLACKSHARD_OPEN_TIMEOUT_MS 1500LL
@@ -125,7 +164,7 @@ typedef struct _BLACKSHARD_HEALTH_REPLY {
     ULONGLONG QueueOverloads;
     ULONGLONG ReadyGeneration;
     ULONG OperationalPhase;
-    ULONG Reserved;
+    ULONG Features;
 } BLACKSHARD_HEALTH_REPLY, *PBLACKSHARD_HEALTH_REPLY;
 
 typedef struct _BLACKSHARD_STREAM_CONTEXT {
@@ -143,6 +182,10 @@ typedef struct _BLACKSHARD_DATA {
     PFLT_PORT ServerPort;
     PFLT_PORT ClientPort;
     HANDLE ClientProcessId;
+    PEPROCESS volatile ClientProcess;
+    PVOID ObjectCallbacks;
+    LARGE_INTEGER RegistryCookie;
+    ULONG Features;
     volatile LONG64 ScanRequests;
     volatile LONG64 Blocks;
     volatile LONG64 Timeouts;
@@ -307,6 +350,34 @@ BlackshardRememberSystemVolume (
     VOID
     );
 
+VOID
+BlackshardRegisterSelfProtection (
+    _In_ PDRIVER_OBJECT DriverObject
+    );
+
+VOID
+BlackshardUnregisterSelfProtection (
+    VOID
+    );
+
+BOOLEAN
+BlackshardSelfProtectionActive (
+    VOID
+    );
+
+OB_PREOP_CALLBACK_STATUS
+BlackshardPreObjectHandle (
+    _In_ PVOID RegistrationContext,
+    _Inout_ POB_PRE_OPERATION_INFORMATION OperationInformation
+    );
+
+EX_CALLBACK_FUNCTION BlackshardRegistryCallback;
+
+BOOLEAN
+BlackshardIsProtectedRegistryKey (
+    _In_ PCUNICODE_STRING KeyName
+    );
+
 NTSTATUS
 BlackshardGetOrCreateStreamContext (
     _In_ PCFLT_RELATED_OBJECTS FltObjects,
@@ -326,6 +397,10 @@ BlackshardGetOrCreateStreamContext (
 #pragma alloc_text(PAGE, BlackshardEvaluateOpenedObject)
 #pragma alloc_text(PAGE, BlackshardIsAdministratorOnlyImage)
 #pragma alloc_text(INIT, BlackshardRememberSystemVolume)
+#pragma alloc_text(INIT, BlackshardRegisterSelfProtection)
+#pragma alloc_text(PAGE, BlackshardUnregisterSelfProtection)
+#pragma alloc_text(PAGE, BlackshardRegistryCallback)
+#pragma alloc_text(PAGE, BlackshardIsProtectedRegistryKey)
 
 CONST FLT_CONTEXT_REGISTRATION Contexts[] = {
     {
@@ -369,10 +444,14 @@ CONST FLT_OPERATION_REGISTRATION Callbacks[] = {
     { IRP_MJ_OPERATION_END }
 };
 
+//
+// Not stoppable through the service control manager, and the unload callback refuses every
+// unload it may refuse, so `sc stop` and `fltmc unload` both fail. A new driver loads at restart.
+//
 CONST FLT_REGISTRATION FilterRegistration = {
     sizeof(FLT_REGISTRATION),
     FLT_REGISTRATION_VERSION,
-    0,
+    FLTFL_REGISTRATION_DO_NOT_SUPPORT_SERVICE_STOP,
     Contexts,
     Callbacks,
     BlackshardUnload,
@@ -449,8 +528,11 @@ DriverEntry (
         return status;
     }
 
+    BlackshardRegisterSelfProtection(DriverObject);
+
     status = FltStartFiltering(gBlackshardData.FilterHandle);
     if (!NT_SUCCESS(status)) {
+        BlackshardUnregisterSelfProtection();
         FltCloseCommunicationPort(gBlackshardData.ServerPort);
         gBlackshardData.ServerPort = NULL;
         FltUnregisterFilter(gBlackshardData.FilterHandle);
@@ -645,9 +727,13 @@ BlackshardUnload (
     _In_ FLT_FILTER_UNLOAD_FLAGS Flags
     )
 {
-    UNREFERENCED_PARAMETER(Flags);
-
     PAGED_CODE();
+
+    if (!FlagOn(Flags, FLTFL_FILTER_UNLOAD_MANDATORY)) {
+        return STATUS_FLT_DO_NOT_DETACH;
+    }
+
+    BlackshardUnregisterSelfProtection();
 
     if (gBlackshardData.ServerPort != NULL) {
         FltCloseCommunicationPort(gBlackshardData.ServerPort);
@@ -1722,6 +1808,11 @@ BlackshardPortConnect (
     }
 
     gBlackshardData.ClientProcessId = PsGetCurrentProcessId();
+    ObReferenceObject(PsGetCurrentProcess());
+    InterlockedExchangePointer(
+        (PVOID volatile *)&gBlackshardData.ClientProcess,
+        PsGetCurrentProcess()
+        );
     gBlackshardData.ClientPort = ClientPort;
     InterlockedExchange(
         &gBlackshardData.OperationalPhase,
@@ -1737,6 +1828,8 @@ BlackshardPortDisconnect (
     _In_opt_ PVOID ConnectionCookie
     )
 {
+    PEPROCESS clientProcess;
+
     UNREFERENCED_PARAMETER(ConnectionCookie);
 
     PAGED_CODE();
@@ -1746,6 +1839,13 @@ BlackshardPortDisconnect (
         &gBlackshardData.ClientPort
         );
     gBlackshardData.ClientProcessId = NULL;
+    clientProcess = (PEPROCESS)InterlockedExchangePointer(
+        (PVOID volatile *)&gBlackshardData.ClientProcess,
+        NULL
+        );
+    if (clientProcess != NULL) {
+        ObDereferenceObject(clientProcess);
+    }
     InterlockedExchange64(&gBlackshardData.ReadyGeneration, 0);
     //
     // A service that said it was stopping left on purpose; any other disconnect is a crash or a
@@ -1890,6 +1990,7 @@ BlackshardPortMessage (
             &gBlackshardData.ReadyGeneration, 0, 0);
     reply.OperationalPhase = (ULONG)InterlockedCompareExchange(
         &gBlackshardData.OperationalPhase, 0, 0);
+    reply.Features = gBlackshardData.Features;
 
     status = STATUS_SUCCESS;
     __try {
@@ -1903,4 +2004,250 @@ BlackshardPortMessage (
 
     *ReturnOutputBufferLength = sizeof(reply);
     return STATUS_SUCCESS;
+}
+
+VOID
+BlackshardRegisterSelfProtection (
+    _In_ PDRIVER_OBJECT DriverObject
+    )
+{
+    OB_OPERATION_REGISTRATION operations[2];
+    OB_CALLBACK_REGISTRATION registration;
+    UNICODE_STRING altitude = RTL_CONSTANT_STRING(BLACKSHARD_CALLBACK_ALTITUDE);
+    NTSTATUS status;
+
+    //
+    // Each part is optional: a driver that loads without one still filters files, and the
+    // service logs which parts the health reply says are missing.
+    //
+    RtlZeroMemory(operations, sizeof(operations));
+    operations[0].ObjectType = PsProcessType;
+    operations[0].Operations = OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
+    operations[0].PreOperation = BlackshardPreObjectHandle;
+    operations[1].ObjectType = PsThreadType;
+    operations[1].Operations = OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE;
+    operations[1].PreOperation = BlackshardPreObjectHandle;
+
+    RtlZeroMemory(&registration, sizeof(registration));
+    registration.Version = OB_FLT_REGISTRATION_VERSION;
+    registration.OperationRegistrationCount = RTL_NUMBER_OF(operations);
+    registration.Altitude = altitude;
+    registration.OperationRegistration = operations;
+    status = ObRegisterCallbacks(&registration, &gBlackshardData.ObjectCallbacks);
+    if (NT_SUCCESS(status)) {
+        gBlackshardData.Features |= BLACKSHARD_FEATURE_HANDLE_PROTECTION;
+    } else {
+        gBlackshardData.ObjectCallbacks = NULL;
+    }
+
+    status = CmRegisterCallbackEx(
+        BlackshardRegistryCallback,
+        &altitude,
+        DriverObject,
+        NULL,
+        &gBlackshardData.RegistryCookie,
+        NULL
+        );
+    if (NT_SUCCESS(status)) {
+        gBlackshardData.Features |= BLACKSHARD_FEATURE_REGISTRY_PROTECTION;
+    }
+}
+
+VOID
+BlackshardUnregisterSelfProtection (
+    VOID
+    )
+{
+    PAGED_CODE();
+
+    if (FlagOn(gBlackshardData.Features, BLACKSHARD_FEATURE_REGISTRY_PROTECTION)) {
+        (VOID)CmUnRegisterCallback(gBlackshardData.RegistryCookie);
+        ClearFlag(gBlackshardData.Features, BLACKSHARD_FEATURE_REGISTRY_PROTECTION);
+    }
+    if (gBlackshardData.ObjectCallbacks != NULL) {
+        ObUnRegisterCallbacks(gBlackshardData.ObjectCallbacks);
+        gBlackshardData.ObjectCallbacks = NULL;
+        ClearFlag(gBlackshardData.Features, BLACKSHARD_FEATURE_HANDLE_PROTECTION);
+    }
+}
+
+BOOLEAN
+BlackshardSelfProtectionActive (
+    VOID
+    )
+{
+    LONG phase;
+
+    //
+    // Off before the service first connects this boot and after it stopped on purpose, so a
+    // broken install can still be repaired and an uninstall can run. On while it runs, and
+    // after it crashed or was killed until it is back.
+    //
+    phase = InterlockedCompareExchange(&gBlackshardData.OperationalPhase, 0, 0);
+    return (BOOLEAN)(
+        phase == BlackshardPhaseStarting ||
+        phase == BlackshardPhaseReady ||
+        phase == BlackshardPhaseRecovering
+        );
+}
+
+OB_PREOP_CALLBACK_STATUS
+BlackshardPreObjectHandle (
+    _In_ PVOID RegistrationContext,
+    _Inout_ POB_PRE_OPERATION_INFORMATION OperationInformation
+    )
+{
+    PEPROCESS protectedProcess;
+    PEPROCESS target;
+    ACCESS_MASK denied;
+
+    UNREFERENCED_PARAMETER(RegistrationContext);
+
+    protectedProcess = (PEPROCESS)InterlockedCompareExchangePointer(
+        (PVOID volatile *)&gBlackshardData.ClientProcess,
+        NULL,
+        NULL
+        );
+    if (protectedProcess == NULL ||
+        OperationInformation->KernelHandle ||
+        PsGetCurrentProcess() == protectedProcess) {
+        return OB_PREOP_SUCCESS;
+    }
+
+    if (OperationInformation->ObjectType == *PsProcessType) {
+        target = (PEPROCESS)OperationInformation->Object;
+        denied = BLACKSHARD_DENIED_PROCESS_ACCESS;
+    } else {
+        target = IoThreadToProcess((PETHREAD)OperationInformation->Object);
+        denied = BLACKSHARD_DENIED_THREAD_ACCESS;
+    }
+    if (target != protectedProcess) {
+        return OB_PREOP_SUCCESS;
+    }
+
+    if (OperationInformation->Operation == OB_OPERATION_HANDLE_CREATE) {
+        OperationInformation->Parameters->CreateHandleInformation.DesiredAccess &= ~denied;
+    } else {
+        OperationInformation->Parameters->DuplicateHandleInformation.DesiredAccess &= ~denied;
+    }
+    return OB_PREOP_SUCCESS;
+}
+
+NTSTATUS
+BlackshardRegistryCallback (
+    _In_ PVOID CallbackContext,
+    _In_opt_ PVOID Argument1,
+    _In_opt_ PVOID Argument2
+    )
+{
+    PEPROCESS service;
+    PVOID keyObject;
+    PCUNICODE_STRING keyName;
+    BOOLEAN protectedKey;
+    NTSTATUS status;
+
+    UNREFERENCED_PARAMETER(CallbackContext);
+
+    PAGED_CODE();
+
+    //
+    // Kernel-mode callers are not refused: the I/O manager records the driver's Enum key itself,
+    // and kernel code could undo this callback anyway.
+    //
+    if (Argument2 == NULL ||
+        ExGetPreviousMode() == KernelMode ||
+        !BlackshardSelfProtectionActive()) {
+        return STATUS_SUCCESS;
+    }
+    service = (PEPROCESS)InterlockedCompareExchangePointer(
+        (PVOID volatile *)&gBlackshardData.ClientProcess,
+        NULL,
+        NULL
+        );
+    if (service != NULL && PsGetCurrentProcess() == service) {
+        return STATUS_SUCCESS;
+    }
+
+    switch ((REG_NOTIFY_CLASS)(ULONG_PTR)Argument1) {
+    case RegNtPreSetValueKey:
+        keyObject = ((PREG_SET_VALUE_KEY_INFORMATION)Argument2)->Object;
+        break;
+    case RegNtPreDeleteValueKey:
+        keyObject = ((PREG_DELETE_VALUE_KEY_INFORMATION)Argument2)->Object;
+        break;
+    case RegNtPreDeleteKey:
+        keyObject = ((PREG_DELETE_KEY_INFORMATION)Argument2)->Object;
+        break;
+    case RegNtPreRenameKey:
+        keyObject = ((PREG_RENAME_KEY_INFORMATION)Argument2)->Object;
+        break;
+    case RegNtPreSetInformationKey:
+        keyObject = ((PREG_SET_INFORMATION_KEY_INFORMATION)Argument2)->Object;
+        break;
+    case RegNtPreRestoreKey:
+        keyObject = ((PREG_RESTORE_KEY_INFORMATION)Argument2)->Object;
+        break;
+    case RegNtPreReplaceKey:
+        keyObject = ((PREG_REPLACE_KEY_INFORMATION)Argument2)->Object;
+        break;
+    default:
+        return STATUS_SUCCESS;
+    }
+
+    keyName = NULL;
+    status = CmCallbackGetKeyObjectIDEx(
+        &gBlackshardData.RegistryCookie,
+        keyObject,
+        NULL,
+        &keyName,
+        0
+        );
+    if (!NT_SUCCESS(status) || keyName == NULL) {
+        return STATUS_SUCCESS;
+    }
+    protectedKey = BlackshardIsProtectedRegistryKey(keyName);
+    CmCallbackReleaseKeyObjectIDEx(keyName);
+    return protectedKey ? STATUS_ACCESS_DENIED : STATUS_SUCCESS;
+}
+
+BOOLEAN
+BlackshardIsProtectedRegistryKey (
+    _In_ PCUNICODE_STRING KeyName
+    )
+{
+    static const UNICODE_STRING system = RTL_CONSTANT_STRING(L"\\REGISTRY\\MACHINE\\SYSTEM\\");
+    /* Below a control set, so ControlSet001, ControlSet002 and CurrentControlSet all match. */
+    static const UNICODE_STRING protectedKeys[] = {
+        RTL_CONSTANT_STRING(L"\\Services\\blackshard"),
+        RTL_CONSTANT_STRING(L"\\Services\\blackshard-protection-service")
+    };
+    UNICODE_STRING rest;
+    USHORT skipped;
+    ULONG index;
+    USHORT keyCharacters;
+
+    PAGED_CODE();
+
+    if (!RtlPrefixUnicodeString(&system, KeyName, TRUE)) {
+        return FALSE;
+    }
+    rest.Buffer = KeyName->Buffer + system.Length / sizeof(WCHAR);
+    rest.Length = KeyName->Length - system.Length;
+    for (skipped = 0;
+         skipped < rest.Length / sizeof(WCHAR) && rest.Buffer[skipped] != L'\\';
+         skipped++) {
+    }
+    rest.Buffer += skipped;
+    rest.Length = (USHORT)(rest.Length - skipped * sizeof(WCHAR));
+    rest.MaximumLength = rest.Length;
+
+    for (index = 0; index < RTL_NUMBER_OF(protectedKeys); index++) {
+        keyCharacters = protectedKeys[index].Length / sizeof(WCHAR);
+        if (RtlPrefixUnicodeString(&protectedKeys[index], &rest, TRUE) &&
+            (rest.Length == protectedKeys[index].Length ||
+             rest.Buffer[keyCharacters] == L'\\')) {
+            return TRUE;
+        }
+    }
+    return FALSE;
 }

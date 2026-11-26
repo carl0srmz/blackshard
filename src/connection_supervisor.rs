@@ -3,10 +3,10 @@ use crate::config::Settings;
 use crate::history::{EventHistory, EventKind, SecurityEvent};
 use crate::quarantine::QuarantineStore;
 use crate::realtime::{
-    hresult_text, interruptible_wait, notification_path, realtime_worker, reply,
-    valid_notification, BlackshardMessage, DriverVerdict, FilterConnectCommunicationPort,
-    FilterGetMessage, ProtectionConnection, RealtimeCounters, RealtimeEvent, SharedDetectionEngine,
-    WorkItem,
+    hresult_text, interruptible_wait, missing_driver_features, notification_path,
+    query_driver_health, realtime_worker, reply, valid_notification, BlackshardMessage,
+    DriverVerdict, FilterConnectCommunicationPort, FilterGetMessage, ProtectionConnection,
+    RealtimeCounters, RealtimeEvent, SharedDetectionEngine, WorkItem,
 };
 use crate::verdict_cache::VerdictCache;
 use std::collections::HashMap;
@@ -163,6 +163,15 @@ pub fn connection_loop(
             "Kernel real-time protection connected",
         ));
         let _ = events.try_send(RealtimeEvent::Connection(ProtectionConnection::Connected));
+        match query_driver_health(port_handle).map(|health| missing_driver_features(health.features))
+        {
+            Ok(missing) if missing.is_empty() => log::info!("Minifilter self-protection is active"),
+            Ok(missing) => log::warn!(
+                "The minifilter loaded without: {}. Check that it was linked with /INTEGRITYCHECK and signed",
+                missing.join(", ")
+            ),
+            Err(error) => log::warn!("Could not read the minifilter's health: {error}"),
+        }
 
         let worker_count = settings
             .read()

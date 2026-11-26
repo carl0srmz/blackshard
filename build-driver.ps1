@@ -154,9 +154,11 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $libraryDirectory = Join-Path $kitsRoot "Lib\$wdkVersion\km\x64"
+# /INTEGRITYCHECK makes Windows check the signature at load; ObRegisterCallbacks and the process
+# notification routine refuse to register for a driver linked without it.
 $linkArguments = @(
     "/nologo", "/MACHINE:X64", "/DRIVER", "/SUBSYSTEM:NATIVE", "/ENTRY:DriverEntry",
-    "/NODEFAULTLIB",
+    "/NODEFAULTLIB", "/INTEGRITYCHECK",
     "/LIBPATH:$libraryDirectory",
     "FltMgr.lib", "ntoskrnl.lib", "hal.lib", "BufferOverflowFastFailK.lib",
     $object,

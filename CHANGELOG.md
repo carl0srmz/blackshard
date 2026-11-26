@@ -7,6 +7,10 @@ changes are listed here, newest first.
 ## Unreleased
 
 ### Security
+- The driver protects itself and the service: `fltmc unload` and `sc stop blackshard` fail, other
+  processes (administrators included) can no longer terminate, suspend or inject into the service,
+  and the driver's and service's registry keys can only be changed after the service was stopped
+  on purpose. Updating or removing the driver now takes effect at the next restart.
 - Once real-time protection has been ready, a program the service cannot judge in time (hung,
   crashed or killed service, bad reply) is blocked instead of allowed, unless it lives in Windows'
   own folders or Program Files. The driver waits up to 30 s for an execution verdict instead of

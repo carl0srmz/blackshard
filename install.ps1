@@ -154,12 +154,10 @@ function Remove-blackshardInstallation {
         & reg.exe delete "HKLM\Software\Classes\CLSID\$amsiClsid" /f "/reg:$registryView" 2>$null | Out-Null
     }
 
-    if (Test-blackshardFilterLoaded) {
-        Write-Host "[*] Unloading blackshard minifilter..." -ForegroundColor Cyan
-        & fltmc.exe unload $driverName | Out-Host
-    }
-
-    & sc.exe stop $driverName 2>$null | Out-Host
+    # The minifilter refuses to unload, so a loaded one is only marked for deletion here and its
+    # file moved aside: it does not load at the next restart, and Windows removes both then.
+    # Its registry key is writable now because the protection service stopped on purpose above.
+    $driverStillLoaded = [bool](Test-blackshardFilterLoaded)
     & sc.exe delete $driverName 2>$null | Out-Host
     Start-Sleep -Seconds 1
 
@@ -179,6 +177,9 @@ function Remove-blackshardInstallation {
     }
 
     Write-Host "[+] blackshard was removed." -ForegroundColor Green
+    if ($driverStillLoaded) {
+        Write-Host "    The minifilter stays loaded until Windows restarts; restart to finish removing it." -ForegroundColor Yellow
+    }
 }
 
 if ($Uninstall) {
@@ -303,10 +304,21 @@ foreach ($provider in @(
     if ($LASTEXITCODE -ne 0) { throw "Could not register the $($provider.View)-bit AMSI provider." }
 }
 
-if ($installDriver) {
+# Drivers since self-protection refuse to unload (`fltmc unload` and `sc stop` both fail), so an
+# upgrade over one replaces the file in place and the new driver loads at the next restart. An
+# older driver still unloads, and is then reinstalled from scratch as before.
+$driverReplacedForRestart = $false
+if ($installDriver -and (Test-blackshardFilterLoaded)) {
+    & fltmc.exe unload $driverName 2>&1 | Out-Host
     if (Test-blackshardFilterLoaded) {
-        & fltmc.exe unload $driverName | Out-Host
+        Remove-FileNowOrAtRestart $destinationDriver
+        Copy-Item -LiteralPath $sourceDriver -Destination $destinationDriver -Force
+        $driverReplacedForRestart = $true
+        Write-Host "[*] The running minifilter cannot be unloaded; the new one loads when Windows restarts." -ForegroundColor Yellow
     }
+}
+
+if ($installDriver -and -not $driverReplacedForRestart) {
     & sc.exe stop $driverName 2>$null | Out-Host
     & sc.exe delete $driverName 2>$null | Out-Host
 
@@ -381,7 +393,7 @@ $regDump
         throw "fltmc reported success, but blackshard is absent from the loaded filter list."
     }
 }
-else {
+elseif (-not $installDriver) {
     Write-Host "[*] Skipping the kernel minifilter; blackshard will run with AMSI coverage." -ForegroundColor Yellow
 }
 Write-Host "[*] Installing blackshard protection service..." -ForegroundColor Cyan
@@ -430,6 +442,9 @@ if (-not $serviceRunning) {
 if ($installDriver) {
     Write-Host "[+] blackshard minifilter and protection service are running." -ForegroundColor Green
     & fltmc.exe instances -f $driverName | Out-Host
+    if ($driverReplacedForRestart) {
+        Write-Host "    Restart Windows to load the new minifilter; until then the service may report a protocol mismatch." -ForegroundColor Yellow
+    }
 }
 else {
     Write-Host "[+] blackshard protection service is running with AMSI coverage." -ForegroundColor Green

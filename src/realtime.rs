@@ -107,7 +107,7 @@ struct DriverHealthReply {
     queue_overloads: u64,
     ready_generation: u64,
     operational_phase: u32,
-    reserved: u32,
+    features: u32,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -157,6 +157,22 @@ pub struct DriverHealthCounters {
     pub queue_overloads: u64,
     pub ready_generation: u64,
     pub operational_phase: DriverOperationalPhase,
+    pub features: u32,
+}
+
+/// Parts of the driver's protection that register separately at load and can be missing.
+const DRIVER_FEATURES: &[(u32, &str)] = &[
+    (0x1, "service process protection"),
+    (0x2, "service registry protection"),
+];
+
+/// The protection parts a driver reporting `features` loaded without.
+pub(crate) fn missing_driver_features(features: u32) -> Vec<&'static str> {
+    DRIVER_FEATURES
+        .iter()
+        .filter(|(bit, _)| features & bit == 0)
+        .map(|(_, name)| *name)
+        .collect()
 }
 
 #[repr(C)]
@@ -350,60 +366,7 @@ impl RealtimeProtection {
     }
 
     pub fn driver_health(&self) -> Result<DriverHealthCounters, String> {
-        let port = self.port.load(Ordering::Acquire);
-        if port == 0 {
-            return Err("the kernel communication port is not connected".to_owned());
-        }
-        let request = DriverControlRequest {
-            magic: BLACKSHARD_PROTOCOL_MAGIC,
-            version: BLACKSHARD_PROTOCOL_VERSION,
-            size: mem::size_of::<DriverControlRequest>() as u16,
-            command: CONTROL_GET_HEALTH,
-            generation: 0,
-        };
-        let mut reply = unsafe { mem::zeroed::<DriverHealthReply>() };
-        let mut returned = 0u32;
-        let result = unsafe {
-            FilterSendMessage(
-                port,
-                (&request as *const DriverControlRequest).cast(),
-                mem::size_of::<DriverControlRequest>() as u32,
-                (&mut reply as *mut DriverHealthReply).cast(),
-                mem::size_of::<DriverHealthReply>() as u32,
-                &mut returned,
-            )
-        };
-        if result != S_OK {
-            return Err(hresult_text(result));
-        }
-        if returned as usize != mem::size_of::<DriverHealthReply>()
-            || reply.magic != BLACKSHARD_PROTOCOL_MAGIC
-            || reply.version != BLACKSHARD_PROTOCOL_VERSION
-            || reply.size as usize != mem::size_of::<DriverHealthReply>()
-        {
-            return Err("the minifilter returned an invalid health record".to_owned());
-        }
-        Ok(DriverHealthCounters {
-            scan_requests: reply.scan_requests,
-            blocks: reply.blocks,
-            timeouts: reply.timeouts,
-            service_unavailable_bypasses: reply.service_unavailable_bypasses,
-            object_resolution_bypasses: reply.object_resolution_bypasses,
-            oversize_path_bypasses: reply.oversize_path_bypasses,
-            irql_bypasses: reply.irql_bypasses,
-            invalid_replies: reply.invalid_replies,
-            dirty_writes: reply.dirty_writes,
-            enforcement_bypasses: reply.enforcement_bypasses,
-            content_race_blocks: reply.content_race_blocks,
-            path_resolution_failures: reply.path_resolution_failures,
-            protocol_mismatches: reply.protocol_mismatches,
-            cache_allows: reply.cache_allows,
-            boot_policy_allows: reply.boot_policy_allows,
-            required_enforcement_blocks: reply.required_enforcement_blocks,
-            queue_overloads: reply.queue_overloads,
-            ready_generation: reply.ready_generation,
-            operational_phase: reply.operational_phase.into(),
-        })
+        query_driver_health(self.port.load(Ordering::Acquire))
     }
 
     pub fn set_ready_generation(&self, generation: u64) -> Result<(), String> {
@@ -444,6 +407,63 @@ impl RealtimeProtection {
         }
         Ok(())
     }
+}
+
+pub(crate) fn query_driver_health(port: HANDLE) -> Result<DriverHealthCounters, String> {
+    if port == 0 {
+        return Err("the kernel communication port is not connected".to_owned());
+    }
+    let request = DriverControlRequest {
+        magic: BLACKSHARD_PROTOCOL_MAGIC,
+        version: BLACKSHARD_PROTOCOL_VERSION,
+        size: mem::size_of::<DriverControlRequest>() as u16,
+        command: CONTROL_GET_HEALTH,
+        generation: 0,
+    };
+    let mut reply = unsafe { mem::zeroed::<DriverHealthReply>() };
+    let mut returned = 0u32;
+    let result = unsafe {
+        FilterSendMessage(
+            port,
+            (&request as *const DriverControlRequest).cast(),
+            mem::size_of::<DriverControlRequest>() as u32,
+            (&mut reply as *mut DriverHealthReply).cast(),
+            mem::size_of::<DriverHealthReply>() as u32,
+            &mut returned,
+        )
+    };
+    if result != S_OK {
+        return Err(hresult_text(result));
+    }
+    if returned as usize != mem::size_of::<DriverHealthReply>()
+        || reply.magic != BLACKSHARD_PROTOCOL_MAGIC
+        || reply.version != BLACKSHARD_PROTOCOL_VERSION
+        || reply.size as usize != mem::size_of::<DriverHealthReply>()
+    {
+        return Err("the minifilter returned an invalid health record".to_owned());
+    }
+    Ok(DriverHealthCounters {
+        scan_requests: reply.scan_requests,
+        blocks: reply.blocks,
+        timeouts: reply.timeouts,
+        service_unavailable_bypasses: reply.service_unavailable_bypasses,
+        object_resolution_bypasses: reply.object_resolution_bypasses,
+        oversize_path_bypasses: reply.oversize_path_bypasses,
+        irql_bypasses: reply.irql_bypasses,
+        invalid_replies: reply.invalid_replies,
+        dirty_writes: reply.dirty_writes,
+        enforcement_bypasses: reply.enforcement_bypasses,
+        content_race_blocks: reply.content_race_blocks,
+        path_resolution_failures: reply.path_resolution_failures,
+        protocol_mismatches: reply.protocol_mismatches,
+        cache_allows: reply.cache_allows,
+        boot_policy_allows: reply.boot_policy_allows,
+        required_enforcement_blocks: reply.required_enforcement_blocks,
+        queue_overloads: reply.queue_overloads,
+        ready_generation: reply.ready_generation,
+        operational_phase: reply.operational_phase.into(),
+        features: reply.features,
+    })
 }
 
 impl Drop for RealtimeProtection {
