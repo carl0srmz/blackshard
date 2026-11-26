@@ -7,6 +7,7 @@ pub mod archive;
 pub mod atomic_file;
 pub mod behavior;
 pub mod boot_scan;
+pub mod canary;
 pub mod config;
 pub mod definitions;
 pub mod detection;

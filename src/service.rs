@@ -411,6 +411,8 @@ mod windows_service_host {
             log::warn!("Ransomware rollback is unavailable: {error}");
         }
         crate::realtime::enable_backup_privilege();
+        // Ransomware decoys in each user's Documents and Pictures.
+        std::thread::spawn(crate::canary::plant);
 
         let health_path = default_service_health_path();
         let started_at = Utc::now();
@@ -775,6 +777,8 @@ mod windows_service_host {
 
             if last_vault_purge.elapsed() >= VAULT_PURGE_INTERVAL {
                 last_vault_purge = Instant::now();
+                // Decoys a person or a trusted program removed, and new users', come back.
+                std::thread::spawn(crate::canary::plant);
                 if let Some(vault) = crate::rollback::global() {
                     vault.purge_expired();
                 }

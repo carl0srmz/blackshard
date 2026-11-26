@@ -968,7 +968,7 @@ fn handle_protected_modification(
         );
         return;
     }
-    let decision = monitor
+    let mut decision = monitor
         .lock()
         .map(|mut monitor| {
             monitor.observe(
@@ -981,6 +981,20 @@ fn handle_protected_modification(
             )
         })
         .unwrap_or_default();
+    // A decoy no person opens: the first program not signed by a trusted publisher to change it
+    // is ransomware, however slowly it goes.
+    if action.is_some()
+        && process_trust != ProcessTrust::Trusted
+        && device_path_to_dos_path(path).is_some_and(|document| crate::canary::is_decoy(&document))
+    {
+        log::warn!(
+            "PID {} changed a ransomware decoy: {path:?}",
+            notification.process_id
+        );
+        decision.alert = true;
+        decision.block = block_mode;
+        decision.distinct_files = decision.distinct_files.max(1);
+    }
     let verdict = if decision.block {
         DriverVerdict::Block
     } else {
