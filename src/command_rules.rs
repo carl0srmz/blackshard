@@ -676,9 +676,108 @@ pub fn judge_autostart(command: &str) -> Option<RuleHit> {
     })
 }
 
+/// System DLLs loaders put next to a signed program so that the program loads theirs instead of
+/// Windows' copy. None of these is a KnownDLL, which Windows would always load from System32.
+const SIDE_LOADED_NAMES: &[&str] = &[
+    "version.dll",
+    "dbghelp.dll",
+    "dbgcore.dll",
+    "wtsapi32.dll",
+    "winhttp.dll",
+    "userenv.dll",
+    "cryptbase.dll",
+    "cryptsp.dll",
+    "dwmapi.dll",
+    "uxtheme.dll",
+    "propsys.dll",
+    "secur32.dll",
+    "sspicli.dll",
+    "profapi.dll",
+    "wldp.dll",
+    "winmm.dll",
+    "msimg32.dll",
+    "mpclient.dll",
+    "libcurl.dll",
+    "dxgi.dll",
+    "d3d11.dll",
+    "iphlpapi.dll",
+    "netapi32.dll",
+    "wininet.dll",
+    "winsta.dll",
+    "edputil.dll",
+    "mscoree.dll",
+];
+
+/// Whether loading `dll` into `host` looks like side-loading: the DLL has the name of a Windows
+/// system DLL, sits in the same folder as the program, and that folder is one a user or a
+/// download can write. The caller also checks that the program is signed and the DLL is not.
+pub fn looks_side_loaded(dll: &str, host: &str) -> bool {
+    let folder = |path: &str| {
+        let path = path
+            .trim_start_matches(r"\\?\")
+            .to_ascii_lowercase()
+            .replace('/', "\\");
+        path.rsplit_once('\\').map(|(folder, _)| folder.to_owned())
+    };
+    let (Some(dll_folder), Some(host_folder)) = (folder(dll), folder(host)) else {
+        return false;
+    };
+    SIDE_LOADED_NAMES.contains(&file_name(dll).as_str())
+        && dll_folder == host_folder
+        && in_user_writable_place(&format!("{dll_folder}\\"))
+}
+
+/// The security zone in a file's `Zone.Identifier` stream, which browsers and mail clients
+/// attach to what they save: 3 is the internet, 4 untrusted sites.
+pub fn download_zone(zone_identifier: &str) -> Option<u32> {
+    zone_identifier.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("ZoneId=")
+            .and_then(|zone| zone.trim().parse().ok())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_system_dll_name_beside_a_program_in_a_user_folder_is_side_loading() {
+        let host = r"C:\Users\x\AppData\Local\Temp\upd\OneDriveUpdater.exe";
+        assert!(looks_side_loaded(
+            r"C:\Users\x\AppData\Local\Temp\upd\version.dll",
+            host
+        ));
+        assert!(looks_side_loaded(
+            r"\\?\C:\ProgramData\app\DBGHELP.DLL",
+            r"\\?\C:\ProgramData\app\tool.exe"
+        ));
+        assert!(
+            !looks_side_loaded(r"C:\Users\x\AppData\Local\Temp\upd\app.dll", host),
+            "not a system name"
+        );
+        assert!(
+            !looks_side_loaded(r"C:\Users\x\Desktop\version.dll", host),
+            "another folder"
+        );
+        assert!(
+            !looks_side_loaded(
+                r"C:\Program Files\Vendor\version.dll",
+                r"C:\Program Files\Vendor\app.exe"
+            ),
+            "installed software bundling its own copy"
+        );
+    }
+
+    #[test]
+    fn the_download_zone_is_read() {
+        assert_eq!(
+            download_zone("[ZoneTransfer]\r\nZoneId=3\r\nReferrerUrl=https://a.test/\r\n"),
+            Some(3)
+        );
+        assert_eq!(download_zone("[ZoneTransfer]\nZoneId=2"), Some(2));
+        assert_eq!(download_zone("garbage"), None);
+    }
 
     fn start(image: &str, command_line: &str) -> Option<&'static str> {
         judge_launch(&Launch {

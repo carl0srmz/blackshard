@@ -723,6 +723,20 @@ pub(crate) fn realtime_worker(
                 report.execution_block_eligible = true;
             }
         }
+        if matches!(
+            notification.operation,
+            OPERATION_EXECUTE_SECTION | OPERATION_PROCESS_CREATE
+        ) && !report.execution_block_eligible
+        {
+            if let Some(reason) = execution_reputation(&path, notification.process_id, &report) {
+                log::warn!("Blocked execution of {path:?}: {reason}");
+                report.execution_block_eligible = true;
+                if report.verdict == DetectionVerdict::Clean {
+                    report.verdict = DetectionVerdict::Suspicious;
+                }
+                report.threat_name.get_or_insert_with(|| reason.to_owned());
+            }
+        }
         let driver_verdict = execution_driver_verdict(&report);
         let reply_accepted = reply(
             item.port,
@@ -1227,6 +1241,39 @@ pub(crate) fn reply(
             mem::size_of::<BlackshardReplyMessage>() as u32,
         ) == S_OK
     }
+}
+
+/// Execution rules a file scan alone cannot apply, because they depend on where the file came
+/// from or who is loading it: an unsigned DLL named like a Windows one beside the signed program
+/// loading it (side-loading), and an unsigned file the engine finds suspicious that was
+/// downloaded from the internet.
+fn execution_reputation(
+    path: &Path,
+    requester: u32,
+    report: &DetectionReport,
+) -> Option<&'static str> {
+    let text = path.to_string_lossy();
+    let lower = text.to_ascii_lowercase();
+    if lower.ends_with(".dll") || lower.ends_with(".ocx") || lower.ends_with(".cpl") {
+        if let Some(host) = process_image_path(requester) {
+            if crate::command_rules::looks_side_loaded(&text, &host.to_string_lossy())
+                && trust::verify_file_cached(&host).is_trusted()
+                && !trust::verify_file_cached(path).is_trusted()
+            {
+                return Some("Behavior.Win.DllSideLoading");
+            }
+        }
+    }
+    if report.verdict == DetectionVerdict::Suspicious {
+        let downloaded = std::fs::read_to_string(format!("{text}:Zone.Identifier"))
+            .ok()
+            .and_then(|zone| crate::command_rules::download_zone(&zone))
+            .is_some_and(|zone| zone >= 3);
+        if downloaded && !trust::verify_file_cached(path).is_trusted() {
+            return Some("Reputation.Win.SuspiciousDownload");
+        }
+    }
+    None
 }
 
 /// The command-line rules' verdict on a process start.
