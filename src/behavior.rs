@@ -261,6 +261,7 @@ fn is_protected_document(path: &Path) -> bool {
         "\\music\\",
         "\\videos\\",
         "\\favorites\\",
+        "\\downloads\\",
         "\\onedrive\\",
         "\\onedrive - ",
     ]
@@ -299,6 +300,21 @@ fn is_protected_document(path: &Path) -> bool {
                 | "avi"
                 | "zip"
                 | "7z"
+                | "odt"
+                | "ods"
+                | "odp"
+                | "heic"
+                | "tif"
+                | "tiff"
+                | "dng"
+                | "cr2"
+                | "nef"
+                | "mkv"
+                | "m4a"
+                | "flac"
+                | "mpg"
+                | "mpeg"
+                | "wmv"
                 | "rar"
                 | "sql"
                 | "db"

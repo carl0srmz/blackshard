@@ -1763,7 +1763,15 @@ BlackshardIsProtectedDocumentName (
         RTL_CONSTANT_STRING(L"zip"), RTL_CONSTANT_STRING(L"7z"),
         RTL_CONSTANT_STRING(L"rar"), RTL_CONSTANT_STRING(L"sql"),
         RTL_CONSTANT_STRING(L"db"), RTL_CONSTANT_STRING(L"sqlite"),
-        RTL_CONSTANT_STRING(L"psd"), RTL_CONSTANT_STRING(L"ai")
+        RTL_CONSTANT_STRING(L"psd"), RTL_CONSTANT_STRING(L"ai"),
+        RTL_CONSTANT_STRING(L"odt"), RTL_CONSTANT_STRING(L"ods"),
+        RTL_CONSTANT_STRING(L"odp"), RTL_CONSTANT_STRING(L"heic"),
+        RTL_CONSTANT_STRING(L"tif"), RTL_CONSTANT_STRING(L"tiff"),
+        RTL_CONSTANT_STRING(L"dng"), RTL_CONSTANT_STRING(L"cr2"),
+        RTL_CONSTANT_STRING(L"nef"), RTL_CONSTANT_STRING(L"mkv"),
+        RTL_CONSTANT_STRING(L"m4a"), RTL_CONSTANT_STRING(L"flac"),
+        RTL_CONSTANT_STRING(L"mpg"), RTL_CONSTANT_STRING(L"mpeg"),
+        RTL_CONSTANT_STRING(L"wmv")
     };
     static const UNICODE_STRING users = RTL_CONSTANT_STRING(L"\\users\\");
     static const UNICODE_STRING protectedFolders[] = {
@@ -1773,6 +1781,7 @@ BlackshardIsProtectedDocumentName (
         RTL_CONSTANT_STRING(L"\\music\\"),
         RTL_CONSTANT_STRING(L"\\videos\\"),
         RTL_CONSTANT_STRING(L"\\favorites\\"),
+        RTL_CONSTANT_STRING(L"\\downloads\\"),
         RTL_CONSTANT_STRING(L"\\onedrive\\"),
         RTL_CONSTANT_STRING(L"\\onedrive - ")
     };

@@ -98,6 +98,29 @@ fn remove_startup_items(target: &str) -> Vec<String> {
     removed
 }
 
+/// Asks Windows' System File Checker to put back a protected Windows file that was removed as
+/// infected: file infectors (Virut, Sality, Ramnit) patch programs in place, and a quarantined
+/// system file would otherwise leave a hole. Only for files in the Windows folder; returns a line
+/// when the checker ran.
+pub fn restore_system_file(path: &Path) -> Option<String> {
+    let comparable_path = comparable(&path.to_string_lossy());
+    if !is_under_windows_folder(&comparable_path) {
+        return None;
+    }
+    let sfc = windows_folder().join(r"System32\sfc.exe");
+    let mut argument = std::ffi::OsString::from("/scanfile=");
+    argument.push(path.as_os_str());
+    let ran = Command::new(sfc)
+        .arg(argument)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .status()
+        .is_ok();
+    ran.then(|| format!("System File Checker restored {}", path.display()))
+}
+
 fn windows_folder() -> PathBuf {
     std::env::var_os("SystemRoot")
         .map(PathBuf::from)

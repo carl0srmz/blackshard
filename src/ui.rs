@@ -604,7 +604,7 @@ impl BlackshardApp {
 
     /// The secret turbo button: protection back on, then a full-speed hunt that stops, removes and
     /// cleans up after whatever it convicts. Triple-click the shard on the status page, or press
-    /// Ctrl+Shift+T anywhere.
+    /// Ctrl+Shift+T in the window, or Ctrl+Alt+Shift+T anywhere on the desktop.
     fn turbo(&mut self) {
         if let Some(running) = self
             .scan_job
@@ -1857,9 +1857,11 @@ impl eframe::App for BlackshardApp {
             return;
         }
 
+        start_global_turbo_hotkey(ctx);
         if ctx.input(|input| {
             input.modifiers.ctrl && input.modifiers.shift && input.key_pressed(egui::Key::T)
-        }) {
+        }) || GLOBAL_TURBO.swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
             self.turbo();
         }
         self.follow_pause();
@@ -2520,6 +2522,65 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{} B", bytes as u64)
     }
+}
+
+/// Set when Ctrl+Alt+Shift+T is pressed anywhere on the desktop.
+static GLOBAL_TURBO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Registers Ctrl+Alt+Shift+T with Windows, once, so turbo works when a full-screen locker or a
+/// flood of windows keeps blackshard's own window, and its Ctrl+Shift+T, out of reach. The key is
+/// delivered to a thread of its own, which wakes the UI.
+fn start_global_turbo_hotkey(ctx: &egui::Context) {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            #[repr(C)]
+            struct Message {
+                window: isize,
+                message: u32,
+                wparam: usize,
+                lparam: isize,
+                time: u32,
+                x: i32,
+                y: i32,
+                private: u32,
+            }
+            #[link(name = "user32")]
+            extern "system" {
+                fn RegisterHotKey(window: isize, id: i32, modifiers: u32, key: u32) -> i32;
+                fn GetMessageW(message: *mut Message, window: isize, first: u32, last: u32) -> i32;
+            }
+            const MOD_ALT: u32 = 0x1;
+            const MOD_CONTROL: u32 = 0x2;
+            const MOD_SHIFT: u32 = 0x4;
+            const MOD_NOREPEAT: u32 = 0x4000;
+            const WM_HOTKEY: u32 = 0x0312;
+            let modifiers = MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT;
+            if unsafe { RegisterHotKey(0, 1, modifiers, u32::from(b'T')) } == 0 {
+                log::warn!(
+                    "Ctrl+Alt+Shift+T is taken by another program; turbo stays in-window only"
+                );
+                return;
+            }
+            let mut message = Message {
+                window: 0,
+                message: 0,
+                wparam: 0,
+                lparam: 0,
+                time: 0,
+                x: 0,
+                y: 0,
+                private: 0,
+            };
+            while unsafe { GetMessageW(&mut message, 0, 0, 0) } > 0 {
+                if message.message == WM_HOTKEY {
+                    GLOBAL_TURBO.store(true, std::sync::atomic::Ordering::Release);
+                    ctx.request_repaint();
+                }
+            }
+        });
+    });
 }
 
 /// The turbo hunt's repairs as a sentence for the notice: the first few by name.
