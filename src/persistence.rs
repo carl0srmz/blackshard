@@ -5,17 +5,20 @@
 //! either way, so the Run and RunOnce entries that launch it are removed with it: machine-wide,
 //! in the 32-bit view, and in every user hive that is loaded.
 //!
-//! Scheduled tasks and Win32 services that launch the file are removed too. Startup-folder
-//! shortcuts and WMI subscriptions are the next places to clean. Paths written with 8.3 short
-//! names are not matched.
+//! Scheduled tasks, Win32 services (by program or service DLL), Startup-folder items, AppInit
+//! DLLs, the Winlogon shell, debugger and silent-exit hijacks, per-user COM hijacks, Active Setup,
+//! BITS jobs and WMI subscriptions that launch the file are removed too. [`sweep_autostarts`]
+//! removes, from the same places, whatever the command-line rules condemn, which is how fileless
+//! malware is cleaned up. Paths written with 8.3 short names are not matched.
 
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use windows_sys::Win32::System::Registry::{
-    RegCloseKey, RegDeleteValueW, RegEnumKeyExW, RegEnumValueW, RegGetValueW, RegOpenKeyExW, HKEY,
-    HKEY_LOCAL_MACHINE, HKEY_USERS, KEY_ENUMERATE_SUB_KEYS, KEY_QUERY_VALUE, KEY_SET_VALUE,
-    KEY_WOW64_64KEY, REG_EXPAND_SZ, REG_SZ, RRF_RT_DWORD, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
+    RegCloseKey, RegDeleteTreeW, RegDeleteValueW, RegEnumKeyExW, RegEnumValueW, RegGetValueW,
+    RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_LOCAL_MACHINE, HKEY_USERS, KEY_ENUMERATE_SUB_KEYS,
+    KEY_QUERY_VALUE, KEY_SET_VALUE, KEY_WOW64_64KEY, REG_EXPAND_SZ, REG_SZ, RRF_RT_DWORD,
+    RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
 };
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -107,6 +110,11 @@ fn is_under_windows_folder(target: &str) -> bool {
 }
 
 fn remove_tasks(target: &str) -> Vec<String> {
+    remove_tasks_where(&|line| launches(line, None, target))
+}
+
+/// Deletes every scheduled task with an action `condemns` says is malicious.
+fn remove_tasks_where(condemns: &dyn Fn(&str) -> bool) -> Vec<String> {
     let tasks_folder = windows_folder().join(r"System32\Tasks");
     let mut found = Vec::new();
     collect_task_files(&tasks_folder, &tasks_folder, 0, &mut found);
@@ -116,7 +124,7 @@ fn remove_tasks(target: &str) -> Vec<String> {
     for (name, definition) in found {
         let launches_target = crate::remediation::task_command_lines(&definition)
             .iter()
-            .any(|line| launches(line, None, target));
+            .any(|line| condemns(line));
         if !launches_target {
             continue;
         }
@@ -177,6 +185,11 @@ fn collect_task_files(
 }
 
 fn remove_services(target: &str) -> Vec<String> {
+    remove_services_where(&|command| launches(command, None, target))
+}
+
+/// Stops and deletes every Win32 service whose program or DLL `condemns` says is malicious.
+fn remove_services_where(condemns: &dyn Fn(&str) -> bool) -> Vec<String> {
     const SERVICES: &str = r"SYSTEM\CurrentControlSet\Services";
     let sc = windows_folder().join(r"System32\sc.exe");
     let mut removed = Vec::new();
@@ -198,7 +211,7 @@ fn remove_services(target: &str) -> Vec<String> {
         let Some(image_path) = [image_path, service_dll]
             .into_iter()
             .flatten()
-            .find(|command| launches(command, None, target))
+            .find(|command| condemns(command))
         else {
             continue;
         };
@@ -276,7 +289,7 @@ pub fn remove_autostarts_for(target: &Path) -> Vec<String> {
     if target.is_empty() {
         return Vec::new();
     }
-    let mut removed = Vec::new();
+    let mut removed = more_autostarts_for(&target);
     for key in RUN_KEYS {
         removed.extend(clean_key(HKEY_LOCAL_MACHINE, "HKLM", key, None, &target));
     }
@@ -306,6 +319,19 @@ fn clean_key(
     path: &str,
     profile: Option<&str>,
     target: &str,
+) -> Vec<String> {
+    clean_key_where(root, root_name, path, profile, &|command, profile| {
+        launches(command, profile, target)
+    })
+}
+
+/// Deletes every string value under `path` whose command `condemns` says is malicious.
+fn clean_key_where(
+    root: HKEY,
+    root_name: &str,
+    path: &str,
+    profile: Option<&str>,
+    condemns: &dyn Fn(&str, Option<&str>) -> bool,
 ) -> Vec<String> {
     let Some(key) = open(root, path, KEY_QUERY_VALUE | KEY_SET_VALUE) else {
         return Vec::new();
@@ -338,7 +364,7 @@ fn clean_key(
             continue;
         }
         let command = utf16_bytes(&data[..data_length as usize]);
-        if launches(&command, profile, target) {
+        if condemns(&command, profile) {
             name.truncate(name_length as usize);
             matches.push((name, command));
         }
@@ -486,6 +512,353 @@ fn utf16_bytes(bytes: &[u8]) -> String {
         .take_while(|unit| *unit != 0)
         .collect::<Vec<_>>();
     String::from_utf16_lossy(&units)
+}
+
+/// Registered with Windows to run a DLL in every program, or a program at sign-in.
+const APPINIT_KEYS: [&str; 2] = [
+    r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows",
+    r"SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion\Windows",
+];
+const WINLOGON_KEYS: [&str; 2] = [
+    r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon",
+    r"SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion\Winlogon",
+];
+const IFEO: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options";
+const SILENT_PROCESS_EXIT: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\SilentProcessExit";
+const ACTIVE_SETUP_KEYS: [&str; 2] = [
+    r"SOFTWARE\Microsoft\Active Setup\Installed Components",
+    r"SOFTWARE\WOW6432Node\Microsoft\Active Setup\Installed Components",
+];
+/// More than a user hive ever holds legitimately; a bound on how long a walk can take.
+const MAX_SUBKEYS: usize = 20_000;
+
+/// The places beyond Run keys, tasks, services and Startup folders that make Windows start a
+/// program or load a DLL: AppInit_DLLs, the per-user `Load` and `Run` values, the Winlogon shell
+/// and Userinit, debugger and silent-exit hijacks, per-user COM hijacks, Active Setup, BITS jobs
+/// and WMI subscriptions. Removes those that name `target`.
+fn more_autostarts_for(target: &str) -> Vec<String> {
+    let names = |command: &str, profile: Option<&str>| launches(command, profile, target);
+    let mut removed = Vec::new();
+    for key in APPINIT_KEYS {
+        if let Some(value) = registry_string(HKEY_LOCAL_MACHINE, key, "AppInit_DLLs") {
+            let kept: Vec<&str> = value
+                .split([' ', ','])
+                .filter(|dll| !dll.is_empty() && !names(dll, None))
+                .collect();
+            if kept.len()
+                != value
+                    .split([' ', ','])
+                    .filter(|dll| !dll.is_empty())
+                    .count()
+                && set_string(HKEY_LOCAL_MACHINE, key, "AppInit_DLLs", &kept.join(" "))
+            {
+                removed.push(format!(r"HKLM\{key}: AppInit_DLLs entry"));
+            }
+        }
+    }
+    for key in WINLOGON_KEYS {
+        let system32 = windows_folder().join("system32");
+        for (value, default) in [
+            ("Shell", "explorer.exe".to_owned()),
+            ("Userinit", format!(r"{}\userinit.exe,", system32.display())),
+        ] {
+            if registry_string(HKEY_LOCAL_MACHINE, key, value)
+                .is_some_and(|command| names(&command, None))
+                && set_string(HKEY_LOCAL_MACHINE, key, value, &default)
+            {
+                removed.push(format!(r"HKLM\{key}: {value} reset to {default}"));
+            }
+        }
+    }
+    for program in subkeys(HKEY_LOCAL_MACHINE, IFEO)
+        .into_iter()
+        .take(MAX_SUBKEYS)
+    {
+        let key = format!(r"{IFEO}\{program}");
+        if registry_string(HKEY_LOCAL_MACHINE, &key, "Debugger")
+            .is_some_and(|command| names(&command, None))
+            && delete_value(HKEY_LOCAL_MACHINE, &key, "Debugger")
+        {
+            removed.push(format!("debugger hijack of {program}"));
+        }
+    }
+    for program in subkeys(HKEY_LOCAL_MACHINE, SILENT_PROCESS_EXIT)
+        .into_iter()
+        .take(MAX_SUBKEYS)
+    {
+        let key = format!(r"{SILENT_PROCESS_EXIT}\{program}");
+        if registry_string(HKEY_LOCAL_MACHINE, &key, "MonitorProcess")
+            .is_some_and(|command| names(&command, None))
+            && delete_tree(HKEY_LOCAL_MACHINE, &key)
+        {
+            removed.push(format!("silent-exit hijack of {program}"));
+        }
+    }
+    for key in ACTIVE_SETUP_KEYS {
+        for component in subkeys(HKEY_LOCAL_MACHINE, key)
+            .into_iter()
+            .take(MAX_SUBKEYS)
+        {
+            let path = format!(r"{key}\{component}");
+            if registry_string(HKEY_LOCAL_MACHINE, &path, "StubPath")
+                .is_some_and(|command| names(&command, None))
+                && delete_tree(HKEY_LOCAL_MACHINE, &path)
+            {
+                removed.push(format!("Active Setup component {component}"));
+            }
+        }
+    }
+    for sid in subkeys(HKEY_USERS, "") {
+        if let Some(user) = sid.strip_suffix("_Classes") {
+            // A per-user COM registration shadows the machine's: a hijack needs no administrator.
+            let profile = profile_path(user);
+            let classes = format!(r"{sid}\CLSID");
+            for clsid in subkeys(HKEY_USERS, &classes).into_iter().take(MAX_SUBKEYS) {
+                let hijacked = ["InprocServer32", "LocalServer32"].iter().any(|server| {
+                    registry_string(HKEY_USERS, &format!(r"{classes}\{clsid}\{server}"), "")
+                        .is_some_and(|command| names(&command, profile.as_deref()))
+                });
+                if hijacked && delete_tree(HKEY_USERS, &format!(r"{classes}\{clsid}")) {
+                    removed.push(format!("per-user COM registration {clsid}"));
+                }
+            }
+            continue;
+        }
+        let profile = profile_path(&sid);
+        let key = format!(r"{sid}\Software\Microsoft\Windows NT\CurrentVersion\Windows");
+        for value in ["Load", "Run"] {
+            if registry_string(HKEY_USERS, &key, value)
+                .is_some_and(|command| names(&command, profile.as_deref()))
+                && delete_value(HKEY_USERS, &key, value)
+            {
+                removed.push(format!(r"HKU\{key}: {value}"));
+            }
+        }
+    }
+    removed.extend(cancel_bits_jobs_where(&|command| names(command, None)));
+    removed.extend(remove_wmi_consumers_where(&|command| names(command, None)));
+    removed
+}
+
+/// Removes every autostart, wherever Windows keeps it, whose command the command-line rules
+/// condemn: a Run value that runs JavaScript through rundll32 (Poweliks), mshta fetching a page,
+/// PowerShell downloading and running code. Fileless malware has no file to quarantine; this
+/// entry is all there is of it on disk.
+pub fn sweep_autostarts() -> Vec<String> {
+    let condemns = |command: &str, profile: Option<&str>| {
+        crate::command_rules::judge_autostart(&expand(command, profile)).is_some()
+    };
+    let mut removed = Vec::new();
+    for key in RUN_KEYS {
+        removed.extend(clean_key_where(
+            HKEY_LOCAL_MACHINE,
+            "HKLM",
+            key,
+            None,
+            &condemns,
+        ));
+    }
+    for sid in subkeys(HKEY_USERS, "") {
+        if sid.ends_with("_Classes") {
+            continue;
+        }
+        let profile = profile_path(&sid);
+        for key in RUN_KEYS {
+            removed.extend(clean_key_where(
+                HKEY_USERS,
+                "HKU",
+                &format!(r"{sid}\{key}"),
+                profile.as_deref(),
+                &condemns,
+            ));
+        }
+        let key = format!(r"{sid}\Software\Microsoft\Windows NT\CurrentVersion\Windows");
+        for value in ["Load", "Run"] {
+            if registry_string(HKEY_USERS, &key, value)
+                .is_some_and(|command| condemns(&command, profile.as_deref()))
+                && delete_value(HKEY_USERS, &key, value)
+            {
+                removed.push(format!(r"HKU\{key}: {value}"));
+            }
+        }
+    }
+    let by_rule = |command: &str| condemns(command, None);
+    removed.extend(remove_tasks_where(&by_rule));
+    removed.extend(remove_services_where(&by_rule));
+    removed.extend(cancel_bits_jobs_where(&by_rule));
+    removed.extend(remove_wmi_consumers_where(&|command| {
+        by_rule(command)
+            || crate::command_rules::judge_script(&command.to_ascii_lowercase()).is_some()
+    }));
+    removed
+}
+
+fn set_string(root: HKEY, path: &str, name: &str, value: &str) -> bool {
+    let Some(key) = open(root, path, KEY_SET_VALUE) else {
+        return false;
+    };
+    let name = wide(name);
+    let data = wide(value);
+    let status = unsafe {
+        RegSetValueExW(
+            key,
+            name.as_ptr(),
+            0,
+            REG_SZ,
+            data.as_ptr().cast(),
+            (data.len() * 2) as u32,
+        )
+    };
+    unsafe { RegCloseKey(key) };
+    status == 0
+}
+
+fn delete_value(root: HKEY, path: &str, name: &str) -> bool {
+    let Some(key) = open(root, path, KEY_SET_VALUE) else {
+        return false;
+    };
+    let name = wide(name);
+    let status = unsafe { RegDeleteValueW(key, name.as_ptr()) };
+    unsafe { RegCloseKey(key) };
+    status == 0
+}
+
+fn delete_tree(root: HKEY, path: &str) -> bool {
+    let path = wide(path);
+    unsafe { RegDeleteTreeW(root, path.as_ptr()) == 0 }
+}
+
+/// Runs a fixed PowerShell script, with anything that came from the machine passed in
+/// environment variables rather than written into the script, so a hostile name cannot become
+/// code run as SYSTEM.
+fn run_powershell(script: &str, variables: &[(&str, &str)]) -> Option<String> {
+    let powershell = windows_folder().join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+    let mut command = Command::new(powershell);
+    command
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW);
+    for (name, value) in variables {
+        command.env(name, value);
+    }
+    let output = command.output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// What a WMI event consumer runs: `CommandLineEventConsumer`s run a program, and
+/// `ActiveScriptEventConsumer`s run script; both are how fileless malware outlives a reboot.
+/// Each line is `class<TAB>base64(name)<TAB>base64(command or script)`, so nothing a consumer
+/// contains can break the format.
+const LIST_WMI_CONSUMERS: &str = r#"$ErrorActionPreference = 'SilentlyContinue'
+function b($v) { [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([string]$v)) }
+foreach ($c in Get-CimInstance -Namespace root/subscription -ClassName CommandLineEventConsumer) {
+  [Console]::Out.WriteLine('CommandLineEventConsumer' + "`t" + (b $c.Name) + "`t" + (b ([string]$c.ExecutablePath + ' ' + [string]$c.CommandLineTemplate)))
+}
+foreach ($c in Get-CimInstance -Namespace root/subscription -ClassName ActiveScriptEventConsumer) {
+  [Console]::Out.WriteLine('ActiveScriptEventConsumer' + "`t" + (b $c.Name) + "`t" + (b ([string]$c.ScriptFileName + ' ' + [string]$c.ScriptText)))
+}"#;
+
+/// Removes one consumer, the bindings that fire it, and the filters only they used.
+const REMOVE_WMI_CONSUMER: &str = r#"$ErrorActionPreference = 'SilentlyContinue'
+$class = $env:BLACKSHARD_WMI_CLASS; $name = $env:BLACKSHARD_WMI_NAME
+foreach ($binding in Get-CimInstance -Namespace root/subscription -ClassName __FilterToConsumerBinding) {
+  if ($binding.Consumer.Name -eq $name) {
+    $filter = $binding.Filter.Name
+    Remove-CimInstance -InputObject $binding
+    Get-CimInstance -Namespace root/subscription -ClassName __EventFilter | Where-Object { $_.Name -eq $filter } | Remove-CimInstance
+  }
+}
+Get-CimInstance -Namespace root/subscription -ClassName $class | Where-Object { $_.Name -eq $name } | Remove-CimInstance"#;
+
+fn remove_wmi_consumers_where(condemns: &dyn Fn(&str) -> bool) -> Vec<String> {
+    use base64::Engine;
+    let decode = |text: &str| {
+        base64::engine::general_purpose::STANDARD
+            .decode(text.trim())
+            .ok()
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    };
+    let Some(listing) = run_powershell(LIST_WMI_CONSUMERS, &[]) else {
+        return Vec::new();
+    };
+    let mut removed = Vec::new();
+    for line in listing.lines() {
+        let mut fields = line.split('\t');
+        let (Some(class), Some(name), Some(command)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if !matches!(
+            class,
+            "CommandLineEventConsumer" | "ActiveScriptEventConsumer"
+        ) {
+            continue;
+        }
+        let (Some(name), Some(command)) = (decode(name), decode(command)) else {
+            continue;
+        };
+        if condemns(&command)
+            && run_powershell(
+                REMOVE_WMI_CONSUMER,
+                &[
+                    ("BLACKSHARD_WMI_CLASS", class),
+                    ("BLACKSHARD_WMI_NAME", &name),
+                ],
+            )
+            .is_some()
+        {
+            log::warn!("Removed WMI {class} {name}: {command}");
+            removed.push(format!("WMI {class}: {name}"));
+        }
+    }
+    removed
+}
+
+/// Cancels BITS jobs, in every account, whose completion command `condemns` says is malicious:
+/// a BITS job can rerun its command each time it finishes, which some loaders use to persist.
+fn cancel_bits_jobs_where(condemns: &dyn Fn(&str) -> bool) -> Vec<String> {
+    let bitsadmin = windows_folder().join(r"System32\bitsadmin.exe");
+    let Ok(output) = Command::new(&bitsadmin)
+        .args(["/list", "/allusers", "/verbose"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+    else {
+        return Vec::new();
+    };
+    let listing = String::from_utf8_lossy(&output.stdout);
+    let mut removed = Vec::new();
+    for job in crate::remediation::bits_jobs(&listing) {
+        if !condemns(&job.notify_command) {
+            continue;
+        }
+        let cancelled = Command::new(&bitsadmin)
+            .args(["/cancel", &job.guid])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .status()
+            .is_ok_and(|status| status.success());
+        if cancelled {
+            log::warn!("Cancelled BITS job {}: {}", job.guid, job.notify_command);
+            removed.push(format!("BITS job {}", job.guid));
+        }
+    }
+    removed
 }
 
 #[cfg(test)]

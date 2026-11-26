@@ -1557,8 +1557,8 @@ mod windows_transport {
                             .map_err(|_| internal("settings lock"))? = resumed.clone();
                         settings = resumed;
                     }
+                    let frozen = Arc::new(Mutex::new(None::<crate::realtime::Frozen>));
                     if let Some(pause) = pause {
-                        let frozen = Arc::new(Mutex::new(None::<crate::realtime::Frozen>));
                         let freezing = Arc::clone(&frozen);
                         // On the scan's thread: checking every new program's signature takes a
                         // moment, and the caller should hear back at once.
@@ -1569,29 +1569,36 @@ mod windows_transport {
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(programs);
                         });
-                        finish = Box::new(move || {
-                            let mut repairs = crate::repair::repair_after_pause(pause);
-                            let frozen = frozen
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                                .take();
-                            if let Some(frozen) = frozen {
-                                if frozen.len() > 0 {
-                                    repairs.insert(
-                                        0,
-                                        format!(
-                                            "froze {} program(s) started during the pause",
-                                            frozen.len()
-                                        ),
-                                    );
-                                }
-                                // Resumes whatever the hunt did not convict, after the repairs, so
-                                // nothing it missed can race them.
-                                drop(frozen);
-                            }
-                            repairs
-                        });
                     }
+                    finish = Box::new(move || {
+                        // Every hunt: autostarts the command-line rules condemn, which is all
+                        // there is on disk of fileless malware.
+                        let mut repairs = crate::persistence::sweep_autostarts();
+                        // Only the hunt that ends an administrator's pause may put back what
+                        // changed during it.
+                        if let Some(pause) = pause {
+                            repairs.extend(crate::repair::repair_after_pause(pause));
+                        }
+                        let frozen = frozen
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .take();
+                        if let Some(frozen) = frozen {
+                            if frozen.len() > 0 {
+                                repairs.insert(
+                                    0,
+                                    format!(
+                                        "froze {} program(s) started during the pause",
+                                        frozen.len()
+                                    ),
+                                );
+                            }
+                            // Resumes whatever the hunt did not convict, after the repairs, so
+                            // nothing it missed can race them.
+                            drop(frozen);
+                        }
+                        repairs
+                    });
                     settings.low_resource_mode = false;
                     settings.worker_count = std::thread::available_parallelism()
                         .map(usize::from)

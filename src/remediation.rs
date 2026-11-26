@@ -60,6 +60,51 @@ pub fn command_names_path(command: &str, target: &str) -> bool {
     })
 }
 
+/// A BITS job and the command it runs when it finishes, from `bitsadmin /list /verbose`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BitsJob {
+    pub guid: String,
+    pub notify_command: String,
+}
+
+/// Reads the jobs that have a completion command out of `bitsadmin /list /allusers /verbose`.
+/// The command is printed as `'program' 'arguments'`.
+pub fn bits_jobs(listing: &str) -> Vec<BitsJob> {
+    let mut jobs = Vec::new();
+    let mut guid: Option<String> = None;
+    for line in listing.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("GUID:") {
+            guid = rest
+                .find('{')
+                .and_then(|start| {
+                    rest[start..]
+                        .find('}')
+                        .map(|end| &rest[start..start + end + 1])
+                })
+                .map(str::to_owned);
+        } else if let Some(rest) = line.strip_prefix("NOTIFICATION COMMAND LINE:") {
+            let command = rest.trim();
+            if command.is_empty() || command.eq_ignore_ascii_case("none") {
+                continue;
+            }
+            let command = command
+                .split('\'')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            if let Some(guid) = &guid {
+                jobs.push(BitsJob {
+                    guid: guid.clone(),
+                    notify_command: command,
+                });
+            }
+        }
+    }
+    jobs
+}
+
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty()
         && haystack
@@ -112,6 +157,23 @@ fn decode_entities(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bits_jobs_with_a_completion_command_are_read() {
+        let listing = "GUID: {6F1C1D2A-0000-4000-8000-000000000001} DISPLAY: 'update'
+TYPE: DOWNLOAD STATE: TRANSFERRED OWNER: PC\\x
+NOTIFICATION COMMAND LINE: 'C:\\Windows\\System32\\cmd.exe' '/c C:\\Users\\x\\a.exe'
+GUID: {6F1C1D2A-0000-4000-8000-000000000002} DISPLAY: 'plain'
+NOTIFICATION COMMAND LINE: none
+";
+        assert_eq!(
+            bits_jobs(listing),
+            vec![BitsJob {
+                guid: "{6F1C1D2A-0000-4000-8000-000000000001}".to_owned(),
+                notify_command: r"C:\Windows\System32\cmd.exe /c C:\Users\x\a.exe".to_owned(),
+            }]
+        );
+    }
 
     #[test]
     fn a_command_names_a_path_only_as_a_whole() {

