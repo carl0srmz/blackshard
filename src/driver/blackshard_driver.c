@@ -1844,7 +1844,7 @@ BlackshardIsAdministratorOnlyImage (
         return FALSE;
     }
     relative.Buffer = NameInfo->Name.Buffer + NameInfo->Volume.Length / sizeof(WCHAR);
-    relative.Length = NameInfo->Name.Length - NameInfo->Volume.Length;
+    relative.Length = (USHORT)(NameInfo->Name.Length - NameInfo->Volume.Length);
     relative.MaximumLength = relative.Length;
 
     underRoot = FALSE;
@@ -2150,7 +2150,7 @@ BlackshardRegisterSelfProtection (
 
     RtlZeroMemory(&registration, sizeof(registration));
     registration.Version = OB_FLT_REGISTRATION_VERSION;
-    registration.OperationRegistrationCount = RTL_NUMBER_OF(operations);
+    registration.OperationRegistrationCount = (USHORT)RTL_NUMBER_OF(operations);
     registration.Altitude = altitude;
     registration.OperationRegistration = operations;
     status = ObRegisterCallbacks(&registration, &gBlackshardData.ObjectCallbacks);
@@ -2335,7 +2335,7 @@ BlackshardIsProtectedRegistryKey (
     _In_ PCUNICODE_STRING KeyName
     )
 {
-    static const UNICODE_STRING system = RTL_CONSTANT_STRING(L"\\REGISTRY\\MACHINE\\SYSTEM\\");
+    static const UNICODE_STRING systemHive = RTL_CONSTANT_STRING(L"\\REGISTRY\\MACHINE\\SYSTEM\\");
     /*
      * Below a control set, so ControlSet001, ControlSet002 and CurrentControlSet all match. The
      * Safe Mode entries are covered too: removing them and rebooting into Safe Mode would start
@@ -2356,11 +2356,11 @@ BlackshardIsProtectedRegistryKey (
 
     PAGED_CODE();
 
-    if (!RtlPrefixUnicodeString(&system, KeyName, TRUE)) {
+    if (!RtlPrefixUnicodeString(&systemHive, KeyName, TRUE)) {
         return FALSE;
     }
-    rest.Buffer = KeyName->Buffer + system.Length / sizeof(WCHAR);
-    rest.Length = KeyName->Length - system.Length;
+    rest.Buffer = KeyName->Buffer + systemHive.Length / sizeof(WCHAR);
+    rest.Length = (USHORT)(KeyName->Length - systemHive.Length);
     for (skipped = 0;
          skipped < rest.Length / sizeof(WCHAR) && rest.Buffer[skipped] != L'\\';
          skipped++) {
@@ -2370,7 +2370,7 @@ BlackshardIsProtectedRegistryKey (
     rest.MaximumLength = rest.Length;
 
     for (index = 0; index < RTL_NUMBER_OF(protectedKeys); index++) {
-        keyCharacters = protectedKeys[index].Length / sizeof(WCHAR);
+        keyCharacters = (USHORT)(protectedKeys[index].Length / sizeof(WCHAR));
         if (RtlPrefixUnicodeString(&protectedKeys[index], &rest, TRUE) &&
             (rest.Length == protectedKeys[index].Length ||
              rest.Buffer[keyCharacters] == L'\\')) {
@@ -2394,7 +2394,7 @@ BlackshardAllocateNotification (
     PBLACKSHARD_NOTIFICATION notification;
     ULONG pathLength;
 
-    pathLength = Path->Length / sizeof(WCHAR);
+    pathLength = (ULONG)(Path->Length / sizeof(WCHAR));
     if (pathLength == 0 || pathLength >= MAX_FILE_PATH_LENGTH) {
         return NULL;
     }
