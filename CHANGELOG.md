@@ -7,6 +7,11 @@ changes are listed here, newest first.
 ## Unreleased
 
 ### Security
+- More ways of destroying a protected document now count as modifications, and the original is
+  copied to the rollback vault first: opening it with truncation (overwrite or supersede),
+  shrinking it through its end of file or allocation size, mapping it for writing, opening it
+  delete-on-close, and giving it a hard link. Edits through a mapped view also invalidate cached
+  verdicts for the file.
 - The driver now reports every process start (image, command line, parent and creating process)
   and every DLL load to the service. A process whose image is detected is refused at creation,
   process starts are logged with their command lines, and ransomware alerts name how the

@@ -2,7 +2,7 @@
 #include <dontuse.h>
 
 #define BLACKSHARD_PROTOCOL_MAGIC 0x35485342UL
-#define BLACKSHARD_PROTOCOL_VERSION 8
+#define BLACKSHARD_PROTOCOL_VERSION 9
 #define BLACKSHARD_PORT_NAME L"\\BlackshardPort"
 #define BLACKSHARD_STREAM_CONTEXT_TAG 'cShB'
 #define BLACKSHARD_NOTIFICATION_TAG 'nShB'
@@ -425,6 +425,19 @@ BlackshardAllocateNotification (
     _In_ PCUNICODE_STRING Path
     );
 
+BOOLEAN
+BlackshardAskService (
+    _In_ __drv_freesMem(Mem) PBLACKSHARD_NOTIFICATION Notification,
+    _In_ LONGLONG TimeoutMs,
+    _Out_ PBOOLEAN Block,
+    _Out_ BLACKSHARD_FAILURE_REASON *Failure
+    );
+
+BOOLEAN
+BlackshardEvaluateTruncatingOpen (
+    _Inout_ PFLT_CALLBACK_DATA Data
+    );
+
 NTSTATUS
 BlackshardGetOrCreateStreamContext (
     _In_ PCFLT_RELATED_OBJECTS FltObjects,
@@ -451,6 +464,7 @@ BlackshardGetOrCreateStreamContext (
 #pragma alloc_text(INIT, BlackshardRegisterProcessNotifications)
 #pragma alloc_text(PAGE, BlackshardUnregisterProcessNotifications)
 #pragma alloc_text(PAGE, BlackshardProcessNotify)
+#pragma alloc_text(PAGE, BlackshardEvaluateTruncatingOpen)
 
 CONST FLT_CONTEXT_REGISTRATION Contexts[] = {
     {
@@ -838,16 +852,34 @@ BlackshardPreCreate (
     }
 
     createDisposition = (UCHAR)(Data->Iopb->Parameters.Create.Options >> 24);
-    if (createDisposition == FILE_CREATE ||
-        createDisposition == FILE_SUPERSEDE ||
+    if (createDisposition == FILE_SUPERSEDE ||
         createDisposition == FILE_OVERWRITE ||
         createDisposition == FILE_OVERWRITE_IF) {
+        //
+        // An open that replaces a file empties it before any write is seen, so a protected
+        // document is reported (and copied to the rollback vault) now. A file being replaced is
+        // not scanned.
+        //
+        if (gBlackshardData.ClientPort != NULL &&
+            KeGetCurrentIrql() == PASSIVE_LEVEL &&
+            !KeAreAllApcsDisabled() &&
+            IoGetTopLevelIrp() == NULL &&
+            BlackshardEvaluateTruncatingOpen(Data)) {
+            Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+            Data->IoStatus.Information = 0;
+            InterlockedIncrement64(&gBlackshardData.Blocks);
+            return FLT_PREOP_COMPLETE;
+        }
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+    if (createDisposition == FILE_CREATE) {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
     desiredAccess = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
     if ((desiredAccess &
-         (FILE_READ_DATA | FILE_EXECUTE | GENERIC_READ | GENERIC_EXECUTE)) == 0) {
+         (FILE_READ_DATA | FILE_EXECUTE | GENERIC_READ | GENERIC_EXECUTE)) == 0 &&
+        !FlagOn(Data->Iopb->Parameters.Create.Options, FILE_DELETE_ON_CLOSE)) {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
@@ -902,14 +934,33 @@ BlackshardPostCreate (
         return FLT_POSTOP_FINISHED_PROCESSING;
     }
 
-    block = BlackshardEvaluateOpenedObject(
-        Data,
-        FltObjects,
-        BLACKSHARD_OPERATION_OPEN,
-        FALSE,
-        desiredAccess,
-        TRUE
-        );
+    //
+    // A delete-on-close open deletes the file when its last handle closes, so it is reported as a
+    // deletion now, while the document can still be copied and the open still refused.
+    //
+    if (FlagOn(Data->Iopb->Parameters.Create.Options, FILE_DELETE_ON_CLOSE) &&
+        BlackshardEvaluateOpenedObject(
+            Data,
+            FltObjects,
+            BLACKSHARD_OPERATION_PROTECTED_METADATA,
+            FALSE,
+            0,
+            TRUE
+            )) {
+        block = TRUE;
+    } else if ((desiredAccess &
+                (FILE_READ_DATA | FILE_EXECUTE | GENERIC_READ | GENERIC_EXECUTE)) != 0) {
+        block = BlackshardEvaluateOpenedObject(
+            Data,
+            FltObjects,
+            BLACKSHARD_OPERATION_OPEN,
+            FALSE,
+            desiredAccess,
+            TRUE
+            );
+    } else {
+        block = FALSE;
+    }
 
     if (!block) {
         return FLT_POSTOP_FINISHED_PROCESSING;
@@ -950,12 +1001,30 @@ BlackshardPreWrite (
         *CompletionContext = NULL;
     }
 
-    if (Data->RequestorMode != UserMode ||
-        KeGetCurrentIrql() > APC_LEVEL ||
+    if (KeGetCurrentIrql() > APC_LEVEL ||
         Data->Iopb->Parameters.Write.Length == 0 ||
         FltObjects->Instance == NULL ||
         FltObjects->FileObject == NULL ||
         FlagOn(FltObjects->FileObject->Flags, FO_STREAM_FILE | FO_VOLUME_OPEN)) {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    //
+    // Paging writes (a mapped view being flushed, or the cache writing out earlier writes) are
+    // made by the system, not the program. The program was reported when it wrote through the
+    // cache or mapped the file for writing; here the content still changes, so any verdict
+    // cached for the old content stops matching.
+    //
+    if (Data->RequestorMode != UserMode) {
+        if (FlagOn(Data->Iopb->IrpFlags, IRP_PAGING_IO) &&
+            NT_SUCCESS(FltGetStreamContext(
+                FltObjects->Instance,
+                FltObjects->FileObject,
+                &streamContext
+                ))) {
+            InterlockedIncrement64(&streamContext->ContentGeneration);
+            FltReleaseContext(streamContext);
+        }
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
@@ -1095,6 +1164,7 @@ BlackshardPreSetInformation (
     )
 {
     FILE_INFORMATION_CLASS informationClass;
+    BOOLEAN truncation;
     BOOLEAN relevant;
     BOOLEAN block;
 
@@ -1111,11 +1181,23 @@ BlackshardPreSetInformation (
 
     informationClass =
         Data->Iopb->Parameters.SetFileInformation.FileInformationClass;
+    //
+    // Shrinking a file through its end or its allocation destroys content like a write does. A
+    // hard link to a document gives it a second name, outside the protected folders, that later
+    // writes would go through unseen, so it counts with renames and deletions.
+    //
+    truncation = (BOOLEAN)(
+        informationClass == FileEndOfFileInformation ||
+        informationClass == FileAllocationInformation
+        );
     relevant = (BOOLEAN)(
+        truncation ||
         informationClass == FileDispositionInformation ||
         informationClass == FileDispositionInformationEx ||
         informationClass == FileRenameInformation ||
-        informationClass == FileRenameInformationEx
+        informationClass == FileRenameInformationEx ||
+        informationClass == FileLinkInformation ||
+        informationClass == FileLinkInformationEx
         );
     if (!relevant) {
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
@@ -1135,9 +1217,11 @@ BlackshardPreSetInformation (
     block = BlackshardEvaluateOpenedObject(
         Data,
         FltObjects,
-        BLACKSHARD_OPERATION_PROTECTED_METADATA,
+        truncation
+        ? BLACKSHARD_OPERATION_PROTECTED_WRITE
+        : BLACKSHARD_OPERATION_PROTECTED_METADATA,
         FALSE,
-        0,
+        BLACKSHARD_ENTROPY_NOT_MEASURED,
         TRUE
         );
     if (block) {
@@ -1179,6 +1263,32 @@ BlackshardPreAcquireForSectionSynchronization (
           PAGE_EXECUTE_READ |
           PAGE_EXECUTE_READWRITE |
           PAGE_EXECUTE_WRITECOPY)) == 0) {
+        //
+        // A program that maps a document for writing changes it through the view, and those
+        // changes reach the disk later as paging writes the system makes. The mapping is the
+        // last point where the program is known and the document is still intact.
+        //
+        if ((pageProtection & PAGE_READWRITE) == 0 ||
+            !FltObjects->FileObject->WriteAccess ||
+            gBlackshardData.ClientPort == NULL ||
+            KeGetCurrentIrql() != PASSIVE_LEVEL ||
+            KeAreAllApcsDisabled() ||
+            IoGetTopLevelIrp() != NULL) {
+            return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        }
+        if (BlackshardEvaluateOpenedObject(
+                Data,
+                FltObjects,
+                BLACKSHARD_OPERATION_PROTECTED_WRITE,
+                FALSE,
+                BLACKSHARD_ENTROPY_NOT_MEASURED,
+                TRUE
+                )) {
+            Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+            Data->IoStatus.Information = 0;
+            InterlockedIncrement64(&gBlackshardData.Blocks);
+            return FLT_PREOP_COMPLETE;
+        }
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
@@ -1247,15 +1357,14 @@ BlackshardEvaluateOpenedObject (
     PFLT_FILE_NAME_INFORMATION nameInformation;
     PBLACKSHARD_STREAM_CONTEXT streamContext;
     PBLACKSHARD_NOTIFICATION notification;
-    BLACKSHARD_REPLY reply;
-    ULONG replyLength;
     ULONG requestorProcessId;
     PEPROCESS requestorProcess;
     ULONGLONG processStartKey;
     ULONG pathLength;
     ULONGLONG contentGeneration;
-    LARGE_INTEGER timeout;
     BOOLEAN administratorOnlyImage;
+    BOOLEAN block;
+    BLACKSHARD_FAILURE_REASON failure;
 
     PAGED_CODE();
 
@@ -1440,68 +1549,29 @@ BlackshardEvaluateOpenedObject (
             administratorOnlyImage
             );
     }
-    RtlZeroMemory(&reply, sizeof(reply));
     notification->DesiredAccess = DesiredAccess;
     notification->FileId = (ULONGLONG)internalInformation.IndexNumber.QuadPart;
     notification->ContentGeneration = contentGeneration;
     notification->ProcessStartKey = processStartKey;
     notification->MustEnforce = MustEnforce;
 
-    replyLength = sizeof(reply);
-    timeout.QuadPart = -10000LL * (
-        Operation == BLACKSHARD_OPERATION_EXECUTE_SECTION
-        ? BLACKSHARD_EXECUTE_TIMEOUT_MS
-        : (Operation == BLACKSHARD_OPERATION_PROTECTED_WRITE ||
-           Operation == BLACKSHARD_OPERATION_PROTECTED_METADATA)
-        ? BLACKSHARD_PROTECTED_TIMEOUT_MS
-        : BLACKSHARD_OPEN_TIMEOUT_MS);
-    InterlockedIncrement64(&gBlackshardData.ScanRequests);
-
-    status = FltSendMessage(
-        gBlackshardData.FilterHandle,
-        &gBlackshardData.ClientPort,
-        notification,
-        sizeof(*notification),
-        &reply,
-        &replyLength,
-        &timeout
-        );
-    ExFreePoolWithTag(notification, BLACKSHARD_NOTIFICATION_TAG);
-
-    if (status == STATUS_TIMEOUT) {
+    if (!BlackshardAskService(
+            notification,
+            Operation == BLACKSHARD_OPERATION_EXECUTE_SECTION
+            ? BLACKSHARD_EXECUTE_TIMEOUT_MS
+            : (Operation == BLACKSHARD_OPERATION_PROTECTED_WRITE ||
+               Operation == BLACKSHARD_OPERATION_PROTECTED_METADATA)
+            ? BLACKSHARD_PROTECTED_TIMEOUT_MS
+            : BLACKSHARD_OPEN_TIMEOUT_MS,
+            &block,
+            &failure
+            )) {
         return BlackshardFailureRequiresBlock(
-            BlackshardFailureTimeout,
+            failure,
             MustEnforce,
             administratorOnlyImage
             );
     }
-
-    if (status != STATUS_SUCCESS) {
-        return BlackshardFailureRequiresBlock(
-            BlackshardFailureServiceUnavailable,
-            MustEnforce,
-            administratorOnlyImage
-            );
-    }
-
-    if (replyLength != sizeof(reply) ||
-        (reply.Verdict != VERDICT_ALLOW && reply.Verdict != VERDICT_BLOCK)) {
-        return BlackshardFailureRequiresBlock(
-            BlackshardFailureInvalidReply,
-            MustEnforce,
-            administratorOnlyImage
-            );
-    }
-    if (reply.Magic != BLACKSHARD_PROTOCOL_MAGIC ||
-        reply.Version != BLACKSHARD_PROTOCOL_VERSION ||
-        reply.Size != sizeof(reply)) {
-        return BlackshardFailureRequiresBlock(
-            BlackshardFailureProtocolMismatch,
-            MustEnforce,
-            administratorOnlyImage
-            );
-    }
-
 
 
 
@@ -1538,7 +1608,7 @@ BlackshardEvaluateOpenedObject (
         }
     }
 
-    return (BOOLEAN)(reply.Verdict == VERDICT_BLOCK);
+    return block;
 }
 
 NTSTATUS
@@ -2387,12 +2457,10 @@ BlackshardProcessNotify (
     PFLT_FILE_NAME_INFORMATION nameInformation;
     PBLACKSHARD_STREAM_CONTEXT streamContext;
     PBLACKSHARD_NOTIFICATION notification;
-    BLACKSHARD_REPLY reply;
-    ULONG replyLength;
     ULONG creatingProcessId;
     ULONG commandLineLength;
-    LARGE_INTEGER timeout;
-    NTSTATUS status;
+    BOOLEAN block;
+    BLACKSHARD_FAILURE_REASON failure;
 
     PAGED_CODE();
 
@@ -2488,26 +2556,13 @@ BlackshardProcessNotify (
         notification->CommandLineLength = commandLineLength;
     }
 
-    RtlZeroMemory(&reply, sizeof(reply));
-    replyLength = sizeof(reply);
-    timeout.QuadPart = -10000LL * BLACKSHARD_PROCESS_TIMEOUT_MS;
-    status = FltSendMessage(
-        gBlackshardData.FilterHandle,
-        &gBlackshardData.ClientPort,
-        notification,
-        sizeof(*notification),
-        &reply,
-        &replyLength,
-        &timeout
-        );
-    ExFreePoolWithTag(notification, BLACKSHARD_NOTIFICATION_TAG);
-
-    if (status == STATUS_SUCCESS &&
-        replyLength == sizeof(reply) &&
-        reply.Magic == BLACKSHARD_PROTOCOL_MAGIC &&
-        reply.Version == BLACKSHARD_PROTOCOL_VERSION &&
-        reply.Size == sizeof(reply) &&
-        reply.Verdict == VERDICT_BLOCK) {
+    if (BlackshardAskService(
+            notification,
+            BLACKSHARD_PROCESS_TIMEOUT_MS,
+            &block,
+            &failure
+            ) &&
+        block) {
         CreateInfo->CreationStatus = STATUS_ACCESS_DENIED;
         InterlockedIncrement64(&gBlackshardData.Blocks);
     }
@@ -2566,4 +2621,126 @@ BlackshardLoadImageNotify (
         &timeout
         );
     ExFreePoolWithTag(notification, BLACKSHARD_NOTIFICATION_TAG);
+}
+
+//
+// Sends a notification and waits for the service's verdict, freeing the notification. FALSE
+// means there was no usable answer, and Failure says why, for the caller's failure policy.
+//
+BOOLEAN
+BlackshardAskService (
+    _In_ __drv_freesMem(Mem) PBLACKSHARD_NOTIFICATION Notification,
+    _In_ LONGLONG TimeoutMs,
+    _Out_ PBOOLEAN Block,
+    _Out_ BLACKSHARD_FAILURE_REASON *Failure
+    )
+{
+    BLACKSHARD_REPLY reply;
+    ULONG replyLength;
+    LARGE_INTEGER timeout;
+    NTSTATUS status;
+
+    *Block = FALSE;
+    *Failure = BlackshardFailureInternalError;
+    RtlZeroMemory(&reply, sizeof(reply));
+    replyLength = sizeof(reply);
+    timeout.QuadPart = -10000LL * TimeoutMs;
+    InterlockedIncrement64(&gBlackshardData.ScanRequests);
+
+    status = FltSendMessage(
+        gBlackshardData.FilterHandle,
+        &gBlackshardData.ClientPort,
+        Notification,
+        sizeof(*Notification),
+        &reply,
+        &replyLength,
+        &timeout
+        );
+    ExFreePoolWithTag(Notification, BLACKSHARD_NOTIFICATION_TAG);
+
+    if (status == STATUS_TIMEOUT) {
+        *Failure = BlackshardFailureTimeout;
+        return FALSE;
+    }
+    if (status != STATUS_SUCCESS) {
+        *Failure = BlackshardFailureServiceUnavailable;
+        return FALSE;
+    }
+    if (replyLength != sizeof(reply) ||
+        (reply.Verdict != VERDICT_ALLOW && reply.Verdict != VERDICT_BLOCK)) {
+        *Failure = BlackshardFailureInvalidReply;
+        return FALSE;
+    }
+    if (reply.Magic != BLACKSHARD_PROTOCOL_MAGIC ||
+        reply.Version != BLACKSHARD_PROTOCOL_VERSION ||
+        reply.Size != sizeof(reply)) {
+        *Failure = BlackshardFailureProtocolMismatch;
+        return FALSE;
+    }
+    *Block = (BOOLEAN)(reply.Verdict == VERDICT_BLOCK);
+    return TRUE;
+}
+
+//
+// A truncating open is judged before the file exists as an open object, so only its name and
+// the requesting process are known; the service needs no more to copy and count the document.
+//
+BOOLEAN
+BlackshardEvaluateTruncatingOpen (
+    _Inout_ PFLT_CALLBACK_DATA Data
+    )
+{
+    PFLT_FILE_NAME_INFORMATION nameInformation;
+    PBLACKSHARD_NOTIFICATION notification;
+    PEPROCESS requestorProcess;
+    ULONGLONG processStartKey;
+    BOOLEAN block;
+    BLACKSHARD_FAILURE_REASON failure;
+
+    PAGED_CODE();
+
+    requestorProcess = FltGetRequestorProcess(Data);
+    processStartKey = requestorProcess != NULL ? PsGetProcessStartKey(requestorProcess) : 0;
+    if (processStartKey == 0) {
+        (VOID)BlackshardApplyFailurePolicy(BlackshardFailureObjectResolution, FALSE, FALSE);
+        return FALSE;
+    }
+
+    nameInformation = NULL;
+    if (!NT_SUCCESS(FltGetFileNameInformation(
+            Data,
+            FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT,
+            &nameInformation
+            ))) {
+        (VOID)BlackshardApplyFailurePolicy(BlackshardFailurePathResolution, FALSE, FALSE);
+        return FALSE;
+    }
+    if (!NT_SUCCESS(FltParseFileNameInformation(nameInformation)) ||
+        !BlackshardIsProtectedDocumentName(nameInformation)) {
+        FltReleaseFileNameInformation(nameInformation);
+        return FALSE;
+    }
+    notification = BlackshardAllocateNotification(
+        BLACKSHARD_OPERATION_PROTECTED_WRITE,
+        FltGetRequestorProcessId(Data),
+        &nameInformation->Name
+        );
+    FltReleaseFileNameInformation(nameInformation);
+    if (notification == NULL) {
+        (VOID)BlackshardApplyFailurePolicy(BlackshardFailurePathTooLong, FALSE, FALSE);
+        return FALSE;
+    }
+    notification->ProcessStartKey = processStartKey;
+    notification->DesiredAccess = BLACKSHARD_ENTROPY_NOT_MEASURED;
+
+    if (!BlackshardAskService(
+            notification,
+            BLACKSHARD_PROTECTED_TIMEOUT_MS,
+            &block,
+            &failure
+            )) {
+        (VOID)BlackshardApplyFailurePolicy(failure, FALSE, FALSE);
+        return FALSE;
+    }
+    return block;
 }

@@ -28,7 +28,7 @@ use windows_sys::Win32::System::Threading::{
 };
 
 const BLACKSHARD_PROTOCOL_MAGIC: u32 = 0x3548_5342;
-const BLACKSHARD_PROTOCOL_VERSION: u16 = 8;
+const BLACKSHARD_PROTOCOL_VERSION: u16 = 9;
 const CONTROL_GET_HEALTH: u32 = 1;
 const CONTROL_SET_READY_GENERATION: u32 = 2;
 const CONTROL_SET_STOPPING: u32 = 3;
@@ -1241,9 +1241,10 @@ pub(crate) fn notification_path(notification: &BlackshardNotification) -> PathBu
 }
 
 pub(crate) fn valid_notification(notification: &BlackshardNotification) -> bool {
-    // File operations always carry the file's identity. A process start carries it only when the
-    // section scan left it behind, and an image load never does.
-    let identity_required = matches!(notification.operation, 1..=4);
+    // Scans need the file's identity. A protected-document change reported before the file is
+    // open (a truncating open) has none, a process start has it only when the section scan left
+    // it behind, and an image load never does.
+    let identity_required = matches!(notification.operation, 1..=2);
     notification.magic == BLACKSHARD_PROTOCOL_MAGIC
         && notification.version == BLACKSHARD_PROTOCOL_VERSION
         && notification.size as usize == mem::size_of::<BlackshardNotification>()
@@ -2126,6 +2127,34 @@ mod tests {
         );
         let status = child.wait().unwrap();
         assert_eq!(status.code(), Some(1));
+    }
+
+    #[test]
+    fn notifications_need_a_file_identity_only_for_scans() {
+        let notification = |operation: u32, file_id: u64| {
+            let mut notification = unsafe { mem::zeroed::<BlackshardNotification>() };
+            notification.magic = BLACKSHARD_PROTOCOL_MAGIC;
+            notification.version = BLACKSHARD_PROTOCOL_VERSION;
+            notification.size = mem::size_of::<BlackshardNotification>() as u16;
+            notification.operation = operation;
+            notification.must_enforce = u32::from(operation == OPERATION_EXECUTE_SECTION);
+            notification.file_id = file_id;
+            notification.content_generation = file_id;
+            notification.process_start_key = 1;
+            notification.path_length = 1;
+            notification
+        };
+        for operation in [1, 2] {
+            assert!(valid_notification(&notification(operation, 9)));
+            assert!(!valid_notification(&notification(operation, 0)));
+        }
+        for operation in 3..=6 {
+            assert!(valid_notification(&notification(operation, 0)));
+        }
+        assert!(!valid_notification(&notification(7, 9)));
+        let mut enforced_open = notification(1, 9);
+        enforced_open.must_enforce = 1;
+        assert!(!valid_notification(&enforced_open));
     }
 
     #[test]
