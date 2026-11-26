@@ -69,7 +69,8 @@ it before every take.
    when it runs out, protection comes back and the hunt starts by itself.
 5. **Turbo**, any one of these:
    - `[resume and hunt now]` on the status page
-   - **Ctrl+Shift+T** (the blackshard window must have focus)
+   - **Ctrl+Shift+T** with the blackshard window focused, or **Ctrl+Alt+Shift+T** from anywhere,
+     even with a screen locker or a flood of windows on top
    - triple-click the shard
 
    What happens:

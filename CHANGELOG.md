@@ -65,6 +65,30 @@ changes are listed here, newest first.
 - Self-tests are administrator-only and rate-limited; clearing the history is recorded.
 
 ### Added
+- Program starts are judged by their command line: shadow-copy, backup and recovery deletion,
+  Safe Mode reboots, tampering with blackshard, Defender or the firewall, launch and sign-in
+  hijacks, download-and-run and in-memory loader PowerShell (also encoded), mshta, rundll32 and
+  regsvr32 script proxies, quiet remote installs, certutil and bitsadmin downloads, Office
+  starting a shell, scripts run from Downloads or archives, and AutoIt loaders. For ransomware and
+  tampering rules, the program behind the command is stopped and removed too.
+- Hidden decoy documents in each user's Documents and Pictures convict the first untrusted
+  program that touches one, however slowly it encrypts.
+- Turbo also reads the memory of running programs for code no file backs (Cobalt Strike, Sliver,
+  Meterpreter, unpacked stealers), stopping the process or, in Windows' own, the injected threads;
+  scans the boot record and the EFI system partition for bootkits; and removes autostarts the
+  command-line rules condemn, from Run keys, tasks, services, BITS jobs and WMI subscriptions.
+- Removing a program also cleans AppInit DLLs, Winlogon, IFEO and silent-exit hijacks, per-user
+  COM hijacks, Active Setup, BITS jobs and WMI subscriptions. A removed Windows file is put back
+  by the System File Checker.
+- The pause baseline covers whole registry trees: Defender policies and exclusions, browser
+  policies, root certificates, Safe Mode, IFEO, LSA packages, firewall rules for user-writable
+  programs, proxy settings and the registrations UAC bypasses use.
+- DLL side-loading next to a signed program, and suspicious unsigned downloads, are blocked at
+  execution.
+- Ctrl+Alt+Shift+T starts turbo from anywhere on the desktop.
+- Ransomware protection covers Downloads and more document, photo and media types.
+- The installer turns on Microsoft's vulnerable driver blocklist and, on Windows 11 22H2 and
+  later, LSA protection (`-SkipSystemHardening` to leave them).
 - Turbo also scans ProgramData, all of local AppData, `C:\Windows\Temp`, and the DLLs loaded
   into running programs. It puts back the hosts file, and cleans the Group Policy Run key.
 - An option to also catch adware and other potentially unwanted programs.
