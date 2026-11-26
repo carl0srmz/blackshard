@@ -716,6 +716,54 @@ pub fn sweep_autostarts() -> Vec<String> {
     removed
 }
 
+/// Sets every kernel or file-system driver service that loads `file` to disabled, so a convicted
+/// driver does not load at the next start, and names each one.
+pub fn disable_driver_service(file: &Path) -> Vec<String> {
+    const SERVICES: &str = r"SYSTEM\CurrentControlSet\Services";
+    /// `SERVICE_KERNEL_DRIVER` and `SERVICE_FILE_SYSTEM_DRIVER`.
+    const DRIVER_TYPES: u32 = 0x1 | 0x2;
+    const SERVICE_DISABLED: u32 = 4;
+    let system_root = windows_folder().to_string_lossy().into_owned();
+    let target = comparable(&file.to_string_lossy());
+    let mut disabled = Vec::new();
+    for service in subkeys(HKEY_LOCAL_MACHINE, SERVICES) {
+        let key = format!(r"{SERVICES}\{service}");
+        if registry_dword(HKEY_LOCAL_MACHINE, &key, "Type").unwrap_or(0) & DRIVER_TYPES == 0 {
+            continue;
+        }
+        let Some(image) = registry_string(HKEY_LOCAL_MACHINE, &key, "ImagePath") else {
+            continue;
+        };
+        let loads_it = crate::rootkit_scan::driver_file(&image, &system_root)
+            .is_some_and(|path| comparable(&path.to_string_lossy()) == target);
+        if loads_it && set_dword(HKEY_LOCAL_MACHINE, &key, "Start", SERVICE_DISABLED) {
+            log::warn!("Disabled driver service {service}: {image}");
+            disabled.push(service);
+        }
+    }
+    disabled
+}
+
+fn set_dword(root: HKEY, path: &str, name: &str, value: u32) -> bool {
+    use windows_sys::Win32::System::Registry::REG_DWORD;
+    let Some(key) = open(root, path, KEY_SET_VALUE) else {
+        return false;
+    };
+    let name = wide(name);
+    let status = unsafe {
+        RegSetValueExW(
+            key,
+            name.as_ptr(),
+            0,
+            REG_DWORD,
+            (&value as *const u32).cast(),
+            std::mem::size_of::<u32>() as u32,
+        )
+    };
+    unsafe { RegCloseKey(key) };
+    status == 0
+}
+
 fn set_string(root: HKEY, path: &str, name: &str, value: &str) -> bool {
     let Some(key) = open(root, path, KEY_SET_VALUE) else {
         return false;

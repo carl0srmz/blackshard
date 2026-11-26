@@ -31,6 +31,7 @@ pub mod realtime;
 pub mod remediation;
 pub mod repair;
 pub mod rollback;
+pub mod rootkit_scan;
 pub mod rules;
 pub mod scan_manager;
 pub mod self_test;

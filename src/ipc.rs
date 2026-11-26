@@ -1571,6 +1571,7 @@ mod windows_transport {
                         });
                     }
                     let memory_engine = Arc::clone(&engine);
+                    let driver_quarantine = Arc::clone(&resources.quarantine);
                     finish = Box::new(move || {
                         // Every hunt: code living only in memory, with what started during the
                         // pause read first and still frozen; bootkits in the boot record and the
@@ -1584,6 +1585,10 @@ mod windows_transport {
                             .unwrap_or_default();
                         let mut repairs = crate::memory_scan::hunt(&memory_engine, &first);
                         repairs.extend(crate::boot_scan::hunt(&memory_engine));
+                        repairs.extend(crate::rootkit_scan::hunt(
+                            &memory_engine,
+                            &driver_quarantine,
+                        ));
                         repairs.extend(crate::persistence::sweep_autostarts());
                         // Only the hunt that ends an administrator's pause may put back what
                         // changed during it.
