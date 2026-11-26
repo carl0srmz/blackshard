@@ -60,6 +60,57 @@ pub fn command_names_path(command: &str, target: &str) -> bool {
     })
 }
 
+/// What a registry value holds that no program keeps in the registry: a whole program image, raw
+/// or as base64 (Ursnif, Kovter), or script that downloads and runs code or starts programs
+/// (Poweliks, Kovter's JavaScript). Fileless malware keeps its real code in values like these and
+/// only a small launcher in a Run key. `kind` is the registry type; small values are not looked at.
+pub fn registry_payload(kind: u32, data: &[u8]) -> Option<&'static str> {
+    const REG_SZ: u32 = 1;
+    const REG_EXPAND_SZ: u32 = 2;
+    const REG_BINARY: u32 = 3;
+    const REG_MULTI_SZ: u32 = 7;
+    if data.len() < 1024 {
+        return None;
+    }
+    if kind == REG_BINARY && crate::memory_scan::looks_like_loaded_image(data) {
+        return Some("a program image");
+    }
+    if !matches!(kind, REG_SZ | REG_EXPAND_SZ | REG_MULTI_SZ | REG_BINARY) {
+        return None;
+    }
+    // Registry strings are UTF-16LE; binary values holding text may be either.
+    let wide: String = String::from_utf16_lossy(
+        &data
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
+            .collect::<Vec<_>>(),
+    );
+    let narrow = String::from_utf8_lossy(data);
+    for text in [wide.as_str(), narrow.as_ref()] {
+        let trimmed = text.trim_matches(char::from(0)).trim();
+        // "TVqQ", "TVpQ", "TVoA": base64 of an MZ header.
+        if ["TVqQ", "TVpQ", "TVoA", "TVro"]
+            .iter()
+            .any(|prefix| trimmed.starts_with(prefix))
+        {
+            use base64::Engine;
+            let encoded: String = trimmed.chars().filter(|c| !c.is_whitespace()).collect();
+            if base64::engine::general_purpose::STANDARD
+                .decode(encoded.trim_end_matches(char::from(0)))
+                .is_ok_and(|decoded| crate::memory_scan::looks_like_loaded_image(&decoded))
+            {
+                return Some("a program image in base64");
+            }
+        }
+        if crate::command_rules::judge_script(&trimmed.to_ascii_lowercase()).is_some() {
+            return Some("a loader script");
+        }
+    }
+    None
+}
+
 /// A BITS job and the command it runs when it finishes, from `bitsadmin /list /verbose`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BitsJob {
@@ -157,6 +208,51 @@ fn decode_entities(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn program_image() -> Vec<u8> {
+        let mut bytes = vec![0u8; 2048];
+        bytes[..2].copy_from_slice(b"MZ");
+        bytes[0x3C..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        bytes[0x80..0x84].copy_from_slice(b"PE\0\0");
+        bytes[0x84..0x86].copy_from_slice(&0x8664u16.to_le_bytes());
+        bytes
+    }
+
+    fn utf16(text: &str) -> Vec<u8> {
+        text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+    }
+
+    #[test]
+    fn programs_and_loader_scripts_stored_in_the_registry_are_found() {
+        use base64::Engine;
+        assert_eq!(
+            registry_payload(3, &program_image()),
+            Some("a program image")
+        );
+        let encoded = base64::engine::general_purpose::STANDARD.encode(program_image());
+        assert_eq!(
+            registry_payload(1, &utf16(&encoded)),
+            Some("a program image in base64")
+        );
+        let script = format!(
+            "var s = new ActiveXObject('WScript.Shell'); s.Run('mshta ...');{}",
+            " ".repeat(1200)
+        );
+        assert_eq!(
+            registry_payload(1, &utf16(&script)),
+            Some("a loader script")
+        );
+        assert_eq!(
+            registry_payload(1, &utf16(&"ordinary settings ".repeat(100))),
+            None
+        );
+        assert_eq!(registry_payload(3, &[0u8; 4096]), None);
+        assert_eq!(
+            registry_payload(3, b"MZ tiny"),
+            None,
+            "too small to look at"
+        );
+    }
 
     #[test]
     fn bits_jobs_with_a_completion_command_are_read() {

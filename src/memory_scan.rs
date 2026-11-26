@@ -71,6 +71,40 @@ pub fn hollowed(memory_header: &[u8], file_header: &[u8]) -> bool {
     }
 }
 
+/// Which tool a named pipe's default name belongs to. Cobalt Strike's beacons and post-exploitation
+/// jobs, Covenant's grunts and PsExec-style remote execution all open pipes with fixed names
+/// unless their operator changes them.
+pub fn known_tool_pipe(name: &str) -> Option<&'static str> {
+    let lower = name.to_ascii_lowercase();
+    let hex_tail = |prefix: &str| {
+        lower.strip_prefix(prefix).is_some_and(|tail| {
+            (2..=8).contains(&tail.len()) && tail.chars().all(|c| c.is_ascii_hexdigit())
+        })
+    };
+    if hex_tail("msagent_") || hex_tail("postex_") || hex_tail("postex_ssh_") || hex_tail("status_")
+    {
+        return Some("Cobalt Strike");
+    }
+    if let Some(middle) = lower
+        .strip_prefix("msse-")
+        .and_then(|rest| rest.strip_suffix("-server"))
+    {
+        if !middle.is_empty() && middle.chars().all(|c| c.is_ascii_digit()) {
+            return Some("Cobalt Strike");
+        }
+    }
+    if lower == "gruntsvc" {
+        return Some("Covenant");
+    }
+    if lower.starts_with("psexesvc")
+        || lower.starts_with("remcom_communicaton")
+        || lower.starts_with("paexec")
+    {
+        return Some("remote execution (PsExec, RemCom or PAExec)");
+    }
+    None
+}
+
 /// What the hunt found in one process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryFinding {
@@ -194,7 +228,7 @@ mod platform {
                 .into_iter()
                 .filter(|process_id| !first.contains(process_id)),
         );
-        let mut lines = Vec::new();
+        let mut lines = suspicious_pipes();
         let mut total = 0usize;
         for process_id in order {
             if process_id <= 4 || process_id == std::process::id() || total >= MAX_TOTAL_BYTES {
@@ -293,6 +327,59 @@ mod platform {
             size: region.region_size,
             threat: Some("Memory.Win.ProcessHollowing".to_owned()),
         })
+    }
+
+    /// Named pipes open now whose names are the defaults of attack tools.
+    fn suspicious_pipes() -> Vec<String> {
+        #[repr(C)]
+        struct FindData {
+            attributes: u32,
+            created: [u32; 2],
+            accessed: [u32; 2],
+            written: [u32; 2],
+            size_high: u32,
+            size_low: u32,
+            reserved0: u32,
+            reserved1: u32,
+            name: [u16; 260],
+            alternate: [u16; 14],
+            obsolete: [u32; 3],
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn FindFirstFileW(pattern: *const u16, data: *mut FindData) -> isize;
+            fn FindNextFileW(find: isize, data: *mut FindData) -> i32;
+            fn FindClose(find: isize) -> i32;
+        }
+        let pattern: Vec<u16> = "\\\\.\\pipe\\*"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut data: FindData = unsafe { std::mem::zeroed() };
+        let find = unsafe { FindFirstFileW(pattern.as_ptr(), &mut data) };
+        if find == -1 {
+            return Vec::new();
+        }
+        let mut lines = Vec::new();
+        loop {
+            let length = data
+                .name
+                .iter()
+                .position(|unit| *unit == 0)
+                .unwrap_or(data.name.len());
+            let name = String::from_utf16_lossy(&data.name[..length]);
+            if let Some(tool) = super::known_tool_pipe(&name) {
+                log::warn!("Named pipe {name} is the default of {tool}");
+                lines.push(format!(
+                    "named pipe {name} is the default name {tool} uses; something on this machine may be under remote control"
+                ));
+            }
+            if unsafe { FindNextFileW(find, &mut data) } == 0 {
+                break;
+            }
+        }
+        unsafe { FindClose(find) };
+        lines
     }
 
     fn scan_process(
@@ -483,6 +570,18 @@ mod tests {
         bytes[0x80..0x84].copy_from_slice(b"PE\0\0");
         bytes[0x84..0x86].copy_from_slice(&machine.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn default_pipe_names_of_attack_tools_are_known() {
+        assert_eq!(known_tool_pipe("msagent_8a"), Some("Cobalt Strike"));
+        assert_eq!(known_tool_pipe("postex_1c2d"), Some("Cobalt Strike"));
+        assert_eq!(known_tool_pipe("MSSE-1234-server"), Some("Cobalt Strike"));
+        assert_eq!(known_tool_pipe("gruntsvc"), Some("Covenant"));
+        assert!(known_tool_pipe("PSEXESVC").is_some());
+        assert_eq!(known_tool_pipe("status_report_pipe"), None);
+        assert_eq!(known_tool_pipe("mojo.1234.5678"), None);
+        assert_eq!(known_tool_pipe("BlackshardProtection-v1"), None);
     }
 
     #[test]

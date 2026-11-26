@@ -764,6 +764,88 @@ fn set_dword(root: HKEY, path: &str, name: &str, value: u32) -> bool {
     status == 0
 }
 
+/// Deletes, from each signed-in user's `Software` hive, values that hold a program image or a
+/// loader script: where fileless malware keeps its real code (see
+/// [`crate::remediation::registry_payload`]). Bounded, so a huge hive cannot stall the hunt.
+pub fn remove_registry_payloads() -> Vec<String> {
+    const MAX_DEPTH: usize = 16;
+    const MAX_KEYS: usize = 200_000;
+    let mut removed = Vec::new();
+    for sid in subkeys(HKEY_USERS, "") {
+        if !(sid.starts_with("S-1-5-21-") || sid.starts_with("S-1-12-1-"))
+            || sid.ends_with("_Classes")
+        {
+            continue;
+        }
+        let mut pending = vec![(format!(r"{sid}\Software"), 0usize)];
+        let mut visited = 0usize;
+        while let Some((path, depth)) = pending.pop() {
+            visited += 1;
+            if visited > MAX_KEYS {
+                break;
+            }
+            for (name, reason) in payload_values(&path) {
+                if delete_value(HKEY_USERS, &path, &name) {
+                    log::warn!(r"Removed {reason} stored in HKU\{path}\{name}");
+                    removed.push(format!(
+                        r"{reason} stored in the registry (HKU\{path}\{name})"
+                    ));
+                }
+            }
+            if depth < MAX_DEPTH {
+                for child in subkeys(HKEY_USERS, &path) {
+                    pending.push((format!(r"{path}\{child}"), depth + 1));
+                }
+            }
+        }
+    }
+    removed
+}
+
+/// The values under one key that hold a payload, with what each holds.
+fn payload_values(path: &str) -> Vec<(String, &'static str)> {
+    let Some(key) = open(HKEY_USERS, path, KEY_QUERY_VALUE) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    // Allocated once per key: a hive can hold hundreds of thousands of values.
+    let mut name = vec![0u16; 16_384];
+    let mut data = vec![0u8; 4 * 1024 * 1024];
+    for index in 0.. {
+        let mut name_length = name.len() as u32;
+        let mut kind = 0u32;
+        let mut data_length = data.len() as u32;
+        let status = unsafe {
+            RegEnumValueW(
+                key,
+                index,
+                name.as_mut_ptr(),
+                &mut name_length,
+                std::ptr::null(),
+                &mut kind,
+                data.as_mut_ptr(),
+                &mut data_length,
+            )
+        };
+        if status == 259 {
+            break;
+        }
+        if status != 0 {
+            continue;
+        }
+        if let Some(reason) =
+            crate::remediation::registry_payload(kind, &data[..data_length as usize])
+        {
+            found.push((
+                String::from_utf16_lossy(&name[..name_length as usize]),
+                reason,
+            ));
+        }
+    }
+    unsafe { RegCloseKey(key) };
+    found
+}
+
 fn set_string(root: HKEY, path: &str, name: &str, value: &str) -> bool {
     let Some(key) = open(root, path, KEY_SET_VALUE) else {
         return false;

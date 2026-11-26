@@ -1590,6 +1590,7 @@ mod windows_transport {
                             &driver_quarantine,
                         ));
                         repairs.extend(crate::persistence::sweep_autostarts());
+                        repairs.extend(crate::persistence::remove_registry_payloads());
                         // Only the hunt that ends an administrator's pause may put back what
                         // changed during it.
                         if let Some(pause) = pause {
