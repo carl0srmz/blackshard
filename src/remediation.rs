@@ -38,6 +38,28 @@ pub fn item_launches(item: &[u8], target: &str) -> bool {
     contains(&lowered, ascii.as_bytes()) || contains(&lowered, &wide)
 }
 
+/// Whether a command line names `target` as a whole path, not as the start of a longer one:
+/// `c:\tools\x.exe` is in `"c:\tools\x.exe" /run` and `rundll32 c:\tools\x.exe,go`, but not in
+/// `c:\tools\x.exe.bak` or `c:\tools\x.exe-helper.exe`. Both arguments are already lower case.
+/// Removing a service or task on a looser match could delete another program's.
+pub fn command_names_path(command: &str, target: &str) -> bool {
+    if target.is_empty() {
+        return false;
+    }
+    let separates = |character: Option<char>| {
+        character.is_none_or(|character| {
+            matches!(
+                character,
+                '"' | '\'' | ' ' | '\t' | ',' | '=' | '(' | ')' | ';'
+            )
+        })
+    };
+    command.match_indices(target).any(|(start, _)| {
+        separates(command[..start].chars().next_back())
+            && separates(command[start + target.len()..].chars().next())
+    })
+}
+
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty()
         && haystack
@@ -90,6 +112,22 @@ fn decode_entities(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_command_names_a_path_only_as_a_whole() {
+        let target = r"c:\tools\x.exe";
+        assert!(command_names_path(r"c:\tools\x.exe", target));
+        assert!(command_names_path(r#""c:\tools\x.exe" /run"#, target));
+        assert!(command_names_path(
+            r"rundll32.exe c:\tools\x.exe,go",
+            target
+        ));
+        assert!(command_names_path(r"cmd /c start c:\tools\x.exe", target));
+        assert!(!command_names_path(r"c:\tools\x.exe.bak", target));
+        assert!(!command_names_path(r"c:\tools\x.exe-helper.exe /s", target));
+        assert!(!command_names_path(r"c:\tools\x.exe2", target));
+        assert!(!command_names_path("", target));
+    }
 
     const TASK: &str = r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">

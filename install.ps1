@@ -411,7 +411,7 @@ else {
         -Value @("BLACKSHARD_CLAMAV_MIRROR=$DefinitionMirror") -Force | Out-Null
 }
 
-& sc.exe failure $protectionServiceName "reset= 86400" "actions= restart/30000/restart/30000/none/0" | Out-Host
+& sc.exe failure $protectionServiceName "reset= 86400" "actions= restart/5000/restart/5000/restart/10000" | Out-Host
 Start-Service -Name $protectionServiceName
 
 $serviceRunning = $false

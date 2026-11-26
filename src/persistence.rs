@@ -186,12 +186,22 @@ fn remove_services(target: &str) -> Vec<String> {
         if service_type & SERVICE_WIN32_OWN_OR_SHARE == 0 {
             continue;
         }
-        let Some(image_path) = registry_string(HKEY_LOCAL_MACHINE, &key, "ImagePath") else {
+        let image_path = registry_string(HKEY_LOCAL_MACHINE, &key, "ImagePath");
+        // A service hosted in svchost runs its DLL, named by ServiceDll, which is how Conficker
+        // and Emotet-style loaders persist without an executable of their own.
+        let service_dll = registry_string(
+            HKEY_LOCAL_MACHINE,
+            &format!(r"{key}\Parameters"),
+            "ServiceDll",
+        )
+        .or_else(|| registry_string(HKEY_LOCAL_MACHINE, &key, "ServiceDll"));
+        let Some(image_path) = [image_path, service_dll]
+            .into_iter()
+            .flatten()
+            .find(|command| launches(command, None, target))
+        else {
             continue;
         };
-        if !launches(&image_path, None, target) {
-            continue;
-        }
         let run = |action: &str| {
             Command::new(&sc)
                 .args([action, &service])
@@ -250,9 +260,11 @@ fn registry_dword(root: HKEY, path: &str, name: &str) -> Option<u32> {
     (status == 0).then_some(value)
 }
 
-const RUN_KEYS: [&str; 4] = [
+const RUN_KEYS: [&str; 5] = [
     r"Software\Microsoft\Windows\CurrentVersion\Run",
     r"Software\Microsoft\Windows\CurrentVersion\RunOnce",
+    // Group Policy's Run list: the same as Run, and missed by anything that only looks there.
+    r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run",
     r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run",
     r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce",
 ];
@@ -347,7 +359,7 @@ fn clean_key(
 /// Whether a startup command, with its environment variables expanded for the profile it belongs
 /// to, runs `target`.
 fn launches(command: &str, profile: Option<&str>, target: &str) -> bool {
-    comparable(&expand(command, profile)).contains(target)
+    crate::remediation::command_names_path(&comparable(&expand(command, profile)), target)
 }
 
 /// Expands `%VARIABLE%`s. The per-user ones come from the hive's own profile: this runs as SYSTEM,

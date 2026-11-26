@@ -72,7 +72,7 @@
         <util:ServiceConfig
             FirstFailureActionType="restart"
             SecondFailureActionType="restart"
-            ThirdFailureActionType="none"
+            ThirdFailureActionType="restart"
             RestartServiceDelayInSeconds="30"
             ResetPeriodInDays="1" />
       </ServiceInstall>

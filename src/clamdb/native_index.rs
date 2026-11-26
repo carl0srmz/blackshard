@@ -227,7 +227,7 @@ impl NativeIndex {
                 continue;
             };
             let extension = extension.to_ascii_lowercase();
-            if !options.include_pua && extension.ends_with('u') && extension != "sfp" {
+            if !options.include_pua && extension.ends_with('u') {
                 continue;
             }
             let added = self.load_file(entry.path(), false)?;

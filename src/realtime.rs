@@ -31,6 +31,7 @@ const BLACKSHARD_PROTOCOL_MAGIC: u32 = 0x3548_5342;
 const BLACKSHARD_PROTOCOL_VERSION: u16 = 6;
 const CONTROL_GET_HEALTH: u32 = 1;
 const CONTROL_SET_READY_GENERATION: u32 = 2;
+const OPERATION_EXECUTE_SECTION: u32 = 2;
 const OPERATION_PROTECTED_WRITE: u32 = 3;
 const OPERATION_PROTECTED_METADATA: u32 = 4;
 const MAX_FILE_PATH_LENGTH: usize = 1024;
@@ -520,115 +521,139 @@ pub(crate) fn realtime_worker(
         // a removable drive unscanned on the strength of a clean verdict cached for C:. Opening
         // the file yields its full identity, and the exact-key lookup below still avoids a rescan.
         // Restoring a pre-open fast path needs the volume serial added to the driver notification.
-        let candidate = open_candidate_file(&openable_path);
-        let path = candidate
-            .as_ref()
-            .ok()
-            .and_then(|file| opened_final_path(file).ok())
-            .unwrap_or_else(|| kernel_path.clone());
+        let scan = || {
+            let candidate = open_candidate_file(&openable_path);
+            let path = candidate
+                .as_ref()
+                .ok()
+                .and_then(|file| opened_final_path(file).ok())
+                .unwrap_or_else(|| kernel_path.clone());
 
-        let active_engine = {
-            let active = engine
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            Arc::clone(&active)
-        };
-        let report = match candidate {
-            Ok(file) => match opened_file_identity(&file) {
-                Ok(identity) if identity.file_id == notification.file_id => {
-                    let key = VerdictCacheKey {
-                        volume_serial: identity.volume_serial_number as u64,
-                        file_id: identity.file_id,
-                        file_size: file.metadata().map(|m| m.len()).unwrap_or(0),
-                        content_generation: notification.content_generation,
-                        change_time: opened_change_time(&file).unwrap_or(0),
-                    };
-                    let current_gen = definition_generation.load(Ordering::Acquire);
+            let active_engine = {
+                let active = engine
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                Arc::clone(&active)
+            };
+            let report = match candidate {
+                Ok(file) => match opened_file_identity(&file) {
+                    Ok(identity) if identity.file_id == notification.file_id => {
+                        let key = VerdictCacheKey {
+                            volume_serial: identity.volume_serial_number as u64,
+                            file_id: identity.file_id,
+                            file_size: file.metadata().map(|m| m.len()).unwrap_or(0),
+                            content_generation: notification.content_generation,
+                            change_time: opened_change_time(&file).unwrap_or(0),
+                        };
+                        let current_gen = definition_generation.load(Ordering::Acquire);
 
-                    let mut cached_result = None;
-                    if let Ok(mut cache) = verdict_cache.write() {
-                        cached_result = cache.get(&key, current_gen);
-                    }
-
-                    if let Some(cached) = cached_result {
-                        log::debug!("Real-time cache hit for {:?}", key);
-                        DetectionReport {
-                            verdict: match cached.verdict {
-                                CacheVerdict::Clean => DetectionVerdict::Clean,
-                                CacheVerdict::Malicious => DetectionVerdict::Malicious,
-                                CacheVerdict::Suspicious => DetectionVerdict::Suspicious,
-                                CacheVerdict::ScanError => DetectionVerdict::Error,
-                            },
-                            risk_score: cached.risk_score as u8,
-                            confidence: cached.confidence,
-                            threat_name: cached.threat_name.clone(),
-                            sha256: cached.sha256.clone(),
-                            file_size: cached.file_size,
-                            bytes_scanned: cached.bytes_scanned,
-                            truncated: cached.truncated,
-                            analysis_completeness: cached.analysis_completeness,
-                            static_report: None,
-                            rule_matches: Vec::new(),
-                            similarity_matches: Vec::new(),
-                            container_inspection: None,
-                            amsi_report: None,
-                            amsi_error: None,
-                            elapsed: std::time::Duration::ZERO,
-                            from_cache: true,
-                            error: None,
-                            automatic_quarantine_eligible: cached.automatic_quarantine_eligible,
-                            execution_block_eligible: cached.execution_block_eligible,
-                        }
-                    } else {
-                        log::debug!("Real-time cache miss for {:?}", key);
-                        let scan_result = active_engine.scan_open_file(&file);
-
+                        let mut cached_result = None;
                         if let Ok(mut cache) = verdict_cache.write() {
-                            cache.insert(
-                                key,
-                                CachedVerdict {
-                                    verdict: match scan_result.verdict {
-                                        DetectionVerdict::Clean => CacheVerdict::Clean,
-                                        DetectionVerdict::Malicious => CacheVerdict::Malicious,
-                                        DetectionVerdict::Suspicious => CacheVerdict::Suspicious,
-                                        DetectionVerdict::Error => CacheVerdict::ScanError,
-                                    },
-                                    risk_score: scan_result.risk_score as u32,
-                                    confidence: scan_result.confidence,
-                                    threat_name: scan_result.threat_name.clone(),
-                                    sha256: scan_result.sha256.clone(),
-                                    file_size: scan_result.file_size,
-                                    bytes_scanned: scan_result.bytes_scanned,
-                                    truncated: scan_result.truncated,
-                                    definition_generation: current_gen,
-                                    scanned_at: chrono::Utc::now(),
-                                    analysis_completeness: scan_result.analysis_completeness,
-                                    automatic_quarantine_eligible: scan_result
-                                        .automatic_quarantine_eligible,
-                                    execution_block_eligible: scan_result.execution_block_eligible,
-                                },
-                            );
+                            cached_result = cache.get(&key, current_gen);
                         }
-                        scan_result
+
+                        if let Some(cached) = cached_result {
+                            log::debug!("Real-time cache hit for {:?}", key);
+                            DetectionReport {
+                                verdict: match cached.verdict {
+                                    CacheVerdict::Clean => DetectionVerdict::Clean,
+                                    CacheVerdict::Malicious => DetectionVerdict::Malicious,
+                                    CacheVerdict::Suspicious => DetectionVerdict::Suspicious,
+                                    CacheVerdict::ScanError => DetectionVerdict::Error,
+                                },
+                                risk_score: cached.risk_score as u8,
+                                confidence: cached.confidence,
+                                threat_name: cached.threat_name.clone(),
+                                sha256: cached.sha256.clone(),
+                                file_size: cached.file_size,
+                                bytes_scanned: cached.bytes_scanned,
+                                truncated: cached.truncated,
+                                analysis_completeness: cached.analysis_completeness,
+                                static_report: None,
+                                rule_matches: Vec::new(),
+                                similarity_matches: Vec::new(),
+                                container_inspection: None,
+                                amsi_report: None,
+                                amsi_error: None,
+                                elapsed: std::time::Duration::ZERO,
+                                from_cache: true,
+                                error: None,
+                                automatic_quarantine_eligible: cached.automatic_quarantine_eligible,
+                                execution_block_eligible: cached.execution_block_eligible,
+                            }
+                        } else {
+                            log::debug!("Real-time cache miss for {:?}", key);
+                            let scan_result = active_engine.scan_open_file(&file);
+
+                            if let Ok(mut cache) = verdict_cache.write() {
+                                cache.insert(
+                                    key,
+                                    CachedVerdict {
+                                        verdict: match scan_result.verdict {
+                                            DetectionVerdict::Clean => CacheVerdict::Clean,
+                                            DetectionVerdict::Malicious => CacheVerdict::Malicious,
+                                            DetectionVerdict::Suspicious => {
+                                                CacheVerdict::Suspicious
+                                            }
+                                            DetectionVerdict::Error => CacheVerdict::ScanError,
+                                        },
+                                        risk_score: scan_result.risk_score as u32,
+                                        confidence: scan_result.confidence,
+                                        threat_name: scan_result.threat_name.clone(),
+                                        sha256: scan_result.sha256.clone(),
+                                        file_size: scan_result.file_size,
+                                        bytes_scanned: scan_result.bytes_scanned,
+                                        truncated: scan_result.truncated,
+                                        definition_generation: current_gen,
+                                        scanned_at: chrono::Utc::now(),
+                                        analysis_completeness: scan_result.analysis_completeness,
+                                        automatic_quarantine_eligible: scan_result
+                                            .automatic_quarantine_eligible,
+                                        execution_block_eligible: scan_result
+                                            .execution_block_eligible,
+                                    },
+                                );
+                            }
+                            scan_result
+                        }
                     }
-                }
-                Ok(identity) => DetectionReport::error(
-                    format!(
-                        "kernel/user file identity mismatch (expected {:016x}, opened {:016x})",
-                        notification.file_id, identity.file_id
+                    Ok(identity) => DetectionReport::error(
+                        format!(
+                            "kernel/user file identity mismatch (expected {:016x}, opened {:016x})",
+                            notification.file_id, identity.file_id
+                        ),
+                        Duration::ZERO,
                     ),
-                    Duration::ZERO,
-                ),
+                    Err(error) => DetectionReport::error(
+                        format!("could not verify the opened file identity: {error}"),
+                        Duration::ZERO,
+                    ),
+                },
                 Err(error) => DetectionReport::error(
-                    format!("could not verify the opened file identity: {error}"),
+                    format!("could not open the exact candidate for analysis: {error}"),
                     Duration::ZERO,
                 ),
-            },
-            Err(error) => DetectionReport::error(
-                format!("could not open the exact candidate for analysis: {error}"),
-                Duration::ZERO,
-            ),
+            };
+            (report, path)
         };
+        let (mut report, mut path) = scan();
+        // An execution that could not be judged: the file changed underneath the scan, was swapped
+        // for another, or could not be opened. Those are the tricks a launcher plays to get an
+        // image past the scan, so it is tried once more and then refused unless it is signed.
+        if notification.operation == OPERATION_EXECUTE_SECTION
+            && report.verdict == DetectionVerdict::Error
+        {
+            (report, path) = scan();
+            if report.verdict == DetectionVerdict::Error
+                && !trust::verify_file_cached(&path).is_trusted()
+            {
+                log::warn!(
+                    "Blocked execution of {path:?}: it could not be scanned ({})",
+                    report.error.as_deref().unwrap_or("unknown error")
+                );
+                report.execution_block_eligible = true;
+            }
+        }
         let driver_verdict = execution_driver_verdict(&report);
         let reply_accepted = reply(
             item.port,
@@ -832,10 +857,14 @@ fn handle_protected_modification(
         && notification.process_id != 0
         && notification.process_start_key != 0
     {
-        if let Some(vault) = crate::rollback::global() {
+        // The driver reports `\Device\HarddiskVolumeN\...`, which Win32 file calls cannot open,
+        // and restore checks folders by their drive-letter path; the vault keeps that form.
+        if let (Some(vault), Some(document)) =
+            (crate::rollback::global(), device_path_to_dos_path(path))
+        {
             vault.preserve(
                 (notification.process_id, notification.process_start_key),
-                path,
+                &document,
             );
         }
     }
@@ -890,7 +919,13 @@ fn handle_protected_modification(
         // Only an unsigned writer is learned. A signed program doing this is far more likely
         // hijacked than malicious itself, and a shard for powershell.exe would break the machine.
         if let (Some(image), ProcessTrust::Untrusted) = (terminated, process_trust) {
-            learn_and_quarantine(&image, engine, quarantine, history, definition_generation);
+            if behaviour_removal_allowed(&image, &system_root(), &program_files_folders()) {
+                learn_and_quarantine(&image, engine, quarantine, history, definition_generation);
+            } else {
+                log::warn!(
+                    "Stopped {image:?} for ransomware-like writes; it is installed software, so it was not removed"
+                );
+            }
         }
     }
     if !decision.alert {
@@ -942,7 +977,7 @@ fn undo_ransomware_damage(process: crate::rollback::ProcessKey, history: &EventH
         return;
     };
     let summary = vault.restore(process, |folder| {
-        crate::quarantine::pin_restore_directory(folder).map(drop)
+        crate::quarantine::pin_restore_directory(folder)
     });
     if summary.restored + summary.failed == 0 {
         return;
@@ -1166,6 +1201,37 @@ fn opened_final_path(file: &File) -> std::io::Result<PathBuf> {
     )))
 }
 
+/// `\Device\HarddiskVolumeN\Users\...` as `C:\Users\...`, for volumes with a drive letter.
+fn device_path_to_dos_path(path: &Path) -> Option<PathBuf> {
+    use windows_sys::Win32::Storage::FileSystem::QueryDosDeviceW;
+    let text = path.to_string_lossy();
+    for letter in b'A'..=b'Z' {
+        let drive: Vec<u16> = [letter as u16, b':' as u16, 0].to_vec();
+        let mut target = vec![0u16; 1024];
+        let written =
+            unsafe { QueryDosDeviceW(drive.as_ptr(), target.as_mut_ptr(), target.len() as u32) };
+        if written == 0 {
+            continue;
+        }
+        // A list of NUL-terminated names; the first is the current mapping.
+        let Some(device) = target
+            .split(|unit| *unit == 0)
+            .next()
+            .and_then(|device| String::from_utf16(device).ok())
+        else {
+            continue;
+        };
+        if device.is_empty() || !text.is_char_boundary(device.len()) {
+            continue;
+        }
+        let (head, rest) = text.split_at(device.len());
+        if head.eq_ignore_ascii_case(&device) && rest.starts_with('\\') {
+            return Some(PathBuf::from(format!("{}:{rest}", letter as char)));
+        }
+    }
+    None
+}
+
 fn device_path_to_openable_path(path: &Path) -> PathBuf {
     let display = path.to_string_lossy();
     if display.starts_with("\\Device\\") {
@@ -1246,20 +1312,18 @@ fn termination_policy(
     if process_id == 0 || process_id == 4 || process_id == std::process::id() {
         return Err(SpareReason::ReservedProcessId);
     }
-    // Compared component by component, so `C:\WindowsApps` does not count as `C:\Windows`.
-    let in_system_root = PathBuf::from(image.to_string_lossy().to_ascii_lowercase())
-        .starts_with(system_root.to_string_lossy().to_ascii_lowercase());
-    if critical && in_system_root {
-        // Terminating a critical process bugchecks the machine. Outside the Windows folder it is
-        // malware that marked itself critical so that killing it crashes Windows; the flag is
-        // cleared before it is terminated.
+    let in_system_folder = in_protected_system_folder(image, system_root);
+    if critical && in_system_folder {
+        // Terminating a critical process bugchecks the machine. Anywhere else it is malware that
+        // marked itself critical so that killing it crashes Windows; the flag is cleared before
+        // it is terminated.
         return Err(SpareReason::Critical);
     }
     let reserved_name = image
         .file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| NEVER_TERMINATE.contains(&name.to_ascii_lowercase().as_str()));
-    if in_system_root && reserved_name {
+    if in_system_folder && reserved_name {
         return Err(SpareReason::ProtectedSystemBinary);
     }
     // ponytail: bounded by when the event was dequeued, not when it happened. A process ID reused
@@ -1269,6 +1333,60 @@ fn termination_policy(
         return Err(SpareReason::CreatedAfterEvent);
     }
     Ok(())
+}
+
+/// Whether `image` sits directly in `%SystemRoot%`, `System32` or `SysWOW64`, which only
+/// TrustedInstaller and administrators can write. A prefix match on `%SystemRoot%` is not enough:
+/// a standard user can write `C:\Windows\Temp`, `C:\Windows\Tasks` and a few folders under
+/// `System32`, and malware named `svchost.exe` there must not be spared.
+fn in_protected_system_folder(image: &Path, system_root: &Path) -> bool {
+    let Some(folder) = image.parent() else {
+        return false;
+    };
+    let folder = folder.to_string_lossy().to_ascii_lowercase();
+    let folder = folder.trim_end_matches('\\');
+    let root = system_root.to_string_lossy().to_ascii_lowercase();
+    let root = root.trim_end_matches('\\');
+    folder == root || folder == format!(r"{root}\system32") || folder == format!(r"{root}\syswow64")
+}
+
+/// Whether a program convicted only by what it did, not by a signature, may be quarantined and
+/// learned automatically. Only where a standard user or a download can put a program: anything
+/// installed under Program Files or in Windows' own folders is stopped but left for a person to
+/// judge, so a hijacked or abused installed program is not deleted, blocklisted machine-wide and
+/// stripped of its services on the strength of 24 writes.
+fn behaviour_removal_allowed(image: &Path, system_root: &Path, program_files: &[PathBuf]) -> bool {
+    let lower = |path: &Path| PathBuf::from(path.to_string_lossy().to_ascii_lowercase());
+    let image = lower(image);
+    if program_files
+        .iter()
+        .any(|folder| image.starts_with(lower(folder)))
+    {
+        return false;
+    }
+    let root = lower(system_root);
+    if image.starts_with(&root) {
+        // The parts of the Windows folder a standard user can write.
+        return [
+            r"temp",
+            r"tasks",
+            r"tracing",
+            r"system32\tasks",
+            r"system32\spool\drivers\color",
+            r"syswow64\tasks",
+        ]
+        .iter()
+        .any(|writable| image.starts_with(root.join(writable)));
+    }
+    true
+}
+
+fn program_files_folders() -> Vec<PathBuf> {
+    ["ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .collect()
 }
 
 /// Terminates the process the ransomware heuristic blocked, unless the policy spares it, and
@@ -1312,7 +1430,7 @@ fn undo_documents_changed_by(process_id: u32, created_at: std::time::SystemTime)
         return;
     };
     let summary = vault.restore_process_id(process_id, created_at, |folder| {
-        crate::quarantine::pin_restore_directory(folder).map(drop)
+        crate::quarantine::pin_restore_directory(folder)
     });
     if summary.restored + summary.failed > 0 {
         log::warn!(
@@ -1332,6 +1450,84 @@ pub(crate) fn running_process_images() -> Vec<PathBuf> {
     images.sort();
     images.dedup();
     images
+}
+
+/// The DLLs loaded into every running process this service can read, outside Windows' own
+/// folders, for the turbo hunt.
+pub(crate) fn running_process_modules() -> Vec<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::Threading::OpenProcess;
+    const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
+    const PROCESS_VM_READ: u32 = 0x0010;
+    const LIST_MODULES_ALL: u32 = 0x03;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn K32EnumProcessModulesEx(
+            process: HANDLE,
+            modules: *mut isize,
+            size: u32,
+            needed: *mut u32,
+            filter: u32,
+        ) -> i32;
+        fn K32GetModuleFileNameExW(
+            process: HANDLE,
+            module: isize,
+            name: *mut u16,
+            size: u32,
+        ) -> u32;
+    }
+    let system_root = system_root();
+    let side_by_side = PathBuf::from(
+        system_root
+            .join("WinSxS")
+            .to_string_lossy()
+            .to_ascii_lowercase(),
+    );
+    let mut modules = Vec::new();
+    for process_id in running_process_ids() {
+        if process_id <= 4 {
+            continue;
+        }
+        let handle =
+            unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, process_id) };
+        if handle == 0 {
+            continue;
+        }
+        let process = OwnedProcess(handle);
+        let mut handles = vec![0isize; 1024];
+        let mut needed = 0u32;
+        let listed = unsafe {
+            K32EnumProcessModulesEx(
+                process.0,
+                handles.as_mut_ptr(),
+                (handles.len() * mem::size_of::<isize>()) as u32,
+                &mut needed,
+                LIST_MODULES_ALL,
+            )
+        };
+        if listed == 0 {
+            continue;
+        }
+        handles.truncate((needed as usize / mem::size_of::<isize>()).min(handles.len()));
+        for module in handles {
+            let mut name = vec![0u16; 32_768];
+            let length = unsafe {
+                K32GetModuleFileNameExW(process.0, module, name.as_mut_ptr(), name.len() as u32)
+            } as usize;
+            if length == 0 {
+                continue;
+            }
+            let path = PathBuf::from(std::ffi::OsString::from_wide(&name[..length]));
+            let lower = PathBuf::from(path.to_string_lossy().to_ascii_lowercase());
+            if in_protected_system_folder(&path, &system_root) || lower.starts_with(&side_by_side) {
+                continue;
+            }
+            modules.push(path);
+        }
+    }
+    modules.sort();
+    modules.dedup();
+    modules
 }
 
 fn running_process_ids() -> Vec<u32> {
@@ -1381,6 +1577,19 @@ const PROCESS_SUSPEND_RESUME: u32 = 0x0800;
 /// `PROCESS_INFORMATION_CLASS::ProcessBreakOnTermination`: the critical-process flag.
 const PROCESS_BREAK_ON_TERMINATION: u32 = 29;
 const SE_DEBUG_PRIVILEGE: u32 = 20;
+const SE_BACKUP_PRIVILEGE: u32 = 17;
+
+/// Lets the service read files whatever their permissions say, with `FILE_FLAG_BACKUP_SEMANTICS`.
+/// LocalSystem holds the privilege but it starts disabled.
+pub(crate) fn enable_backup_privilege() {
+    let mut previous = 0u8;
+    let status = unsafe { RtlAdjustPrivilege(SE_BACKUP_PRIVILEGE, 1, 0, &mut previous) };
+    if status < 0 {
+        log::warn!(
+            "SeBackupPrivilege could not be enabled (0x{status:08X}); files that deny SYSTEM read access cannot be scanned"
+        );
+    }
+}
 
 #[link(name = "ntdll")]
 extern "system" {
@@ -1546,7 +1755,13 @@ fn clear_critical(handle: HANDLE) -> bool {
 fn terminate_all(targets: Vec<Target>) -> Vec<(u32, std::time::SystemTime, PathBuf)> {
     use windows_sys::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
     for target in &targets {
-        unsafe { NtSuspendProcess(target.process.0) };
+        let status = unsafe { NtSuspendProcess(target.process.0) };
+        if status < 0 {
+            log::warn!(
+                "Could not suspend PID {} before terminating it (0x{status:08X})",
+                target.process_id
+            );
+        }
     }
     let mut terminated = Vec::new();
     for target in targets {
@@ -1560,6 +1775,14 @@ fn terminate_all(targets: Vec<Target>) -> Vec<(u32, std::time::SystemTime, PathB
             continue;
         }
         if unsafe { TerminateProcess(target.process.0, 1) } == 0 {
+            // Left suspended on purpose: a convicted program that cannot be killed does less
+            // harm frozen than running.
+            log::warn!(
+                "Could not terminate PID {} ({:?}): {}; it stays suspended",
+                target.process_id,
+                target.image,
+                std::io::Error::last_os_error()
+            );
             continue;
         }
         terminated.push(target);
@@ -1626,7 +1849,7 @@ pub(crate) fn freeze_programs_started_since(since: std::time::SystemTime) -> Fro
             continue;
         };
         let comparable = comparable_image_path(&image);
-        if comparable.starts_with(&system_root)
+        if in_protected_system_folder(&image, &system_root)
             || own_folder
                 .as_ref()
                 .is_some_and(|folder| comparable.starts_with(folder))
@@ -1694,6 +1917,46 @@ mod tests {
             policy(r"c:\windows\system32\SearchIndexer.EXE", false, -5_000),
             Err(SpareReason::ProtectedSystemBinary)
         );
+    }
+
+    #[test]
+    fn user_writable_windows_folders_are_not_protected() {
+        assert_eq!(
+            policy(r"C:\Windows\Tasks\svchost.exe", false, -5_000),
+            Ok(())
+        );
+        assert_eq!(
+            policy(
+                r"C:\Windows\System32\spool\drivers\color\csrss.exe",
+                true,
+                -5_000
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            policy(r"C:\Windows\SysWOW64\svchost.exe", false, -5_000),
+            Err(SpareReason::ProtectedSystemBinary)
+        );
+    }
+
+    #[test]
+    fn behaviour_alone_removes_only_programs_in_user_writable_places() {
+        let root = Path::new(r"C:\Windows");
+        let program_files = [
+            PathBuf::from(r"C:\Program Files"),
+            PathBuf::from(r"C:\Program Files (x86)"),
+        ];
+        let allowed =
+            |image: &str| behaviour_removal_allowed(Path::new(image), root, &program_files);
+        assert!(allowed(r"C:\Users\x\Downloads\invoice.exe"));
+        assert!(allowed(r"C:\ProgramData\updater\svc.exe"));
+        assert!(allowed(r"C:\Windows\Temp\x.exe"));
+        assert!(allowed(r"D:\tools\x.exe"));
+        assert!(!allowed(r"C:\Program Files\Editor\editor.exe"));
+        assert!(!allowed(r"C:\Program Files (x86)\Old\old.exe"));
+        assert!(!allowed(
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+        ));
     }
 
     #[test]

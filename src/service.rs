@@ -410,10 +410,7 @@ mod windows_service_host {
         if let Err(error) = crate::rollback::init(crate::paths::state_dir().join("Rollback")) {
             log::warn!("Ransomware rollback is unavailable: {error}");
         }
-        // How the boot record and the lock-out registry values look now, for the turbo hunt to
-        // put back. Off the startup path: reading the registry of every signed-in user takes a
-        // moment.
-        std::thread::spawn(crate::repair::take_baseline);
+        crate::realtime::enable_backup_privilege();
 
         let health_path = default_service_health_path();
         let started_at = Utc::now();
@@ -435,6 +432,11 @@ mod windows_service_host {
             .read()
             .map(|value| value.real_time_active())
             .unwrap_or(true);
+        // Whether the loaded signatures include the potentially-unwanted-program databases.
+        let mut loaded_pua = settings.read().is_ok_and(|value| value.detect_pua);
+        let (pua_sender, pua_receiver) = mpsc::channel();
+        let mut pua_loading = false;
+        let mut pua_failed: Option<bool> = None;
 
         // The minifilter's presence decides how much of the machine can be watched. Detected once
         // here rather than re-derived, so every later decision agrees on the tier.
@@ -477,7 +479,7 @@ mod windows_service_host {
         let engine = match load_detection_engine(&mut snapshot, &history) {
             Ok(engine) => {
                 let engine = if let Some(active) = active_freshclam.as_ref() {
-                    match load_native_index(active) {
+                    match load_native_index(active, loaded_pua) {
                         Ok(index) => engine.with_native_index(index),
                         Err(error) => {
                             log::warn!("ClamAV native SHA-256 index was not loaded: {error}");
@@ -531,33 +533,34 @@ mod windows_service_host {
 
         readiness.update_state(crate::readiness::ReadinessState::ValidatingProtocol);
         snapshot.readiness = Some(readiness.diagnostics().current_state);
-        let rpc_server = match RpcServer::start(RpcServiceResources::new(
-            Arc::clone(&engine),
-            Arc::clone(&quarantine),
-            Arc::clone(&history),
-            Arc::clone(&settings),
-            settings_path.clone(),
-            rpc_update_sender,
-            update_client.is_some(),
-        )) {
-            Ok(server) => server,
+        let updates_configured = update_client.is_some();
+        let start_rpc = || {
+            RpcServer::start(RpcServiceResources::new(
+                Arc::clone(&engine),
+                Arc::clone(&quarantine),
+                Arc::clone(&history),
+                Arc::clone(&settings),
+                settings_path.clone(),
+                rpc_update_sender.clone(),
+                updates_configured,
+            ))
+        };
+        // Without the control pipe the UI cannot connect, but protection does not depend on it:
+        // the driver talks to the service over its own port. A process that grabbed the pipe name
+        // first used to stop the whole service; now protection keeps running and the pipe is
+        // retried.
+        let mut rpc_server = match start_rpc() {
+            Ok(server) => Some(server),
             Err(error) => {
-                if let Some(client) = update_client.take() {
-                    client.stop();
-                }
-                protection.stop();
-                readiness.update_state(crate::readiness::ReadinessState::Failed {
-                    reason: error.clone(),
-                });
-                snapshot.lifecycle = ServiceLifecycle::Stopped;
-                snapshot.connection = ServiceConnection::Stopped;
-                snapshot.updated_at = Utc::now();
-                snapshot.last_error = Some(error.clone());
-                snapshot.readiness = Some(readiness.diagnostics().current_state);
-                write_health_best_effort(&health_path, &snapshot, &history);
-                return Err(error);
+                let message = format!(
+                    "The control pipe could not be created; the UI cannot connect until it is: {error}"
+                );
+                append_error(&history, &message);
+                snapshot.last_error = Some(message);
+                None
             }
         };
+        let mut last_rpc_attempt = Instant::now();
         let mut last_manual_update = None::<Instant>;
         let mut last_expired_reload = None::<Instant>;
         let mut last_vault_purge = Instant::now();
@@ -570,7 +573,9 @@ mod windows_service_host {
         snapshot.counters = counter_snapshot(&counters, &protection, &mut snapshot.last_error);
         write_health_best_effort(&health_path, &snapshot, &history);
         if let Err(error) = report_state(BodyState::Running) {
-            rpc_server.stop();
+            if let Some(server) = rpc_server.take() {
+                server.stop();
+            }
             if let Some(client) = update_client.take() {
                 client.stop();
             }
@@ -615,6 +620,31 @@ mod windows_service_host {
                 changed |= apply_realtime_event(&mut snapshot, event);
             }
 
+            while let Ok((wanted, loaded)) = pua_receiver.try_recv() {
+                pua_loading = false;
+                match loaded {
+                    Ok(index) => {
+                        if let Ok(current) = engine.read() {
+                            current.replace_native_index(index);
+                        }
+                        definition_generation.fetch_add(1, std::sync::atomic::Ordering::Release);
+                        loaded_pua = wanted;
+                        pua_failed = None;
+                    }
+                    Err(error) => {
+                        // Not retried every few seconds; the next definitions update tries again.
+                        pua_failed = Some(wanted);
+                        let message = format!(
+                            "Adware signatures could not be {}: {error}",
+                            if wanted { "loaded" } else { "unloaded" }
+                        );
+                        append_error(&history, &message);
+                        snapshot.last_error = Some(message);
+                        changed = true;
+                    }
+                }
+            }
+
             while let Ok(update) = freshclam_receiver.try_recv() {
                 let active = match update {
                     Ok(active) => active,
@@ -626,11 +656,14 @@ mod windows_service_host {
                         continue;
                     }
                 };
-                match load_native_index(&active) {
+                let wanted_pua = settings.read().is_ok_and(|value| value.detect_pua);
+                match load_native_index(&active, wanted_pua) {
                     Ok(index) => {
                         if let Ok(current) = engine.read() {
                             current.replace_native_index(index);
                         }
+                        loaded_pua = wanted_pua;
+                        pua_failed = None;
                         active_freshclam = Some(active);
                         definition_generation.fetch_add(1, std::sync::atomic::Ordering::Release);
                         changed = true;
@@ -732,6 +765,14 @@ mod windows_service_host {
                 }
             }
 
+            if rpc_server.is_none() && last_rpc_attempt.elapsed() >= Duration::from_secs(10) {
+                last_rpc_attempt = Instant::now();
+                if let Ok(server) = start_rpc() {
+                    log::info!("The control pipe is up");
+                    rpc_server = Some(server);
+                }
+            }
+
             if last_vault_purge.elapsed() >= VAULT_PURGE_INTERVAL {
                 last_vault_purge = Instant::now();
                 if let Some(vault) = crate::rollback::global() {
@@ -756,6 +797,22 @@ mod windows_service_host {
                 if snapshot.real_time_enabled != active {
                     snapshot.real_time_enabled = active;
                     changed = true;
+                }
+                // Switching adware detection on or off reloads the signatures it changes, on a
+                // thread of its own: loading 400,000 signatures would stall this loop.
+                let wanted_pua = settings.read().is_ok_and(|value| value.detect_pua);
+                if wanted_pua != loaded_pua && !pua_loading && pua_failed != Some(wanted_pua) {
+                    if let Some(active) = active_freshclam.clone() {
+                        pua_loading = true;
+                        let sender = pua_sender.clone();
+                        std::thread::spawn(move || {
+                            let _ =
+                                sender.send((wanted_pua, load_native_index(&active, wanted_pua)));
+                        });
+                    } else {
+                        // Nothing loaded yet; the first definitions load with the setting.
+                        loaded_pua = wanted_pua;
+                    }
                 }
             }
 
@@ -869,7 +926,9 @@ mod windows_service_host {
         write_health_best_effort(&health_path, &snapshot, &history);
         let stop_status_error = report_state(BodyState::StopPending).err();
 
-        rpc_server.stop();
+        if let Some(server) = rpc_server.take() {
+            server.stop();
+        }
         if let Some(client) = update_client.take() {
             client.stop();
         }
@@ -1087,12 +1146,13 @@ mod windows_service_host {
 
     fn load_native_index(
         active: &crate::clamdb::downloader::ActiveDatabase,
+        include_pua: bool,
     ) -> Result<crate::clamdb::native_index::NativeIndex, String> {
         let mut index = crate::clamdb::native_index::NativeIndex::new();
         let loaded = index
             .load_from_directory(
                 &active.unpacked_path,
-                crate::clamdb::native_index::LoadOptions::default(),
+                crate::clamdb::native_index::LoadOptions { include_pua },
             )
             .map_err(|error| error.to_string())?;
         log::info!(

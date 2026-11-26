@@ -92,7 +92,9 @@ mod platform {
 
     const WTD_UI_NONE: Dword = 2;
     const WTD_REVOKE_NONE: Dword = 0;
+    const WTD_REVOKE_WHOLECHAIN: Dword = 1;
     const WTD_CHOICE_FILE: Dword = 1;
+    const WTD_CHOICE_CATALOG: Dword = 2;
     const WTD_STATEACTION_IGNORE: Dword = 0;
 
     const WTD_CACHE_ONLY_URL_RETRIEVAL: Dword = 0x0000_1000;
@@ -112,6 +114,34 @@ mod platform {
         data4: [0x8c, 0xc2, 0x00, 0xc0, 0x4f, 0xc2, 0x95, 0xee],
     };
 
+    /// `DRIVER_ACTION_VERIFY`: the subsystem Windows' own catalogs are registered under.
+    const DRIVER_ACTION_VERIFY: Guid = Guid {
+        data1: 0xf750_e6c3,
+        data2: 0x38ee,
+        data3: 0x11d1,
+        data4: [0x85, 0xe5, 0x00, 0xc0, 0x4f, 0xc2, 0x95, 0xee],
+    };
+
+    #[repr(C)]
+    struct CatalogInfo {
+        cb_struct: Dword,
+        catalog_file: [u16; 260],
+    }
+
+    #[repr(C)]
+    struct WintrustCatalogInfo {
+        cb_struct: Dword,
+        catalog_version: Dword,
+        catalog_file_path: *const u16,
+        member_tag: *const u16,
+        member_file_path: *const u16,
+        member_file: Handle,
+        calculated_file_hash: *const u8,
+        calculated_file_hash_size: Dword,
+        catalog_context: *mut c_void,
+        admin_context: Handle,
+    }
+
     #[repr(C)]
     struct WintrustFileInfo {
         cb_struct: Dword,
@@ -128,7 +158,8 @@ mod platform {
         ui_choice: Dword,
         revocation_checks: Dword,
         union_choice: Dword,
-        file_info: *mut WintrustFileInfo,
+        /// A `WintrustFileInfo` or a `WintrustCatalogInfo`, as `union_choice` says.
+        subject: *mut c_void,
         state_action: Dword,
         state_data: Handle,
         url_reference: *mut u16,
@@ -144,6 +175,156 @@ mod platform {
             action_id: *const Guid,
             trust_data: *mut WintrustData,
         ) -> Long;
+        fn CryptCATAdminAcquireContext2(
+            admin: *mut Handle,
+            subsystem: *const Guid,
+            hash_algorithm: *const u16,
+            strong_hash_policy: *const c_void,
+            flags: Dword,
+        ) -> i32;
+        fn CryptCATAdminCalcHashFromFileHandle2(
+            admin: Handle,
+            file: Handle,
+            hash_size: *mut Dword,
+            hash: *mut u8,
+            flags: Dword,
+        ) -> i32;
+        fn CryptCATAdminEnumCatalogFromHash(
+            admin: Handle,
+            hash: *const u8,
+            hash_size: Dword,
+            flags: Dword,
+            previous: *mut Handle,
+        ) -> Handle;
+        fn CryptCATCatalogInfoFromContext(
+            catalog: Handle,
+            info: *mut CatalogInfo,
+            flags: Dword,
+        ) -> i32;
+        fn CryptCATAdminReleaseCatalogContext(admin: Handle, catalog: Handle, flags: Dword) -> i32;
+        fn CryptCATAdminReleaseContext(admin: Handle, flags: Dword) -> i32;
+    }
+
+    /// Runs WinVerifyTrust on `subject`, checking revocation against what Windows has cached.
+    /// When the cache has nothing to say, the chain alone decides: an unknown revocation status
+    /// is not a revocation, and treating it as one would distrust most of the machine offline.
+    fn call_winverifytrust(union_choice: Dword, subject: *mut c_void) -> Long {
+        let run = |revocation_checks: Dword| {
+            let mut trust_data = WintrustData {
+                cb_struct: std::mem::size_of::<WintrustData>() as Dword,
+                policy_callback_data: ptr::null_mut(),
+                sip_client_data: ptr::null_mut(),
+                ui_choice: WTD_UI_NONE,
+                revocation_checks,
+                union_choice,
+                subject,
+                state_action: WTD_STATEACTION_IGNORE,
+                state_data: ptr::null_mut(),
+                url_reference: ptr::null_mut(),
+                provider_flags: WTD_CACHE_ONLY_URL_RETRIEVAL,
+                ui_context: 0,
+                signature_settings: ptr::null_mut(),
+            };
+            unsafe {
+                WinVerifyTrust(
+                    ptr::null_mut(),
+                    &GENERIC_AUTHENTICODE_POLICY,
+                    &mut trust_data,
+                )
+            }
+        };
+        match run(WTD_REVOKE_WHOLECHAIN) {
+            super::CERT_E_REVOCATION_FAILURE | super::CRYPT_E_REVOCATION_OFFLINE => {
+                run(WTD_REVOKE_NONE)
+            }
+            status => status,
+        }
+    }
+
+    /// Most of Windows' own binaries carry no signature of their own: they are signed through a
+    /// security catalog. Without this they all read as unsigned, and PowerShell or the shell would
+    /// be judged like a dropped program. Tries the SHA-256 catalogs, then the older SHA-1 ones.
+    fn verify_catalog(wide_path: &[u16], file: &File) -> Option<AuthenticodeStatus> {
+        let sha256: Vec<u16> = "SHA256\0".encode_utf16().collect();
+        [sha256.as_ptr(), ptr::null()]
+            .into_iter()
+            .find_map(|algorithm| verify_catalog_with(wide_path, file, algorithm))
+    }
+
+    fn verify_catalog_with(
+        wide_path: &[u16],
+        file: &File,
+        algorithm: *const u16,
+    ) -> Option<AuthenticodeStatus> {
+        let handle: Handle = file.as_raw_handle().cast();
+        let mut admin: Handle = ptr::null_mut();
+        let acquired = unsafe {
+            CryptCATAdminAcquireContext2(
+                &mut admin,
+                &DRIVER_ACTION_VERIFY,
+                algorithm,
+                ptr::null(),
+                0,
+            )
+        };
+        if acquired == 0 {
+            return None;
+        }
+        let status = (|| {
+            let mut size: Dword = 0;
+            // The first call only reports the hash size.
+            unsafe {
+                CryptCATAdminCalcHashFromFileHandle2(admin, handle, &mut size, ptr::null_mut(), 0)
+            };
+            if size == 0 || size > 64 {
+                return None;
+            }
+            let mut hash = vec![0u8; size as usize];
+            if unsafe {
+                CryptCATAdminCalcHashFromFileHandle2(admin, handle, &mut size, hash.as_mut_ptr(), 0)
+            } == 0
+            {
+                return None;
+            }
+            let catalog = unsafe {
+                CryptCATAdminEnumCatalogFromHash(admin, hash.as_ptr(), size, 0, ptr::null_mut())
+            };
+            if catalog.is_null() {
+                return None;
+            }
+            let mut info = CatalogInfo {
+                cb_struct: std::mem::size_of::<CatalogInfo>() as Dword,
+                catalog_file: [0; 260],
+            };
+            let status = if unsafe { CryptCATCatalogInfoFromContext(catalog, &mut info, 0) } != 0 {
+                let tag: Vec<u16> = hex::encode_upper(&hash)
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .collect();
+                let mut catalog_info = WintrustCatalogInfo {
+                    cb_struct: std::mem::size_of::<WintrustCatalogInfo>() as Dword,
+                    catalog_version: 0,
+                    catalog_file_path: info.catalog_file.as_ptr(),
+                    member_tag: tag.as_ptr(),
+                    member_file_path: wide_path.as_ptr(),
+                    member_file: handle,
+                    calculated_file_hash: hash.as_ptr(),
+                    calculated_file_hash_size: size,
+                    catalog_context: ptr::null_mut(),
+                    admin_context: admin,
+                };
+                Some(map_winverifytrust_status(call_winverifytrust(
+                    WTD_CHOICE_CATALOG,
+                    (&mut catalog_info as *mut WintrustCatalogInfo).cast(),
+                )))
+            } else {
+                None
+            };
+            unsafe { CryptCATAdminReleaseCatalogContext(admin, catalog, 0) };
+            status
+        })();
+        unsafe { CryptCATAdminReleaseContext(admin, 0) };
+        status
     }
 
     pub(super) fn verify_file(path: &Path) -> AuthenticodeStatus {
@@ -171,31 +352,14 @@ mod platform {
             known_subject: ptr::null_mut(),
         };
 
-        let mut trust_data = WintrustData {
-            cb_struct: std::mem::size_of::<WintrustData>() as Dword,
-            policy_callback_data: ptr::null_mut(),
-            sip_client_data: ptr::null_mut(),
-            ui_choice: WTD_UI_NONE,
-            revocation_checks: WTD_REVOKE_NONE,
-            union_choice: WTD_CHOICE_FILE,
-            file_info: &mut file_info,
-            state_action: WTD_STATEACTION_IGNORE,
-            state_data: ptr::null_mut(),
-            url_reference: ptr::null_mut(),
-            provider_flags: WTD_CACHE_ONLY_URL_RETRIEVAL,
-            ui_context: 0,
-            signature_settings: ptr::null_mut(),
-        };
-
-        let status = unsafe {
-            WinVerifyTrust(
-                ptr::null_mut(),
-                &GENERIC_AUTHENTICODE_POLICY,
-                &mut trust_data,
-            )
-        };
-
-        map_winverifytrust_status(status)
+        let embedded = map_winverifytrust_status(call_winverifytrust(
+            WTD_CHOICE_FILE,
+            (&mut file_info as *mut WintrustFileInfo).cast(),
+        ));
+        if embedded != AuthenticodeStatus::Unsigned {
+            return embedded;
+        }
+        verify_catalog(&wide_path, &file).unwrap_or(embedded)
     }
 }
 

@@ -3,17 +3,20 @@
 //! hijacks, the wallpaper).
 //!
 //! The approach is a baseline, not a list of known-bad values: the service records how things were
-//! when it started and again when protection is paused, and the turbo hunt puts back whatever
-//! differs. A machine whose administrator set one of these policies on purpose keeps it, because it
-//! was already in the baseline.
+//! the moment an administrator pauses protection, and the turbo hunt that ends that pause puts back
+//! whatever differs. Only that one hunt may use it. A baseline from service start would let a
+//! standard user's turbo, days later, write back a backdoor an administrator had since removed, or
+//! an old boot loader over a new one; a baseline from the pause only undoes the pause.
+use chrono::{DateTime, Utc};
 use std::sync::Mutex;
 
 /// The start of the boot disk that is saved: the MBR, the GPT header and partition entries, and
 /// the gap boot code lives in. Cut short where the first partition begins, so a write never lands
 /// in a volume.
 const BOOT_REGION_BYTES: usize = 1024 * 1024;
-/// Writes to a raw disk must be whole sectors; 4096 covers 512-byte and 4K-native disks alike.
-const SECTOR_ALIGNMENT: usize = 4096;
+/// Writes to a raw disk must be whole sectors. A GPT header says the sector size; an MBR does not,
+/// so its region is cut to 4096, which covers 512-byte and 4K-native disks alike.
+const MBR_ALIGNMENT: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootDecision {
@@ -60,10 +63,15 @@ fn gpt_header(region: &[u8]) -> Option<(&[u8], usize)> {
 
 /// How much of the start of the disk belongs to no partition, from a healthy copy of it.
 pub fn boot_region_len(region: &[u8]) -> usize {
-    let free = if let Some((header, sector)) = gpt_header(region) {
+    if let Some((header, sector)) = gpt_header(region) {
+        // Every partition entry up to the first usable sector, so the entry array's checksum in
+        // the header still holds after a restore.
         let first_usable = u64::from_le_bytes(header[40..48].try_into().unwrap());
-        usize::try_from(first_usable.saturating_mul(sector as u64)).unwrap_or(usize::MAX)
-    } else {
+        let free =
+            usize::try_from(first_usable.saturating_mul(sector as u64)).unwrap_or(usize::MAX);
+        return free.min(BOOT_REGION_BYTES).min(region.len()) / sector * sector;
+    }
+    let free = {
         region[446..510]
             .as_chunks::<16>()
             .0
@@ -73,7 +81,7 @@ pub fn boot_region_len(region: &[u8]) -> usize {
             .min()
             .unwrap_or(0)
     };
-    free.min(BOOT_REGION_BYTES).min(region.len()) / SECTOR_ALIGNMENT * SECTOR_ALIGNMENT
+    free.min(BOOT_REGION_BYTES).min(region.len()) / MBR_ALIGNMENT * MBR_ALIGNMENT
 }
 
 /// Decides whether the saved start of the disk should replace what is there now.
@@ -97,18 +105,21 @@ pub fn boot_decision(saved: &[u8], current: &[u8]) -> BootDecision {
 
 /// Everything recorded about the machine at one moment.
 struct Baseline {
+    /// The pause it was taken for, as `Settings::paused_at`.
+    pause: DateTime<Utc>,
     /// The boot disk's number and the start of it.
     boot: Option<(u32, Vec<u8>)>,
+    /// The hosts file, which malware rewrites to block security sites or redirect banks.
+    hosts: Option<Vec<u8>>,
     #[cfg(windows)]
     registry: registry::Snapshot,
 }
 
 static BASELINE: Mutex<Option<Baseline>> = Mutex::new(None);
 
-/// Records how the machine is now, replacing any earlier baseline. Called when the service starts
-/// and when protection is paused. A boot record that already looks broken is not recorded, so the
-/// previous good copy is kept.
-pub fn take_baseline() {
+/// Records how the machine is now, for the pause that began at `pause`. Replaces any earlier
+/// baseline. A boot record that already looks broken is not recorded.
+pub fn take_baseline(pause: DateTime<Utc>) {
     let boot = boot_disk::read().ok().and_then(|(disk, region)| {
         if !partition_table_valid(&region) {
             log::warn!("The boot record of disk {disk} does not look healthy; not saving it");
@@ -117,26 +128,54 @@ pub fn take_baseline() {
         let length = boot_region_len(&region);
         (length > 0).then(|| (disk, region[..length].to_vec()))
     });
-    let mut baseline = BASELINE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let boot = boot.or_else(|| baseline.as_mut().and_then(|old| old.boot.take()));
-    *baseline = Some(Baseline {
+    let baseline = Baseline {
+        pause,
         boot,
+        hosts: hosts_path().and_then(|path| std::fs::read(path).ok()),
         #[cfg(windows)]
         registry: registry::snapshot(),
-    });
+    };
+    *BASELINE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(baseline);
 }
 
-/// Puts back whatever differs from the baseline, and describes each repair.
-pub fn repair_from_baseline() -> Vec<String> {
-    let baseline = BASELINE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let Some(baseline) = baseline.as_ref() else {
-        return Vec::new();
+fn hosts_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("SystemRoot").map(|root| {
+        std::path::PathBuf::from(root)
+            .join("System32")
+            .join("drivers")
+            .join("etc")
+            .join("hosts")
+    })
+}
+
+/// Puts back whatever differs from the baseline taken when the pause that began at `pause`
+/// started, and describes each repair. The baseline is used up: a later hunt repairs nothing until
+/// the next pause.
+pub fn repair_after_pause(pause: DateTime<Utc>) -> Vec<String> {
+    let baseline = {
+        let mut slot = BASELINE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match slot.take() {
+            Some(baseline) if baseline.pause == pause => baseline,
+            other => {
+                *slot = other;
+                log::warn!("No baseline was recorded for the pause at {pause}; nothing to repair");
+                return Vec::new();
+            }
+        }
     };
     let mut repairs = Vec::new();
+    if let (Some(path), Some(saved)) = (hosts_path(), &baseline.hosts) {
+        if std::fs::read(&path).ok().as_ref() != Some(saved) {
+            match crate::atomic_file::write(&path, saved) {
+                Ok(()) => repairs.push(format!("hosts file put back ({})", path.display())),
+                Err(error) => log::warn!("Could not put back the hosts file: {error}"),
+            }
+        }
+    }
     if let Some((disk, saved)) = &baseline.boot {
         match boot_disk::read_len(*disk, saved.len()) {
             Ok(current) => match boot_decision(saved, &current) {
@@ -323,6 +362,22 @@ mod registry {
             "Userinit",
         ),
         (
+            r"SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion\Winlogon",
+            "Shell",
+        ),
+        (
+            r"SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion\Winlogon",
+            "Userinit",
+        ),
+        // What opens a program, script or text file: hijacked so every launch runs the malware.
+        (r"SOFTWARE\Classes\exefile\shell\open\command", ""),
+        (r"SOFTWARE\Classes\comfile\shell\open\command", ""),
+        (r"SOFTWARE\Classes\batfile\shell\open\command", ""),
+        (r"SOFTWARE\Classes\cmdfile\shell\open\command", ""),
+        (r"SOFTWARE\Classes\regfile\shell\open\command", ""),
+        (r"SOFTWARE\Classes\txtfile\shell\open\command", ""),
+        (r"SOFTWARE\Classes\.exe", ""),
+        (
             r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System",
             "EnableLUA",
         ),
@@ -370,13 +425,20 @@ mod registry {
     pub struct Snapshot {
         users: Vec<String>,
         values: BTreeMap<Location, Value>,
+        /// Values that could not be read when the snapshot was taken: there is nothing to put
+        /// back, so they are left alone.
+        unreadable: Vec<Location>,
     }
 
     /// Signed-in users' hives: `HKU\S-1-5-21-...`, not the service accounts or `_Classes`.
     fn user_sids() -> Vec<String> {
         subkeys(HKEY_USERS, "")
             .into_iter()
-            .filter(|sid| sid.starts_with("S-1-5-21-") && !sid.ends_with("_Classes"))
+            // Local and domain accounts, and Microsoft Entra (Azure AD) accounts.
+            .filter(|sid| {
+                (sid.starts_with("S-1-5-21-") || sid.starts_with("S-1-12-1-"))
+                    && !sid.ends_with("_Classes")
+            })
             .collect()
     }
 
@@ -400,27 +462,61 @@ mod registry {
         all
     }
 
-    fn read((root, path, name): &Location) -> Value {
-        let key = open(root.handle(), path, KEY_QUERY_VALUE)?;
+    /// The value, `Ok(None)` when it does not exist, and `Err` for any other failure (access
+    /// denied, a damaged hive), so an unreadable value is never mistaken for an absent one and
+    /// deleted.
+    fn read((root, path, name): &Location) -> Result<Value, u32> {
+        use windows_sys::Win32::System::Registry::RegOpenKeyExW;
+        const ERROR_FILE_NOT_FOUND: u32 = 2;
+        const ERROR_MORE_DATA: u32 = 234;
+        let wide_path = wide(path);
+        let mut key: HKEY = 0;
+        let opened = unsafe {
+            RegOpenKeyExW(
+                root.handle(),
+                wide_path.as_ptr(),
+                0,
+                KEY_QUERY_VALUE | KEY_WOW64_64KEY,
+                &mut key,
+            )
+        };
+        match opened {
+            0 => {}
+            ERROR_FILE_NOT_FOUND => return Ok(None),
+            error => return Err(error),
+        }
         let name = wide(name);
         let mut kind = 0u32;
         let mut data = vec![0u8; 64 * 1024];
+        let mut status = ERROR_MORE_DATA;
         let mut length = data.len() as u32;
-        let status = unsafe {
-            RegQueryValueExW(
-                key,
-                name.as_ptr(),
-                std::ptr::null(),
-                &mut kind,
-                data.as_mut_ptr(),
-                &mut length,
-            )
-        };
+        // A value larger than the buffer is still a value; retried once at its size.
+        for _ in 0..2 {
+            length = data.len() as u32;
+            status = unsafe {
+                RegQueryValueExW(
+                    key,
+                    name.as_ptr(),
+                    std::ptr::null(),
+                    &mut kind,
+                    data.as_mut_ptr(),
+                    &mut length,
+                )
+            };
+            if status != ERROR_MORE_DATA || length as usize > 16 * 1024 * 1024 {
+                break;
+            }
+            data.resize(length as usize, 0);
+        }
         unsafe { RegCloseKey(key) };
-        (status == 0).then(|| {
-            data.truncate(length as usize);
-            (kind, data)
-        })
+        match status {
+            0 => {
+                data.truncate(length as usize);
+                Ok(Some((kind, data)))
+            }
+            ERROR_FILE_NOT_FOUND => Ok(None),
+            error => Err(error),
+        }
     }
 
     fn write((root, path, name): &Location, value: &Value) -> bool {
@@ -473,14 +569,21 @@ mod registry {
 
     pub fn snapshot() -> Snapshot {
         let users = user_sids();
-        let values = locations(&users, &subkeys(HKEY_LOCAL_MACHINE, IFEO))
-            .into_iter()
-            .map(|location| {
-                let value = read(&location);
-                (location, value)
-            })
-            .collect();
-        Snapshot { users, values }
+        let mut values = BTreeMap::new();
+        let mut unreadable = Vec::new();
+        for location in locations(&users, &subkeys(HKEY_LOCAL_MACHINE, IFEO)) {
+            match read(&location) {
+                Ok(value) => {
+                    values.insert(location, value);
+                }
+                Err(_) => unreadable.push(location),
+            }
+        }
+        Snapshot {
+            users,
+            values,
+            unreadable,
+        }
     }
 
     /// Puts every watched value back as the snapshot has it. Users who signed in after the
@@ -499,9 +602,15 @@ mod registry {
 
         let mut repairs = Vec::new();
         for location in locations(&snapshot.users, &programs) {
-            let saved = snapshot.values.get(&location).cloned().flatten();
-            if read(&location) == saved {
+            if snapshot.unreadable.contains(&location) {
                 continue;
+            }
+            // A debugger entry for a program with no subkey at the time did not exist then.
+            let saved = snapshot.values.get(&location).cloned().flatten();
+            match read(&location) {
+                Ok(current) if current == saved => continue,
+                Ok(_) => {}
+                Err(_) => continue,
             }
             let (root, path, name) = &location;
             if write(&location, &saved) {
@@ -549,7 +658,7 @@ mod tests {
     #[test]
     fn the_saved_region_stops_where_the_first_partition_starts() {
         assert_eq!(boot_region_len(&mbr_disk()), 1024 * 1024);
-        assert_eq!(boot_region_len(&gpt_disk()), 34 * 512 / 4096 * 4096);
+        assert_eq!(boot_region_len(&gpt_disk()), 34 * 512);
         let mut old_alignment = mbr_disk();
         old_alignment[446 + 8..446 + 12].copy_from_slice(&63u32.to_le_bytes());
         assert_eq!(boot_region_len(&old_alignment), 28_672);

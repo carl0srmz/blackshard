@@ -242,6 +242,15 @@ pub struct BlackshardApp {
     settings: Settings,
     settings_dirty: bool,
     settings_save_at: Option<Instant>,
+    /// A turbo hunt waiting for the scan it cancelled to stop.
+    turbo_pending: bool,
+    /// When to repaint the desktop again: the service freezes what started during the pause on
+    /// the hunt's own thread, a moment after the hunt starts.
+    turbo_repaint_at: Option<Instant>,
+    /// Until when to keep asking the service whether a pause sent through the administrator
+    /// prompt took effect.
+    pause_watch_until: Option<Instant>,
+    pause_poll_at: Instant,
     page: Page,
     scan_job: Option<ServiceScanJob>,
     last_handled_scan: Option<Uuid>,
@@ -311,6 +320,10 @@ impl BlackshardApp {
             settings,
             settings_dirty: false,
             settings_save_at: None,
+            turbo_pending: false,
+            turbo_repaint_at: None,
+            pause_watch_until: None,
+            pause_poll_at: Instant::now(),
             page: Page::Dashboard,
             scan_job: None,
             last_handled_scan: None,
@@ -525,38 +538,118 @@ impl BlackshardApp {
 
     /// Pauses real-time protection for a few minutes. It comes back on by itself, with a turbo hunt,
     /// or sooner with turbo. Asks for administrator approval, so malware cannot do this.
+    ///
+    /// The countdown appears only once the service has the pause: the prompt may be declined.
     fn pause_protection(&mut self, minutes: i64) {
-        self.settings.pause_for(minutes);
-        self.save_settings();
+        let mut requested = self.settings.clone();
+        requested.pause_for(minutes);
+        self.notice = Some(match self.client.save_settings(requested.clone()) {
+            Ok(_) => {
+                self.settings = requested;
+                Notice {
+                    level: NoticeLevel::Information,
+                    message: format!(
+                        "protection paused for {minutes} min. turbo ends it sooner and hunts."
+                    ),
+                    created: Instant::now(),
+                }
+            }
+            Err(error) if error.code == RpcErrorCode::AccessDenied => {
+                match elevation::request_save_settings(&requested) {
+                    Ok(()) => {
+                        self.pause_watch_until = Some(Instant::now() + Duration::from_secs(120));
+                        Notice {
+                            level: NoticeLevel::Information,
+                            message:
+                                "approve the windows administrator prompt to pause protection."
+                                    .to_owned(),
+                            created: Instant::now(),
+                        }
+                    }
+                    Err(error) => Notice {
+                        level: NoticeLevel::Error,
+                        message: format!("administrator approval could not be requested: {error}"),
+                        created: Instant::now(),
+                    },
+                }
+            }
+            Err(error) => Notice {
+                level: NoticeLevel::Error,
+                message: format!("protection could not be paused: {error}"),
+                created: Instant::now(),
+            },
+        });
+    }
+
+    /// Follows the service's pause while one may be in effect, so the countdown matches it: a
+    /// pause approved at the prompt appears, and one another hunt ended disappears.
+    fn follow_pause(&mut self) {
+        let watching = self
+            .pause_watch_until
+            .is_some_and(|until| Instant::now() < until)
+            || self.settings.paused_until.is_some();
+        if !watching || Instant::now() < self.pause_poll_at {
+            return;
+        }
+        self.pause_poll_at = Instant::now() + Duration::from_secs(1);
+        if let Ok(current) = self.client.get_settings() {
+            if current.is_paused() {
+                self.pause_watch_until = None;
+            }
+            self.settings.paused_until = current.paused_until;
+            self.settings.paused_at = current.paused_at;
+            self.settings.real_time_protection = current.real_time_protection;
+        }
     }
 
     /// The secret turbo button: protection back on, then a full-speed hunt that stops, removes and
     /// cleans up after whatever it convicts. Triple-click the shard on the status page, or press
     /// Ctrl+Shift+T anywhere.
     fn turbo(&mut self) {
-        // The service switches protection back on when the hunt starts, with no administrator
-        // prompt in the way; this copy just follows.
+        if let Some(running) = self
+            .scan_job
+            .as_ref()
+            .map(ServiceScanJob::snapshot)
+            .filter(|progress| !progress.is_finished())
+        {
+            if running.kind != ScanRequestKind::Turbo {
+                // The hunt matters more: stop the scan, then hunt as soon as it has stopped.
+                if let Some(job) = self.scan_job.as_ref() {
+                    job.cancel();
+                }
+                self.turbo_pending = true;
+                self.notice = Some(Notice {
+                    level: NoticeLevel::Information,
+                    message: "stopping the running scan to hunt.".to_owned(),
+                    created: Instant::now(),
+                });
+            }
+            return;
+        }
+        self.turbo_pending = false;
+        self.start_scan(ScanRequestKind::Turbo);
+        let started = self.scan_job.as_ref().is_some_and(|job| {
+            let progress = job.snapshot();
+            progress.kind == ScanRequestKind::Turbo && !progress.is_finished()
+        });
+        if !started {
+            return;
+        }
+        // The service switched protection back on when the hunt started, with no administrator
+        // prompt in the way; this copy follows.
         self.settings.resume();
+        self.settings.paused_at = None;
         if let Ok(mut runtime) = self.runtime.lock() {
             runtime.desired_real_time_protection = true;
         }
-        self.start_scan(ScanRequestKind::Turbo);
-        // The service froze what started during the pause; repaint over whatever it drew.
-        refresh_desktop(false);
+        self.turbo_repaint_at = Some(Instant::now() + Duration::from_millis(1500));
         // The hunt plays out on the status page, where the shard shows it.
         self.page = Page::Dashboard;
-        if self
-            .scan_job
-            .as_ref()
-            .is_some_and(|job| job.snapshot().kind == ScanRequestKind::Turbo)
-        {
-            self.notice = Some(Notice {
-                level: NoticeLevel::Information,
-                message: "turbo: protection is on, and blackshard is hunting at full speed."
-                    .to_owned(),
-                created: Instant::now(),
-            });
-        }
+        self.notice = Some(Notice {
+            level: NoticeLevel::Information,
+            message: "turbo: protection is on, and blackshard is hunting at full speed.".to_owned(),
+            created: Instant::now(),
+        });
     }
 
     fn start_custom_scan(&mut self) {
@@ -1392,6 +1485,12 @@ impl BlackshardApp {
                 .changed();
             changed |= ui
                 .checkbox(
+                    &mut self.settings.detect_pua,
+                    "also catch adware and other unwanted programs (flags some legitimate software)",
+                )
+                .changed();
+            changed |= ui
+                .checkbox(
                     &mut self.settings.automatic_quarantine,
                     "move confirmed malware to quarantine automatically",
                 )
@@ -1751,16 +1850,35 @@ impl eframe::App for BlackshardApp {
         }) {
             self.turbo();
         }
+        self.follow_pause();
         // The service resumes by itself when a pause runs out; the hunt that cleans up after it
         // starts from here.
-        if self
+        let scan_running = self
+            .scan_job
+            .as_ref()
+            .is_some_and(|job| !job.snapshot().is_finished());
+        if self.turbo_pending && !scan_running {
+            self.turbo();
+        } else if self
             .settings
             .paused_until
             .is_some_and(|until| Utc::now() >= until)
         {
+            self.settings.paused_until = None;
             self.turbo();
-        } else if self.settings.paused_until.is_some() {
+        }
+        if self.settings.paused_until.is_some()
+            || self.pause_watch_until.is_some()
+            || self.turbo_pending
+        {
             ctx.request_repaint_after(Duration::from_millis(500));
+        }
+        if self.turbo_repaint_at.is_some_and(|at| Instant::now() >= at) {
+            self.turbo_repaint_at = None;
+            // Repaint over whatever the frozen programs drew straight onto the screen.
+            refresh_desktop(false);
+        } else if self.turbo_repaint_at.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(250));
         }
 
         egui::Panel::top("blackshard_top")

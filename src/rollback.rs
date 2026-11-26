@@ -157,14 +157,15 @@ impl RollbackVault {
 
     /// Puts back every file saved for `process`.
     ///
-    /// `verify_parent` is called with each file's folder before anything is written there: restore
+    /// `verify_parent` is called with each file's folder before anything is written there, and what
+    /// it returns is held until that file is restored, so a pin it takes lasts the whole write: restore
     /// runs as SYSTEM into folders a standard user controls, so the caller supplies the same
     /// junction check quarantine restore uses. A file whose current contents differ from the saved
     /// ones is kept beside the saved copy in the vault, not destroyed.
-    pub fn restore(
+    pub fn restore<G>(
         &self,
         process: ProcessKey,
-        verify_parent: impl Fn(&Path) -> io::Result<()>,
+        verify_parent: impl Fn(&Path) -> io::Result<G>,
     ) -> RestoreSummary {
         let entries = {
             let mut index = self.lock();
@@ -203,11 +204,11 @@ impl RollbackVault {
     /// Puts back every file saved for a program known only by its process ID, as user mode sees
     /// it: the driver's start key is not available there. Only copies saved after `created_at`
     /// count, so a program that held the same ID earlier is not mistaken for this one.
-    pub fn restore_process_id(
+    pub fn restore_process_id<G>(
         &self,
         process_id: u32,
         created_at: SystemTime,
-        verify_parent: impl Fn(&Path) -> io::Result<()>,
+        verify_parent: impl Fn(&Path) -> io::Result<G>,
     ) -> RestoreSummary {
         let keys: Vec<ProcessKey> = self
             .lock()
@@ -228,16 +229,17 @@ impl RollbackVault {
         total
     }
 
-    fn restore_one(
+    fn restore_one<G>(
         &self,
         entry: &Entry,
-        verify_parent: &impl Fn(&Path) -> io::Result<()>,
+        verify_parent: &impl Fn(&Path) -> io::Result<G>,
     ) -> io::Result<bool> {
         let parent = entry
             .original
             .parent()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no parent folder"))?;
-        verify_parent(parent)?;
+        // Held to the end: the folder cannot be swapped for a junction while it is pinned.
+        let _pinned = verify_parent(parent)?;
 
         let current = match fs::symlink_metadata(&entry.original) {
             Ok(metadata) if metadata.is_file() => Some(digest_of(&entry.original)?),
@@ -323,6 +325,24 @@ impl RollbackVault {
         }
         for id in expired {
             let _ = fs::remove_file(self.data_path(id));
+        }
+        // What a restore found in place of a document is kept beside the vault for a person to
+        // look at, for as long as the vault keeps anything, and no longer.
+        for entry in fs::read_dir(&self.root).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let old = entry
+                .metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|modified| now.duration_since(modified).ok())
+                .is_some_and(|age| age > MAX_AGE);
+            if old
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "replaced")
+            {
+                let _ = fs::remove_file(path);
+            }
         }
     }
 
@@ -531,7 +551,7 @@ mod tests {
         assert!(vault.preserve(WRITER, &file));
         fs::write(&file, b"ciphertext").unwrap();
 
-        let summary = vault.restore(WRITER, |_| {
+        let summary = vault.restore(WRITER, |_| -> io::Result<()> {
             Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "redirected",

@@ -19,6 +19,8 @@ const MAX_VISIBLE_FINDINGS: usize = 250;
 /// Work that runs once the files are scanned and before the scan reports itself finished, whatever
 /// its outcome. Returns a line for each thing it repaired.
 pub type FinishStep = Box<dyn FnOnce() -> Vec<String> + Send>;
+/// Work that runs on the scan's own thread before any file is looked at.
+pub type PrepareStep = Box<dyn FnOnce() + Send>;
 
 #[derive(Debug, Clone)]
 pub enum ScanKind {
@@ -124,23 +126,27 @@ impl ScanJob {
         history: Arc<EventHistory>,
         settings: Settings,
     ) -> Self {
-        Self::start_with_finish(
+        Self::start_with_steps(
             kind,
             engine,
             quarantine,
             history,
             settings,
+            Box::new(|| {}),
             Box::new(Vec::new),
         )
     }
 
-    /// Like [`ScanJob::start`], with `finish` run after the files are scanned.
-    pub fn start_with_finish(
+    /// Like [`ScanJob::start`], with `prepare` run first on the scan's thread, so the caller is
+    /// not kept waiting, and `finish` run after the files are scanned.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_steps(
         kind: ScanKind,
         engine: Arc<DetectionEngine>,
         quarantine: Arc<QuarantineStore>,
         history: Arc<EventHistory>,
         settings: Settings,
+        prepare: PrepareStep,
         finish: FinishStep,
     ) -> Self {
         let progress = Arc::new(Mutex::new(ScanProgress::new(kind.clone())));
@@ -148,6 +154,7 @@ impl ScanJob {
         let worker_progress = Arc::clone(&progress);
         let worker_cancelled = Arc::clone(&cancelled);
         let worker = thread::spawn(move || {
+            prepare();
             run_scan(
                 kind,
                 engine,

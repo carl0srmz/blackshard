@@ -40,7 +40,9 @@ blocks them as you copy. Then, in an admin PowerShell:
 & "C:\Program Files\blackshard\blackshard-service.exe" --evaluate-corpus C:\samples C:\report.json "C:\ProgramData\blackshard\ClamAV\Generations\<newest folder>"
 ```
 
-`report.json` lists each file as clean, suspicious or malicious. **A file marked clean will not be
+`report.json` lists each file as clean, suspicious or malicious. It does not include the
+adware (PUA) signatures; for BonziBuddy-style samples, turn on "also catch adware" in settings
+and test with a real take. **A file marked clean will not be
 caught.** It gets frozen when turbo starts and resumed when the hunt ends, so it keeps running. Either film that as a loss, or skip it.
 
 ### 4. Snapshot
@@ -57,7 +59,8 @@ it before every take.
 3. **Pause:** on the status page, click `[5 min]` next to "pause protection for" and approve the
    prompt. A countdown appears. At that moment blackshard records the boot record and the
    registry values malware likes to change, and from then on it copies documents before unknown
-   programs change them.
+   programs change them. Only the turbo that ends this pause freezes and repairs, so don't
+   restart the service or start another turbo in between.
 4. **Run the sample** from the Desktop. Let it play for 30–90 s. The countdown is your safety net:
    when it runs out, protection comes back and the hunt starts by itself.
 5. **Turbo**, any one of these:

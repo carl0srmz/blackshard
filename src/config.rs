@@ -29,6 +29,9 @@ pub struct Settings {
     pub scan_archives: bool,
     pub scan_network_drives: bool,
     pub low_resource_mode: bool,
+    /// Also convict potentially unwanted programs: adware, bundlers, scareware. Off by default,
+    /// since it flags some legitimate software too.
+    pub detect_pua: bool,
     pub max_file_size_mb: u64,
     pub worker_count: usize,
     pub definition_update_interval_hours: u64,
@@ -60,6 +63,7 @@ impl Default for Settings {
             scan_archives: true,
             scan_network_drives: false,
             low_resource_mode: true,
+            detect_pua: false,
             max_file_size_mb: 512,
             worker_count: logical_cpus.saturating_sub(1).clamp(1, 4),
             definition_update_interval_hours: 4,

@@ -7,6 +7,21 @@ changes are listed here, newest first.
 ## Unreleased
 
 ### Security
+- The CI auto-repair job no longer trusts branch names coming back from the job that ran the
+  failed commit's code; it re-reads them from the run and only pushes to `autofix/` branches.
+- Turbo freezes and repairs only once per administrator-approved pause, from a baseline taken when
+  that pause began. A later turbo, by anyone, can no longer write an old boot record or registry
+  value back.
+- Files that deny SYSTEM read access are scanned anyway (backup semantics). An unsigned program
+  that still cannot be scanned, or that changes or is swapped mid-scan, is not allowed to run.
+- Windows' own catalog-signed binaries are recognised as signed, and revoked certificates are
+  refused when Windows has the revocation data cached.
+- Only programs directly in `C:\Windows`, `System32` or `SysWOW64` are spared as system
+  processes. Malware named `svchost.exe` in a user-writable Windows folder is not.
+- A program convicted only by ransomware-like behaviour is quarantined and blocklisted
+  automatically only if it lives somewhere a user or download can put it, not under Program Files.
+- The service keeps protecting when another process has taken its pipe name, and retries the pipe.
+  It now restarts after every failure, not just the first two.
 - AMSI no longer treats scripts over ~1.1 MB as clean, and no longer rescans the service's own
   submissions.
 - Quarantine restore refuses folders redirected by a junction or link.
@@ -19,6 +34,9 @@ changes are listed here, newest first.
 - Self-tests are administrator-only and rate-limited; clearing the history is recorded.
 
 ### Added
+- Turbo also scans ProgramData, all of local AppData, `C:\Windows\Temp`, and the DLLs loaded
+  into running programs. It puts back the hosts file, and cleans the Group Policy Run key.
+- An option to also catch adware and other potentially unwanted programs.
 - Real-time protection can be paused for 1, 5 or 15 minutes from the status page. It comes back
   on by itself and starts a turbo hunt; scripts through AMSI are not checked meanwhile either.
   Pausing asks for administrator approval; ending a pause with turbo does not.
@@ -49,6 +67,16 @@ changes are listed here, newest first.
   ClamAV signatures, and fails on any detection; it also fails on driver analyzer findings.
 
 ### Fixed
+- Document rollback never saved anything: it was handed kernel device paths Win32 cannot open.
+  The folder pin is now also held for the whole restore.
+- The boot-record backup covers the whole GPT partition-entry array.
+- Registry repair never deletes a value it could not read, reads values over 64 KiB, and covers
+  Microsoft Entra accounts, the 32-bit Winlogon key and program file associations.
+- Services, tasks and startup items are removed only when they name the convicted file as a whole
+  path, not as part of a longer one. Services hosted in svchost are matched by their DLL.
+- The pause countdown appears only once the service has the pause, and turbo waits for a running
+  scan to stop instead of being dropped.
+- Toggling adware detection reloads signatures without stalling the service.
 - 16-bit Windows executables and system DLLs are no longer flagged as malformed or as Office macros.
 - Large valid executables and large ordinary archives are no longer flagged Suspicious.
 - Every member of a multi-member gzip file is scanned.

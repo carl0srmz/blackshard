@@ -730,11 +730,16 @@ pub(crate) fn open_candidate_file(path: &Path) -> io::Result<File> {
     const FILE_SHARE_DELETE: u32 = 0x0000_0004;
     const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    // With SeBackupPrivilege enabled (the service enables it at start), this opens the file
+    // whatever its permissions say: a payload whose owner denied SYSTEM read access is still read.
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 
     OpenOptions::new()
         .read(true)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .custom_flags(FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OPEN_REPARSE_POINT)
+        .custom_flags(
+            FILE_FLAG_SEQUENTIAL_SCAN | FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+        )
         .open(path)
 }
 

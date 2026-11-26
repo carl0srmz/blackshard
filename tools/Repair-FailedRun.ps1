@@ -236,6 +236,20 @@ function Assert-RepairablePatch {
 
 function Invoke-Apply {
     $state = Read-State
+    # state.json comes back from the job that ran the failed commit's build scripts, which could
+    # rewrite it. Nothing in it that names a branch, run or link is believed: those are read again
+    # from the run itself, and the push target must be an autofix/ branch.
+    if (-not $RunId) { throw '-RunId is required to apply a repair.' }
+    $run = gh run view $RunId --json headBranch,headSha,workflowName,url | ConvertFrom-Json
+    $state.runId = $RunId
+    $state.branch = $run.headBranch
+    $state.headSha = $run.headSha
+    $state.workflowName = $run.workflowName
+    $state.url = $run.url
+    $state.fixBranch = 'autofix/' + ($run.headBranch -replace '[^A-Za-z0-9/_.-]', '-')
+    if ($state.fixBranch -notmatch '^autofix/[A-Za-z0-9/_.-]+$' -or $state.fixBranch -match '\.\.') {
+        throw "Refusing to push to $($state.fixBranch)."
+    }
     switch ($state.action) {
         'skip' { return }
         'rerun' {

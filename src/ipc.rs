@@ -1448,8 +1448,11 @@ mod windows_transport {
                     .read()
                     .map_err(|_| internal("settings lock"))?
                     .paused_at;
-                if settings.is_paused() && settings.paused_at != previous_pause {
-                    crate::repair::take_baseline();
+                if let Some(pause) = settings
+                    .paused_at
+                    .filter(|pause| settings.is_paused() && Some(*pause) != previous_pause)
+                {
+                    crate::repair::take_baseline(pause);
                 }
                 settings
                     .save(&resources.settings_path)
@@ -1495,13 +1498,23 @@ mod windows_transport {
                     .read()
                     .map_err(|_| internal("settings lock"))?
                     .clone();
+                let mut prepare: crate::scan_manager::PrepareStep = Box::new(|| {});
                 let mut finish: crate::scan_manager::FinishStep = Box::new(Vec::new);
                 if kind == ScanRequestKind::Turbo {
+                    // The pause this hunt ends, if any. An administrator approved it, so its hunt
+                    // may freeze what started meanwhile and put back what changed since. It is
+                    // used up here: a later turbo, by anyone, scans and removes but freezes and
+                    // repairs nothing.
+                    let pause = settings.paused_at.filter(|at| {
+                        *at > Utc::now()
+                            - chrono::Duration::minutes(crate::config::MAX_PAUSE_MINUTES + 15)
+                    });
                     // Turning protection back on needs no administrator: it is never the harmful
                     // direction, and the hunt should not wait on a prompt.
-                    if !settings.real_time_active() {
+                    if !settings.real_time_active() || settings.paused_at.is_some() {
                         let mut resumed = settings.clone();
                         resumed.resume();
+                        resumed.paused_at = None;
                         resumed
                             .save(&resources.settings_path)
                             .map_err(|error| RpcFailure {
@@ -1514,39 +1527,54 @@ mod windows_transport {
                             .map_err(|_| internal("settings lock"))? = resumed.clone();
                         settings = resumed;
                     }
-                    // What started while protection was down stops now, before the scan reaches
-                    // it. The vault keeps copies for six hours, so an older pause is not chased.
-                    let frozen = settings
-                        .paused_at
-                        .filter(|at| *at > Utc::now() - chrono::Duration::hours(6))
-                        .map(|at| crate::realtime::freeze_programs_started_since(at.into()));
-                    finish = Box::new(move || {
-                        let mut repairs = Vec::new();
-                        if let Some(frozen) = frozen {
-                            if frozen.len() > 0 {
-                                repairs.push(format!(
-                                    "froze {} program(s) started during the pause",
-                                    frozen.len()
-                                ));
+                    if let Some(pause) = pause {
+                        let frozen = Arc::new(Mutex::new(None::<crate::realtime::Frozen>));
+                        let freezing = Arc::clone(&frozen);
+                        // On the scan's thread: checking every new program's signature takes a
+                        // moment, and the caller should hear back at once.
+                        prepare = Box::new(move || {
+                            let programs =
+                                crate::realtime::freeze_programs_started_since(pause.into());
+                            *freezing
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(programs);
+                        });
+                        finish = Box::new(move || {
+                            let mut repairs = crate::repair::repair_after_pause(pause);
+                            let frozen = frozen
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .take();
+                            if let Some(frozen) = frozen {
+                                if frozen.len() > 0 {
+                                    repairs.insert(
+                                        0,
+                                        format!(
+                                            "froze {} program(s) started during the pause",
+                                            frozen.len()
+                                        ),
+                                    );
+                                }
+                                // Resumes whatever the hunt did not convict, after the repairs, so
+                                // nothing it missed can race them.
+                                drop(frozen);
                             }
-                            // Resumes whatever the hunt did not convict.
-                            drop(frozen);
-                        }
-                        repairs.extend(crate::repair::repair_from_baseline());
-                        repairs
-                    });
+                            repairs
+                        });
+                    }
                     settings.low_resource_mode = false;
                     settings.worker_count = std::thread::available_parallelism()
                         .map(usize::from)
                         .unwrap_or(4)
                         .clamp(1, 16);
                 }
-                let job = ScanJob::start_with_finish(
+                let job = ScanJob::start_with_steps(
                     scan_kind,
                     engine,
                     Arc::clone(&resources.quarantine),
                     Arc::clone(&resources.history),
                     settings,
+                    prepare,
                     finish,
                 );
                 let progress =
@@ -1767,6 +1795,19 @@ mod windows_transport {
                 // already running is the first thing a quick scan should find.
                 let mut paths = validate_scan_roots(roots, "quick")?;
                 paths.extend(crate::realtime::running_process_images());
+                if *kind == ScanRequestKind::Turbo {
+                    // The hunt also looks where programs drop themselves for every user, and at
+                    // the DLLs loaded into running programs: a DLL run by rundll32 or side-loaded
+                    // beside a real program is never a process image.
+                    if let Some(program_data) = std::env::var_os("ProgramData") {
+                        paths.push(PathBuf::from(program_data));
+                    }
+                    if let Some(root) = std::env::var_os("SystemRoot") {
+                        paths.push(PathBuf::from(root).join("Temp"));
+                    }
+                    paths.extend(crate::realtime::running_process_modules());
+                    paths.retain(|path| path.exists());
+                }
                 Ok(ScanKind::Custom(paths))
             }
             ScanRequestKind::Full if roots.is_empty() => Ok(ScanKind::Full),
@@ -2006,7 +2047,8 @@ mod windows_transport {
 
         fn start_scan(&self, kind: ScanRequestKind) -> Result<ScanProgressView, RpcFailure> {
             let roots = match &kind {
-                ScanRequestKind::Quick | ScanRequestKind::Turbo => quick_scan_roots(),
+                ScanRequestKind::Quick => quick_scan_roots(false),
+                ScanRequestKind::Turbo => quick_scan_roots(true),
                 ScanRequestKind::Full => Vec::new(),
                 ScanRequestKind::Custom { roots } => roots.clone(),
             };
@@ -2260,7 +2302,9 @@ mod windows_transport {
         }
     }
 
-    fn quick_scan_roots() -> Vec<String> {
+    /// The folders in this user's profile a quick scan covers; `hunt` adds all of local AppData,
+    /// where loaders and stealers commonly unpack, for the turbo hunt.
+    fn quick_scan_roots(hunt: bool) -> Vec<String> {
         let mut roots = Vec::<PathBuf>::new();
         // Where malware lands and installs itself: the user's own folders, roaming AppData (which
         // holds the Startup folder), per-user program installs, and the shared Public profile.
@@ -2270,6 +2314,10 @@ mod windows_transport {
             roots.push(profile.join("Documents"));
             roots.push(profile.join(r"AppData\Roaming"));
             roots.push(profile.join(r"AppData\Local\Programs"));
+            if hunt {
+                roots.push(profile.join(r"AppData\Local"));
+                roots.push(profile.join(r"AppData\LocalLow"));
+            }
         }
         if let Some(public) = std::env::var_os("PUBLIC").map(PathBuf::from) {
             roots.push(public);
@@ -2287,8 +2335,24 @@ mod windows_transport {
                 .to_string_lossy()
                 .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
         });
+        // A folder inside another root would be walked twice: Temp inside AppData\Local.
+        let lower: Vec<PathBuf> = roots
+            .iter()
+            .map(|path| PathBuf::from(path.to_string_lossy().to_lowercase()))
+            .collect();
+        let nested: Vec<bool> = lower
+            .iter()
+            .map(|path| {
+                lower
+                    .iter()
+                    .any(|other| other != path && path.starts_with(other))
+            })
+            .collect();
         roots
             .into_iter()
+            .zip(nested)
+            .filter(|(_, nested)| !nested)
+            .map(|(path, _)| path)
             .take(MAX_CUSTOM_SCAN_ROOTS)
             .map(|path| path.to_string_lossy().into_owned())
             .collect()

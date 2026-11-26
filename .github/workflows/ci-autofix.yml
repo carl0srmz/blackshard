@@ -124,9 +124,10 @@ jobs:
         shell: pwsh
         env:
           PULL_REQUEST: ${{ github.event.workflow_run.pull_requests[0].number }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
           gh label create ci-autofix --color FFFF00 --force --description "Repaired or reported after a failed CI run" | Out-Null
-          .\tools\Repair-FailedRun.ps1 -Mode Apply -WorkTree .\failed -PullRequest "$env:PULL_REQUEST" -StateDirectory $env:STATE
+          .\tools\Repair-FailedRun.ps1 -Mode Apply -RunId $env:RUN_ID -WorkTree .\failed -PullRequest "$env:PULL_REQUEST" -StateDirectory $env:STATE
 
   close-resolved:
     if: >-
