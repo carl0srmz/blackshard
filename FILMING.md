@@ -53,11 +53,13 @@ it before every take.
 ## Each episode
 
 1. **Revert to `ready`** and open blackshard on the status page. Right-click it and choose "Run as
-   administrator" if you don't want a UAC prompt on camera when you pause.
+   administrator" if you don't want prompts on camera when you pause. Run normally, a pause asks
+   twice: the Windows administrator prompt, then blackshard's own "go ahead?" window naming the
+   change. Running as administrator also shows the full exclusion list.
 2. **Optional opening shot:** double-click the sample while protection is on. blackshard blocks it
    before it starts.
 3. **Pause:** on the status page, click `[5 min]` next to "pause protection for" and approve the
-   prompt. A countdown appears. At that moment blackshard records the boot record and the
+   prompt(s). The countdown appears once the service has the pause. At that moment blackshard records the boot record and the
    registry values malware likes to change, and from then on it copies documents before unknown
    programs change them. Only the turbo that ends this pause freezes and repairs, so don't
    restart the service or start another turbo in between.

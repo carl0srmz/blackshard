@@ -20,6 +20,16 @@ changes are listed here, newest first.
   processes. Malware named `svchost.exe` in a user-writable Windows folder is not.
 - A program convicted only by ransomware-like behaviour is quarantined and blocklisted
   automatically only if it lives somewhere a user or download can put it, not under Program Files.
+- Exclusions are shown only to administrators. A standard user's UI can still add one, which is
+  added to the list instead of replacing it.
+- A standard user's scan skips other people's profiles, so it cannot list their files.
+- The elevated helper says what it is about to do (settings changes, quarantine restore or
+  delete, clearing the history) in its own window and waits for a click, so a reused
+  administrator prompt cannot quietly turn protection off.
+- AMSI detections no longer record names chosen by the submitting program as verified paths, and
+  each user's detections are limited to 20 history entries a minute. With the service down,
+  scripts no longer each wait three seconds. Scripts over 4 MB are read at both ends.
+- The control pipe takes four connections, so one client cannot keep the UI out.
 - The service keeps protecting when another process has taken its pipe name, and retries the pipe.
   It now restarts after every failure, not just the first two.
 - AMSI no longer treats scripts over ~1.1 MB as clean, and no longer rescans the service's own

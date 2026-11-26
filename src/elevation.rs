@@ -98,7 +98,23 @@ pub fn elevated_action_exit_code() -> Option<i32> {
                 Err(_) => return Some(2),
             };
             let client = IpcClient;
-            if action == OsStr::new("restore-quarantine") {
+            let restore = action == OsStr::new("restore-quarantine");
+            let record = client
+                .list_quarantine()
+                .ok()
+                .and_then(|records| records.into_iter().find(|record| record.id == id));
+            let what = record
+                .map(|record| format!("{} ({})", record.threat_name, record.original_path))
+                .unwrap_or_else(|| format!("quarantine item {id}"));
+            let line = if restore {
+                format!("put {what} back where it was. it was quarantined as malware")
+            } else {
+                format!("permanently delete {what} from quarantine")
+            };
+            if !confirm(&[line]) {
+                return Some(1);
+            }
+            if restore {
                 client.restore_quarantine(id).map(|_| ())
             } else {
                 client.delete_quarantine(id).map(|_| ())
@@ -108,6 +124,9 @@ pub fn elevated_action_exit_code() -> Option<i32> {
         Some("clear-activity") => {
             if arguments.next().is_some() {
                 return Some(2);
+            }
+            if !confirm(&["clear the whole activity history".to_owned()]) {
+                return Some(1);
             }
             IpcClient
                 .clear_activity()
@@ -142,10 +161,57 @@ fn apply_settings_request(path: &Path, expected_digest: &str) -> Result<(), Stri
     }
     let settings: Settings = serde_json::from_slice(&bytes)
         .map_err(|error| format!("the settings request is invalid: {error}"))?;
+    let current = IpcClient
+        .get_settings()
+        .map_err(|error| format!("the current settings could not be read: {error}"))?;
+    let changes = settings.describe_changes_from(&current);
+    if !changes.is_empty() && !confirm(&changes) {
+        return Err("the change was declined".to_owned());
+    }
     IpcClient
         .save_settings(settings)
         .map(|_| ())
         .map_err(|error| error.to_string())
+}
+
+/// Asks, in this elevated process's own window, before an administrator action takes effect.
+///
+/// The administrator prompt cannot say what is being approved, and any program can raise one for
+/// this executable with arguments of its choosing: it would look exactly like the routine "pause"
+/// prompt. This window says what will happen, and a program without administrator rights cannot
+/// click it for the person, since Windows keeps lower-integrity input out of elevated windows.
+/// "No" is the default button.
+fn confirm(lines: &[String]) -> bool {
+    #[link(name = "user32")]
+    extern "system" {
+        fn MessageBoxW(window: isize, text: *const u16, caption: *const u16, kind: u32) -> i32;
+    }
+    const MB_YESNO: u32 = 0x0004;
+    const MB_ICONWARNING: u32 = 0x0030;
+    const MB_DEFBUTTON2: u32 = 0x0100;
+    const MB_SETFOREGROUND: u32 = 0x0001_0000;
+    const MB_TOPMOST: u32 = 0x0004_0000;
+    const IDYES: i32 = 6;
+    let text = format!(
+        "blackshard was given administrator approval to:\n\n{}\n\ngo ahead? if you did not ask for this, choose no.",
+        lines
+            .iter()
+            .map(|line| format!("  - {line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let wide =
+        |value: &str| -> Vec<u16> { value.encode_utf16().chain(std::iter::once(0)).collect() };
+    let text = wide(&text);
+    let caption = wide("blackshard: confirm");
+    unsafe {
+        MessageBoxW(
+            0,
+            text.as_ptr(),
+            caption.as_ptr(),
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND | MB_TOPMOST,
+        ) == IDYES
+    }
 }
 
 fn validate_settings_request_path(path: &Path) -> Result<(), String> {

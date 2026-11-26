@@ -1600,6 +1600,18 @@ impl BlackshardApp {
                 "exclusions",
                 "blackshard never looks inside these. add only paths you fully trust.",
             );
+            if self.settings.exclusions_withheld {
+                // Malware running as you would love to read this list, so only an administrator
+                // sees it. Paths added here are added to it.
+                ui.label(
+                    RichText::new(
+                        "the list is shown only to administrators. paths you add here are added to it; to see or remove exclusions, open blackshard as administrator.",
+                    )
+                    .size(13.0)
+                    .color(MUTED),
+                );
+                ui.add_space(6.0);
+            }
             ui.horizontal(|ui| {
                 ui.add_sized(
                     [ui.available_width() - 90.0, 34.0],

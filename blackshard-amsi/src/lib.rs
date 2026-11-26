@@ -72,23 +72,16 @@ fn scan(stream: Option<&IAmsiStream>) -> Result<AMSI_RESULT> {
         return Ok(AMSI_RESULT_NOT_DETECTED);
     }
 
+    // The service takes at most this much. A larger script is read at both ends: reading only the
+    // start let a payload hide behind a few megabytes of padding.
+    const LIMIT: usize = 4 * 1024 * 1024;
     let mut content = Vec::new();
-    let mut buffer = vec![0u8; 8192];
-    let mut position = 0u64;
-
-    while content.len() < 4 * 1024 * 1024 {
-        let mut read = 0u32;
-        let remaining = 4 * 1024 * 1024 - content.len();
-        let read_size = remaining.min(buffer.len());
-        let read_buffer = &mut buffer[..read_size];
-        unsafe {
-            stream.Read(position, read_buffer, &mut read)?;
+    match read_size_attribute(stream) {
+        Some(size) if size > LIMIT as u64 => {
+            read_range(stream, 0, LIMIT / 2, &mut content)?;
+            read_range(stream, size - (LIMIT / 2) as u64, LIMIT / 2, &mut content)?;
         }
-        if read == 0 {
-            break;
-        }
-        content.extend_from_slice(&read_buffer[..read as usize]);
-        position += read as u64;
+        _ => read_range(stream, 0, LIMIT, &mut content)?,
     }
 
     let content_name = read_string_attribute(stream, AMSI_ATTRIBUTE_CONTENT_NAME, "");
@@ -101,6 +94,45 @@ fn scan(stream: Option<&IAmsiStream>) -> Result<AMSI_RESULT> {
         Ok(DetectionVerdictView::Error) => Ok(AMSI_RESULT_CLEAN),
         Err(_) => Ok(AMSI_RESULT_CLEAN),
     }
+}
+
+/// Appends up to `length` bytes of the stream, starting at `start`, to `content`.
+fn read_range(
+    stream: &IAmsiStream,
+    start: u64,
+    length: usize,
+    content: &mut Vec<u8>,
+) -> Result<()> {
+    let mut buffer = vec![0u8; 8192];
+    let mut position = start;
+    let mut remaining = length;
+    while remaining > 0 {
+        let mut read = 0u32;
+        let read_buffer = &mut buffer[..remaining.min(8192)];
+        unsafe {
+            stream.Read(position, read_buffer, &mut read)?;
+        }
+        if read == 0 {
+            break;
+        }
+        let read = (read as usize).min(read_buffer.len());
+        content.extend_from_slice(&read_buffer[..read]);
+        position += read as u64;
+        remaining -= read;
+    }
+    Ok(())
+}
+
+/// The whole content's size, which the host reports as a 64-bit number.
+fn read_size_attribute(stream: &IAmsiStream) -> Option<u64> {
+    let mut data = [0u8; 8];
+    let mut read = 0u32;
+    if unsafe { stream.GetAttribute(AMSI_ATTRIBUTE_CONTENT_SIZE, &mut data, &mut read) }.is_err()
+        || read != 8
+    {
+        return None;
+    }
+    Some(u64::from_le_bytes(data))
 }
 
 fn read_string_attribute(

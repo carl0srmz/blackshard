@@ -398,6 +398,18 @@ fn comparable(path: &str) -> String {
     lower.strip_prefix(r"\\?\").unwrap_or(&lower).to_owned()
 }
 
+/// The profile folder of every local, domain and Microsoft Entra account on the machine, by SID.
+pub(crate) fn user_profiles() -> Vec<(String, PathBuf)> {
+    subkeys(
+        HKEY_LOCAL_MACHINE,
+        r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList",
+    )
+    .into_iter()
+    .filter(|sid| sid.starts_with("S-1-5-21-") || sid.starts_with("S-1-12-1-"))
+    .filter_map(|sid| profile_path(&sid).map(|path| (sid, PathBuf::from(path))))
+    .collect()
+}
+
 fn profile_path(sid: &str) -> Option<String> {
     let key = wide(&format!(
         r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\{sid}"

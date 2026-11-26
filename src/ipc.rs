@@ -674,8 +674,9 @@ mod windows_transport {
 
         fn instances(self) -> usize {
             match self {
-                // The UI and a handful of commands; one instance is plenty.
-                Self::Management => 1,
+                // More than one, so a client that holds its connection open (or a busy loop of
+                // them) cannot keep the real UI out.
+                Self::Management => 4,
                 Self::Amsi => AMSI_INSTANCES,
             }
         }
@@ -1301,7 +1302,7 @@ mod windows_transport {
                 message: format!("invalid AMSI request document: {error}"),
             })?;
         let request_id = request.request_id;
-        let result = validate_and_scan_amsi(request, resources);
+        let result = validate_and_scan_amsi(request, resources, caller);
         Ok(AmsiResponseEnvelope {
             version: AMSI_IPC_PROTOCOL_VERSION,
             request_id,
@@ -1318,6 +1319,7 @@ mod windows_transport {
     fn validate_and_scan_amsi(
         request: AmsiRequestEnvelope,
         resources: &RpcServiceResources,
+        caller: &CallerContext,
     ) -> Result<DetectionVerdictView, RpcFailure> {
         if request.version != AMSI_IPC_PROTOCOL_VERSION {
             return Err(invalid(format!(
@@ -1375,20 +1377,19 @@ mod windows_transport {
             .map_err(|_| internal("engine lock"))?
             .clone();
         let report = engine.scan_amsi_submission(&content);
-        if report.verdict == crate::detection::DetectionVerdict::Malicious {
-            // A script refused here never touches the minifilter, so this is the only record of it.
+        if report.verdict == crate::detection::DetectionVerdict::Malicious
+            && amsi_event_allowed(&caller.sid)
+        {
+            // A script refused here never touches the minifilter, so this is the only record of
+            // it. The names come from whoever submitted the script, so they are recorded as what
+            // the host reported, not as a file path that would appear verified in toasts.
             let mut event = SecurityEvent::new(EventKind::Detection, "Script blocked by AMSI");
-            let source = if request.content_name.is_empty() {
-                &request.application_name
-            } else {
-                &request.content_name
-            };
-            event.path = Some(PathBuf::from(source));
             event.threat_name = report.threat_name.clone();
             event.risk_score = Some(report.risk_score);
             event.details = Some(format!(
-                "block_reply_accepted=true; source=amsi; application={}",
-                request.application_name
+                "block_reply_accepted=true; source=amsi; reported_application={}; reported_content={}",
+                bounded_string(&request.application_name, 128),
+                bounded_string(&request.content_name, 256)
             ));
             let _ = resources.history.append(&event);
         }
@@ -1434,13 +1435,31 @@ mod windows_transport {
                     .read()
                     .map_err(|_| internal("settings lock"))?
                     .clone();
-                if caller.component == TrustedClientComponent::NotificationAgent {
-                    // It runs in every session and only needs to know whether to show toasts.
+                if !caller.elevated_admin {
+                    // The exclusions say exactly where blackshard does not look, which is what
+                    // malware running as the user would most like to know. A standard user's UI
+                    // gets an empty list and the marker that it was withheld; saving such
+                    // settings adds to the list rather than replacing it.
                     settings.exclusions.clear();
+                    settings.exclusions_withheld = true;
                 }
                 Ok(RpcResponse::Settings { settings })
             }
-            RpcCommand::SaveSettings { settings } => {
+            RpcCommand::SaveSettings { mut settings } => {
+                if settings.exclusions_withheld {
+                    // Sent by a UI that never saw the list: what it holds are additions.
+                    let additions = std::mem::take(&mut settings.exclusions);
+                    settings.exclusions = resources
+                        .settings
+                        .read()
+                        .map_err(|_| internal("settings lock"))?
+                        .exclusions
+                        .clone();
+                    for exclusion in additions {
+                        settings.add_exclusion(exclusion);
+                    }
+                    settings.exclusions_withheld = false;
+                }
                 // A new pause: record how the machine looks first, so the turbo hunt can put back
                 // whatever the programs let in meanwhile change.
                 let previous_pause = resources
@@ -1498,6 +1517,17 @@ mod windows_transport {
                     .read()
                     .map_err(|_| internal("settings lock"))?
                     .clone();
+                // A standard user's scan runs as SYSTEM, so it could otherwise walk other people's
+                // profiles and report their file names back. It skips them; an administrator's
+                // scan, or real-time protection, covers those.
+                if !caller.elevated_admin {
+                    let own = sid_string(&caller.sid);
+                    for (sid, profile) in crate::persistence::user_profiles() {
+                        if !sid.eq_ignore_ascii_case(&own) {
+                            settings.add_exclusion(profile);
+                        }
+                    }
+                }
                 let mut prepare: crate::scan_manager::PrepareStep = Box::new(|| {});
                 let mut finish: crate::scan_manager::FinishStep = Box::new(Vec::new);
                 if kind == ScanRequestKind::Turbo {
@@ -1976,6 +2006,30 @@ mod windows_transport {
         let _ = history.append(&event);
     }
 
+    /// Whether another AMSI detection from this user may be written to the history. Any program
+    /// can submit content through AMSI, and each detection is a history entry and a toast in every
+    /// session; without a limit, a loop of submissions floods the history and pushes real events
+    /// out. The verdict itself is always returned.
+    fn amsi_event_allowed(sid: &[u8]) -> bool {
+        const PER_MINUTE: u32 = 20;
+        /// Per user SID: when the current minute began, and detections recorded in it.
+        type Recent = std::collections::HashMap<Vec<u8>, (Instant, u32)>;
+        static RECENT: Mutex<Option<Recent>> = Mutex::new(None);
+        let mut recent = RECENT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let recent = recent.get_or_insert_with(std::collections::HashMap::new);
+        if recent.len() > 1024 {
+            recent.clear();
+        }
+        let entry = recent.entry(sid.to_vec()).or_insert((Instant::now(), 0));
+        if entry.0.elapsed() >= Duration::from_secs(60) {
+            *entry = (Instant::now(), 0);
+        }
+        entry.1 += 1;
+        entry.1 <= PER_MINUTE
+    }
+
     /// A SID in its `S-1-5-21-...` form, for the audit trail.
     fn sid_string(sid: &[u8]) -> String {
         use windows_sys::Win32::Foundation::LocalFree;
@@ -2098,7 +2152,28 @@ mod windows_transport {
                     .collect(),
                 finalize: true,
             };
+            // With the service gone, every script used to wait out the full connect deadline (about
+            // three seconds) before running unscanned. Once it is known to be down, scripts are let
+            // through at once for a short while instead of each paying that wait.
+            static SERVICE_DOWN_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
+            if SERVICE_DOWN_UNTIL
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_some_and(|until| Instant::now() < until)
+            {
+                return Err(RpcFailure::transport(
+                    "the AMSI scan service was unavailable moments ago",
+                ));
+            }
             let pipe = connect_client(AMSI_PIPE_NAME).map_err(|error| {
+                // 2: no instance exists, so the service is not running. Busy instances (121) mean
+                // it is running but loaded; those requests keep waiting.
+                if error.raw_os_error() == Some(2) {
+                    *SERVICE_DOWN_UNTIL
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                        Some(Instant::now() + Duration::from_secs(10));
+                }
                 RpcFailure::transport(format!("AMSI scan service is unavailable: {error}"))
             })?;
             write_json_frame(pipe.raw(), &request, MAX_AMSI_REQUEST_BYTES).map_err(|error| {

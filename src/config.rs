@@ -36,6 +36,11 @@ pub struct Settings {
     pub worker_count: usize,
     pub definition_update_interval_hours: u64,
     pub exclusions: Vec<PathBuf>,
+    /// Set by the service when it sends settings to someone who is not an administrator, with
+    /// `exclusions` left empty: the list says exactly where blackshard does not look. Settings
+    /// saved back with this set add their `exclusions` to the real list instead of replacing it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exclusions_withheld: bool,
     /// Real-time protection is off until this moment, then back on by itself.
     pub paused_until: Option<DateTime<Utc>>,
     /// When the latest pause began. Kept after it ends, so the turbo hunt that follows knows which
@@ -68,6 +73,7 @@ impl Default for Settings {
             worker_count: logical_cpus.saturating_sub(1).clamp(1, 4),
             definition_update_interval_hours: 4,
             exclusions: Vec::new(),
+            exclusions_withheld: false,
             paused_until: None,
             paused_at: None,
             exclusion_keys: OnceLock::new(),
@@ -137,6 +143,126 @@ impl Settings {
         self.paused_until = None;
     }
 
+    /// What changes if `self` replaces `current`, one plain line each, for the administrator to
+    /// confirm in the elevated helper's own window. Changes that weaken protection come first.
+    pub fn describe_changes_from(&self, current: &Settings) -> Vec<String> {
+        let mut weaker = Vec::new();
+        let mut other = Vec::new();
+        let mut toggle = |after: bool, before: bool, what: &str, weakens_when_off: bool| {
+            if after != before {
+                let line = format!("turn {} {what}", if after { "on" } else { "off" });
+                if after != weakens_when_off {
+                    weaker.push(line);
+                } else {
+                    other.push(line);
+                }
+            }
+        };
+        toggle(
+            self.real_time_protection,
+            current.real_time_protection,
+            "real-time protection",
+            true,
+        );
+        toggle(
+            self.ransomware_protection,
+            current.ransomware_protection,
+            "ransomware protection",
+            true,
+        );
+        toggle(
+            self.ransomware_block_mode,
+            current.ransomware_block_mode,
+            "stopping ransomware (not just watching it)",
+            true,
+        );
+        toggle(
+            self.rollback_documents,
+            current.rollback_documents,
+            "document copies for ransomware rollback",
+            true,
+        );
+        toggle(
+            self.automatic_quarantine,
+            current.automatic_quarantine,
+            "automatic quarantine",
+            true,
+        );
+        toggle(
+            self.scan_archives,
+            current.scan_archives,
+            "scanning inside archives",
+            true,
+        );
+        toggle(
+            self.scan_network_drives,
+            current.scan_network_drives,
+            "scanning network drives",
+            true,
+        );
+        toggle(
+            self.detect_pua,
+            current.detect_pua,
+            "adware detection",
+            true,
+        );
+        toggle(
+            self.notify_on_detection,
+            current.notify_on_detection,
+            "detection notifications",
+            true,
+        );
+        toggle(
+            self.low_resource_mode,
+            current.low_resource_mode,
+            "low resource mode",
+            false,
+        );
+        if self.paused_until != current.paused_until {
+            match self.paused_until {
+                Some(until) => {
+                    let minutes = (until - Utc::now()).num_minutes().max(0) + 1;
+                    weaker.push(format!(
+                        "pause real-time protection for about {minutes} min"
+                    ));
+                }
+                None => other.push("end the pause".to_owned()),
+            }
+        }
+        let key = |path: &PathBuf| resolved_key(path);
+        let current_keys: Vec<String> = current.exclusions.iter().map(key).collect();
+        let new_keys: Vec<String> = self.exclusions.iter().map(key).collect();
+        for (path, path_key) in self.exclusions.iter().zip(&new_keys) {
+            if !current_keys.contains(path_key) {
+                weaker.push(format!("stop scanning {} (new exclusion)", path.display()));
+            }
+        }
+        if !self.exclusions_withheld {
+            for (path, path_key) in current.exclusions.iter().zip(&current_keys) {
+                if !new_keys.contains(path_key) {
+                    other.push(format!("scan {} again (exclusion removed)", path.display()));
+                }
+            }
+        }
+        if self.max_file_size_mb != current.max_file_size_mb {
+            other.push(format!(
+                "largest file scanned: {} MB",
+                self.max_file_size_mb
+            ));
+        }
+        if self.worker_count != current.worker_count {
+            other.push(format!("scan workers: {}", self.worker_count));
+        }
+        if self.definition_update_interval_hours != current.definition_update_interval_hours {
+            other.push(format!(
+                "check for definitions every {} h",
+                self.definition_update_interval_hours
+            ));
+        }
+        weaker.extend(other);
+        weaker
+    }
+
     /// In the private `State` folder: the exclusions say exactly where blackshard does not look.
     pub fn default_machine_path() -> PathBuf {
         crate::paths::state_dir().join("settings.json")
@@ -183,6 +309,8 @@ impl Settings {
 
     fn validate(&mut self) {
         self.schema_version = SETTINGS_SCHEMA_VERSION;
+        // Only ever meaningful in transit; a file always holds the whole list.
+        self.exclusions_withheld = false;
         self.max_file_size_mb = self.max_file_size_mb.clamp(1, 4_096);
         self.worker_count = self.worker_count.clamp(1, 16);
         self.definition_update_interval_hours = self.definition_update_interval_hours.clamp(1, 24);
@@ -406,5 +534,46 @@ mod tests {
             settings.paused_at.is_some(),
             "the hunt still needs to know when it began"
         );
+    }
+
+    #[test]
+    fn a_change_is_described_with_weakening_lines_first() {
+        let current = Settings::default();
+        let mut requested = current.clone();
+        requested.real_time_protection = false;
+        requested.worker_count = current.worker_count + 1;
+        requested.add_exclusion(PathBuf::from(r"C:\Tools"));
+        let lines = requested.describe_changes_from(&current);
+        assert_eq!(lines[0], "turn off real-time protection");
+        assert!(lines[1].starts_with("stop scanning"));
+        assert!(lines.iter().any(|line| line.starts_with("scan workers")));
+        assert!(current.describe_changes_from(&current).is_empty());
+    }
+
+    #[test]
+    fn a_withheld_list_only_adds_and_never_reads_as_removals() {
+        let mut current = Settings::default();
+        current.add_exclusion(PathBuf::from(r"C:\Build"));
+        let mut requested = Settings {
+            exclusions_withheld: true,
+            ..Settings::default()
+        };
+        requested.add_exclusion(PathBuf::from(r"C:\Tools"));
+        let lines = requested.describe_changes_from(&current);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with("stop scanning"));
+    }
+
+    #[test]
+    fn the_withheld_marker_never_reaches_the_settings_file() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("settings.json");
+        let settings = Settings {
+            exclusions_withheld: true,
+            ..Settings::default()
+        };
+        settings.save(&path).unwrap();
+        assert!(!Settings::load(&path).unwrap().exclusions_withheld);
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("withheld"));
     }
 }
