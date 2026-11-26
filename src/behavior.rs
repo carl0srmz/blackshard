@@ -104,6 +104,15 @@ impl RansomwareMonitor {
         self.starts.push_back(start);
     }
 
+    /// The most recent start of a process with this ID. Without the start key it may be an
+    /// earlier holder of the ID, so it is only used to walk a few hops up a chain of shells.
+    pub fn latest_start(&self, process_id: u32) -> Option<&ProcessStart> {
+        self.starts
+            .iter()
+            .rev()
+            .find(|start| start.process_id == process_id)
+    }
+
     pub fn process_start(&self, process_id: u32, process_start_key: u64) -> Option<&ProcessStart> {
         self.starts.iter().rev().find(|start| {
             start.process_id == process_id && start.process_start_key == process_start_key

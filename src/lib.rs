@@ -44,6 +44,7 @@ pub mod vba;
 pub mod verdict_cache;
 
 pub mod clamdb;
+pub mod command_rules;
 
 /// The product version, with the commit of the CI build that produced it when there is one
 /// (`0.1.0+abc1234`), so a screenshot or bug report identifies the exact build.

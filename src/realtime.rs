@@ -563,6 +563,26 @@ pub(crate) fn realtime_worker(
             continue;
         }
 
+        // How the program is being started can condemn it before its file is even scanned: a
+        // signed Windows tool asked to delete shadow copies or to run script from the web.
+        if notification.operation == OPERATION_PROCESS_CREATE {
+            if let Some(hit) = judge_process_start(&notification, &kernel_path) {
+                refuse_process_start(
+                    &item,
+                    &notification,
+                    &kernel_path,
+                    hit,
+                    &history,
+                    &counters,
+                    &ransomware_monitor,
+                    &engine,
+                    &quarantine,
+                    &definition_generation,
+                );
+                continue;
+            }
+        }
+
         // There is no cache lookup before the file is opened. The driver reports a file ID but no
         // volume, and NTFS file IDs repeat across volumes, so an ID-only hit could allow a file on
         // a removable drive unscanned on the strength of a clean verdict cached for C:. Opening
@@ -977,7 +997,14 @@ fn handle_protected_modification(
         // hijacked than malicious itself, and a shard for powershell.exe would break the machine.
         if let (Some(image), ProcessTrust::Untrusted) = (terminated, process_trust) {
             if behaviour_removal_allowed(&image, &system_root(), &program_files_folders()) {
-                learn_and_quarantine(&image, engine, quarantine, history, definition_generation);
+                learn_and_quarantine(
+                    &image,
+                    "Shard.Behavior.Ransomware",
+                    engine,
+                    quarantine,
+                    history,
+                    definition_generation,
+                );
             } else {
                 log::warn!(
                     "Stopped {image:?} for ransomware-like writes; it is installed software, so it was not removed"
@@ -1071,12 +1098,12 @@ fn undo_ransomware_damage(process: crate::rollback::ProcessKey, history: &EventH
 /// and moves the program itself to quarantine.
 fn learn_and_quarantine(
     image: &Path,
+    threat_name: &str,
     engine: &SharedDetectionEngine,
     quarantine: &QuarantineStore,
     history: &EventHistory,
     definition_generation: &AtomicU64,
 ) {
-    const THREAT_NAME: &str = "Shard.Behavior.Ransomware";
     let active = Arc::clone(
         &engine
             .read()
@@ -1087,7 +1114,7 @@ fn learn_and_quarantine(
         log::warn!("Could not hash {image:?} to learn it: {:?}", report.error);
         return;
     };
-    match crate::shards::learn(sha256, THREAT_NAME) {
+    match crate::shards::learn(sha256, threat_name) {
         // Cached clean verdicts for this file are stale now.
         Ok(_) => {
             definition_generation.fetch_add(1, Ordering::AcqRel);
@@ -1096,7 +1123,7 @@ fn learn_and_quarantine(
     }
     let (kind, summary, details) = match quarantine.quarantine_verified(
         image,
-        THREAT_NAME,
+        threat_name,
         100,
         sha256,
         report.file_size,
@@ -1104,23 +1131,23 @@ fn learn_and_quarantine(
     ) {
         Ok(record) if record.state == IsolationState::Isolated => (
             EventKind::Quarantined,
-            "Ransomware program stopped, learned and moved to quarantine",
+            "Program stopped for what it did, learned and moved to quarantine",
             record.cleanup_summary(),
         ),
         Ok(_) => (
             EventKind::QuarantineFailed,
-            "Ransomware program stopped and learned; its file could not be removed",
+            "Program stopped for what it did and learned; its file could not be removed",
             None,
         ),
         Err(error) => (
             EventKind::QuarantineFailed,
-            "Ransomware program stopped and learned; quarantine failed",
+            "Program stopped for what it did and learned; quarantine failed",
             Some(error.to_string()),
         ),
     };
     let mut event = SecurityEvent::new(kind, summary);
     event.path = Some(image.to_path_buf());
-    event.threat_name = Some(THREAT_NAME.to_owned());
+    event.threat_name = Some(threat_name.to_owned());
     event.risk_score = Some(100);
     event.details = details;
     let _ = history.append(&event);
@@ -1199,6 +1226,163 @@ pub(crate) fn reply(
             &mut reply as *mut _ as *mut c_void,
             mem::size_of::<BlackshardReplyMessage>() as u32,
         ) == S_OK
+    }
+}
+
+/// The command-line rules' verdict on a process start.
+fn judge_process_start(
+    notification: &BlackshardNotification,
+    kernel_image: &Path,
+) -> Option<crate::command_rules::RuleHit> {
+    let image = device_path_to_dos_path(kernel_image).unwrap_or_else(|| kernel_image.to_path_buf());
+    let image = image.to_string_lossy();
+    let command_line = notification_command_line(notification);
+    // The creating process, not the "parent": a parent can be named freely at creation time,
+    // which malware uses to make its children look like Explorer's.
+    let creator = process_image_path(notification.creating_process_id);
+    let creator = creator.as_ref().map(|path| path.to_string_lossy());
+    crate::command_rules::judge_launch(&crate::command_rules::Launch {
+        image: &image,
+        command_line: &command_line,
+        creator_image: creator.as_deref(),
+    })
+}
+
+/// Refuses a process start a rule condemned, records it, and, when the rule says the program
+/// asking for it is the threat, stops and removes that program.
+#[allow(clippy::too_many_arguments)]
+fn refuse_process_start(
+    item: &WorkItem,
+    notification: &BlackshardNotification,
+    kernel_image: &Path,
+    hit: crate::command_rules::RuleHit,
+    history: &EventHistory,
+    counters: &Mutex<RealtimeCounters>,
+    monitor: &Mutex<RansomwareMonitor>,
+    engine: &SharedDetectionEngine,
+    quarantine: &QuarantineStore,
+    definition_generation: &AtomicU64,
+) {
+    let accepted = reply(
+        item.port,
+        item.message.header.message_id,
+        DriverVerdict::Block,
+        100,
+    );
+    if let Ok(mut value) = counters.lock() {
+        value.scanned += 1;
+        value.detected += 1;
+        if accepted {
+            value.blocked_replies += 1;
+        }
+    }
+    let command_line = notification_command_line(notification);
+    log::warn!(
+        "Refused {kernel_image:?} ({}): {}; {command_line}",
+        hit.name,
+        hit.reason
+    );
+    let mut event = SecurityEvent::new(EventKind::Detection, "Program start refused");
+    event.path =
+        Some(device_path_to_dos_path(kernel_image).unwrap_or_else(|| kernel_image.to_path_buf()));
+    event.threat_name = Some(hit.name.to_owned());
+    event.risk_score = Some(100);
+    event.details = Some(format!(
+        "block_reply_accepted={accepted}; reason={}; pid={}; creator={}; command_line={}",
+        hit.reason,
+        notification.process_id,
+        notification.creating_process_id,
+        command_line.chars().take(1024).collect::<String>()
+    ));
+    let _ = history.append(&event);
+
+    if hit.convict_launcher {
+        if let Some(culprit) = launcher_behind(notification.creating_process_id, monitor) {
+            convict_process(
+                culprit,
+                hit.name,
+                history,
+                engine,
+                quarantine,
+                definition_generation,
+            );
+        }
+    }
+}
+
+/// The program really behind a command: the creator itself, or, when the creator is a shell or
+/// script host that only ran the command for someone, whoever started that. Ransomware usually
+/// runs `cmd /c vssadmin delete shadows`, so the shell is skipped to reach it.
+fn launcher_behind(creating_process_id: u32, monitor: &Mutex<RansomwareMonitor>) -> Option<u32> {
+    const RELAYS: &[&str] = &[
+        "cmd.exe",
+        "powershell.exe",
+        "pwsh.exe",
+        "wscript.exe",
+        "cscript.exe",
+        "mshta.exe",
+        "conhost.exe",
+        "rundll32.exe",
+        "wmiprvse.exe",
+    ];
+    let mut process_id = creating_process_id;
+    // A few hops at most: a chain longer than that is not a relay.
+    for _ in 0..4 {
+        let image = process_image_path(process_id)?;
+        let name = image
+            .file_name()
+            .map(|name| name.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        if !RELAYS.contains(&name.as_str()) {
+            return Some(process_id);
+        }
+        let creator = monitor
+            .lock()
+            .ok()?
+            .latest_start(process_id)
+            .map(|start| start.creating_process_id)?;
+        if creator == 0 || creator == process_id {
+            return None;
+        }
+        process_id = creator;
+    }
+    None
+}
+
+/// Stops a program a rule found to be the threat, puts back the documents it changed, and, if it
+/// lives where a user or a download can put a program, learns and quarantines it. A signed
+/// program is left running: refusing its command was enough, and it is far more likely abused
+/// than malicious.
+fn convict_process(
+    process_id: u32,
+    threat_name: &str,
+    history: &EventHistory,
+    engine: &SharedDetectionEngine,
+    quarantine: &QuarantineStore,
+    definition_generation: &AtomicU64,
+) {
+    let Some(target) = open_target(process_id, std::time::SystemTime::now(), None) else {
+        return;
+    };
+    if trust::verify_file_cached(&target.image).is_trusted() {
+        log::warn!(
+            "{:?} asked for a refused command but is signed; it was left running",
+            target.image
+        );
+        return;
+    }
+    for (process_id, created_at, image) in terminate_all(vec![target]) {
+        undo_documents_changed_by(process_id, created_at);
+        if behaviour_removal_allowed(&image, &system_root(), &program_files_folders()) {
+            learn_and_quarantine(
+                &image,
+                threat_name,
+                engine,
+                quarantine,
+                history,
+                definition_generation,
+            );
+        }
     }
 }
 
