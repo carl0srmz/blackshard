@@ -7,6 +7,8 @@ changes are listed here, newest first.
 ## Unreleased
 
 ### Security
+- blackshard also starts in Safe Mode (with and without networking), so rebooting into Safe Mode
+  no longer gets around it, and those Safe Mode entries are protected like its service keys.
 - More ways of destroying a protected document now count as modifications, and the original is
   copied to the rollback vault first: opening it with truncation (overwrite or supersede),
   shrinking it through its end of file or allocation size, mapping it for writing, opening it

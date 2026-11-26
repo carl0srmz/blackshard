@@ -31,6 +31,12 @@ $destinationAmsiX86 = Join-Path $agentDirectory "blackshard-amsi-x86.dll"
 $dataDirectory = Join-Path $env:ProgramData "blackshard"
 $amsiClsid = "{73A5A75D-BF05-4A2C-8C51-64C1EC8B5C92}"
 $serviceRegistryPath = "HKLM:\System\CurrentControlSet\Services\$driverName"
+# Safe Mode starts only the drivers and services listed here. Without an entry, rebooting into Safe
+# Mode is a way around blackshard; some ransomware does exactly that.
+$safeBootRoots = @(
+    "HKLM:\SYSTEM\CurrentControlSet\Control\SafeBoot\Minimal",
+    "HKLM:\SYSTEM\CurrentControlSet\Control\SafeBoot\Network"
+)
 
 function Test-blackshardFilterLoaded {
     $filterOutput = & fltmc.exe filters 2>$null
@@ -147,6 +153,14 @@ function Remove-blackshardInstallation {
     Write-Host "[*] Stopping blackshard protection service..." -ForegroundColor Cyan
     foreach ($serviceName in @($protectionServiceName, $legacyProtectionServiceName)) {
         Stop-blackshardServiceForReplacement -Name $serviceName
+    }
+
+    # Writable now: the protection service stopped on purpose above, which lifts the driver's
+    # registry protection.
+    foreach ($safeBootRoot in $safeBootRoots) {
+        foreach ($name in @($driverName, $protectionServiceName)) {
+            Remove-Item -LiteralPath (Join-Path $safeBootRoot $name) -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 
     foreach ($registryView in @("32", "64")) {
@@ -424,6 +438,13 @@ else {
 }
 
 & sc.exe failure $protectionServiceName "reset= 86400" "actions= restart/5000/restart/5000/restart/10000" | Out-Host
+
+foreach ($safeBootRoot in $safeBootRoots) {
+    New-Item -Path (Join-Path $safeBootRoot $protectionServiceName) -Value "Service" -Force | Out-Null
+    if ($installDriver) {
+        New-Item -Path (Join-Path $safeBootRoot $driverName) -Value "Driver" -Force | Out-Null
+    }
+}
 Start-Service -Name $protectionServiceName
 
 $serviceRunning = $false

@@ -2336,10 +2336,18 @@ BlackshardIsProtectedRegistryKey (
     )
 {
     static const UNICODE_STRING system = RTL_CONSTANT_STRING(L"\\REGISTRY\\MACHINE\\SYSTEM\\");
-    /* Below a control set, so ControlSet001, ControlSet002 and CurrentControlSet all match. */
+    /*
+     * Below a control set, so ControlSet001, ControlSet002 and CurrentControlSet all match. The
+     * Safe Mode entries are covered too: removing them and rebooting into Safe Mode would start
+     * Windows without blackshard.
+     */
     static const UNICODE_STRING protectedKeys[] = {
         RTL_CONSTANT_STRING(L"\\Services\\blackshard"),
-        RTL_CONSTANT_STRING(L"\\Services\\blackshard-protection-service")
+        RTL_CONSTANT_STRING(L"\\Services\\blackshard-protection-service"),
+        RTL_CONSTANT_STRING(L"\\Control\\SafeBoot\\Minimal\\blackshard"),
+        RTL_CONSTANT_STRING(L"\\Control\\SafeBoot\\Minimal\\blackshard-protection-service"),
+        RTL_CONSTANT_STRING(L"\\Control\\SafeBoot\\Network\\blackshard"),
+        RTL_CONSTANT_STRING(L"\\Control\\SafeBoot\\Network\\blackshard-protection-service")
     };
     UNICODE_STRING rest;
     USHORT skipped;
