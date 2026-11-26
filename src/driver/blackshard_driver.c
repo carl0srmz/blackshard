@@ -2,15 +2,19 @@
 #include <dontuse.h>
 
 #define BLACKSHARD_PROTOCOL_MAGIC 0x35485342UL
-#define BLACKSHARD_PROTOCOL_VERSION 7
+#define BLACKSHARD_PROTOCOL_VERSION 8
 #define BLACKSHARD_PORT_NAME L"\\BlackshardPort"
 #define BLACKSHARD_STREAM_CONTEXT_TAG 'cShB'
+#define BLACKSHARD_NOTIFICATION_TAG 'nShB'
 #define MAX_FILE_PATH_LENGTH 1024
+#define MAX_COMMAND_LINE_LENGTH 2048
 
 #define BLACKSHARD_OPERATION_OPEN 1UL
 #define BLACKSHARD_OPERATION_EXECUTE_SECTION 2UL
 #define BLACKSHARD_OPERATION_PROTECTED_WRITE 3UL
 #define BLACKSHARD_OPERATION_PROTECTED_METADATA 4UL
+#define BLACKSHARD_OPERATION_PROCESS_CREATE 5UL
+#define BLACKSHARD_OPERATION_IMAGE_LOAD 6UL
 #define BLACKSHARD_CONTROL_GET_HEALTH 1UL
 #define BLACKSHARD_CONTROL_SET_READY_GENERATION 2UL
 #define BLACKSHARD_CONTROL_SET_STOPPING 3UL
@@ -28,6 +32,8 @@
 //
 #define BLACKSHARD_FEATURE_HANDLE_PROTECTION 0x1UL
 #define BLACKSHARD_FEATURE_REGISTRY_PROTECTION 0x2UL
+#define BLACKSHARD_FEATURE_PROCESS_NOTIFY 0x4UL
+#define BLACKSHARD_FEATURE_IMAGE_NOTIFY 0x8UL
 #define BLACKSHARD_CALLBACK_ALTITUDE L"320000.4242"
 
 #ifndef PROCESS_TERMINATE
@@ -68,6 +74,9 @@
 #define BLACKSHARD_EXECUTE_TIMEOUT_MS 30000LL
 #define BLACKSHARD_PROTECTED_TIMEOUT_MS 5000LL
 #define BLACKSHARD_OPEN_TIMEOUT_MS 1500LL
+// The image was already judged when its section was created; this second look is usually a cache
+// hit, and a slow one lets the process start rather than hold up its parent.
+#define BLACKSHARD_PROCESS_TIMEOUT_MS 10000LL
 
 typedef enum _BLACKSHARD_OPERATIONAL_PHASE {
     BlackshardPhaseEarlyBoot = 0,
@@ -118,6 +127,11 @@ typedef struct _BLACKSHARD_NOTIFICATION {
     ULONGLONG ProcessStartKey;
     ULONG MustEnforce;
     ULONG Reserved;
+    ULONG ParentProcessId;
+    ULONG CreatingProcessId;
+    ULONG CommandLineLength;
+    ULONG Reserved2;
+    WCHAR CommandLine[MAX_COMMAND_LINE_LENGTH];
 } BLACKSHARD_NOTIFICATION, *PBLACKSHARD_NOTIFICATION;
 
 typedef enum _BLACKSHARD_VERDICT {
@@ -214,7 +228,9 @@ C_ASSERT(FIELD_OFFSET(BLACKSHARD_NOTIFICATION, FileId) == 2072);
 C_ASSERT(FIELD_OFFSET(BLACKSHARD_NOTIFICATION, ContentGeneration) == 2080);
 C_ASSERT(FIELD_OFFSET(BLACKSHARD_NOTIFICATION, ProcessStartKey) == 2088);
 C_ASSERT(FIELD_OFFSET(BLACKSHARD_NOTIFICATION, MustEnforce) == 2096);
-C_ASSERT(sizeof(BLACKSHARD_NOTIFICATION) == 2104);
+C_ASSERT(FIELD_OFFSET(BLACKSHARD_NOTIFICATION, ParentProcessId) == 2104);
+C_ASSERT(FIELD_OFFSET(BLACKSHARD_NOTIFICATION, CommandLine) == 2120);
+C_ASSERT(sizeof(BLACKSHARD_NOTIFICATION) == 6216);
 C_ASSERT(sizeof(BLACKSHARD_REPLY) == 16);
 C_ASSERT(sizeof(BLACKSHARD_CONTROL_REQUEST) == 24);
 C_ASSERT(sizeof(BLACKSHARD_HEALTH_REPLY) == 160);
@@ -378,6 +394,37 @@ BlackshardIsProtectedRegistryKey (
     _In_ PCUNICODE_STRING KeyName
     );
 
+VOID
+BlackshardRegisterProcessNotifications (
+    VOID
+    );
+
+VOID
+BlackshardUnregisterProcessNotifications (
+    VOID
+    );
+
+VOID
+BlackshardProcessNotify (
+    _Inout_ PEPROCESS Process,
+    _In_ HANDLE ProcessId,
+    _Inout_opt_ PPS_CREATE_NOTIFY_INFO CreateInfo
+    );
+
+VOID
+BlackshardLoadImageNotify (
+    _In_opt_ PUNICODE_STRING FullImageName,
+    _In_ HANDLE ProcessId,
+    _In_ PIMAGE_INFO ImageInfo
+    );
+
+PBLACKSHARD_NOTIFICATION
+BlackshardAllocateNotification (
+    _In_ ULONG Operation,
+    _In_ ULONG ProcessId,
+    _In_ PCUNICODE_STRING Path
+    );
+
 NTSTATUS
 BlackshardGetOrCreateStreamContext (
     _In_ PCFLT_RELATED_OBJECTS FltObjects,
@@ -401,6 +448,9 @@ BlackshardGetOrCreateStreamContext (
 #pragma alloc_text(PAGE, BlackshardUnregisterSelfProtection)
 #pragma alloc_text(PAGE, BlackshardRegistryCallback)
 #pragma alloc_text(PAGE, BlackshardIsProtectedRegistryKey)
+#pragma alloc_text(INIT, BlackshardRegisterProcessNotifications)
+#pragma alloc_text(PAGE, BlackshardUnregisterProcessNotifications)
+#pragma alloc_text(PAGE, BlackshardProcessNotify)
 
 CONST FLT_CONTEXT_REGISTRATION Contexts[] = {
     {
@@ -529,9 +579,11 @@ DriverEntry (
     }
 
     BlackshardRegisterSelfProtection(DriverObject);
+    BlackshardRegisterProcessNotifications();
 
     status = FltStartFiltering(gBlackshardData.FilterHandle);
     if (!NT_SUCCESS(status)) {
+        BlackshardUnregisterProcessNotifications();
         BlackshardUnregisterSelfProtection();
         FltCloseCommunicationPort(gBlackshardData.ServerPort);
         gBlackshardData.ServerPort = NULL;
@@ -733,6 +785,7 @@ BlackshardUnload (
         return STATUS_FLT_DO_NOT_DETACH;
     }
 
+    BlackshardUnregisterProcessNotifications();
     BlackshardUnregisterSelfProtection();
 
     if (gBlackshardData.ServerPort != NULL) {
@@ -1193,7 +1246,7 @@ BlackshardEvaluateOpenedObject (
     FILE_INTERNAL_INFORMATION internalInformation;
     PFLT_FILE_NAME_INFORMATION nameInformation;
     PBLACKSHARD_STREAM_CONTEXT streamContext;
-    BLACKSHARD_NOTIFICATION notification;
+    PBLACKSHARD_NOTIFICATION notification;
     BLACKSHARD_REPLY reply;
     ULONG replyLength;
     ULONG requestorProcessId;
@@ -1374,28 +1427,25 @@ BlackshardEvaluateOpenedObject (
             );
     }
 
-    RtlZeroMemory(&notification, sizeof(notification));
-    RtlZeroMemory(&reply, sizeof(reply));
-
-    notification.Magic = BLACKSHARD_PROTOCOL_MAGIC;
-    notification.Version = BLACKSHARD_PROTOCOL_VERSION;
-    notification.Size = (USHORT)sizeof(notification);
-    notification.ProcessId = requestorProcessId;
-    notification.DesiredAccess = DesiredAccess;
-    notification.Operation = Operation;
-    notification.PathLength = pathLength;
-    RtlCopyMemory(
-        notification.FilePath,
-        nameInformation->Name.Buffer,
-        nameInformation->Name.Length
+    notification = BlackshardAllocateNotification(
+        Operation,
+        requestorProcessId,
+        &nameInformation->Name
         );
-    notification.FilePath[pathLength] = L'\0';
-    notification.FileId = (ULONGLONG)internalInformation.IndexNumber.QuadPart;
-    notification.ContentGeneration = contentGeneration;
-    notification.ProcessStartKey = processStartKey;
-    notification.MustEnforce = MustEnforce;
-
     FltReleaseFileNameInformation(nameInformation);
+    if (notification == NULL) {
+        return BlackshardFailureRequiresBlock(
+            BlackshardFailureInternalError,
+            MustEnforce,
+            administratorOnlyImage
+            );
+    }
+    RtlZeroMemory(&reply, sizeof(reply));
+    notification->DesiredAccess = DesiredAccess;
+    notification->FileId = (ULONGLONG)internalInformation.IndexNumber.QuadPart;
+    notification->ContentGeneration = contentGeneration;
+    notification->ProcessStartKey = processStartKey;
+    notification->MustEnforce = MustEnforce;
 
     replyLength = sizeof(reply);
     timeout.QuadPart = -10000LL * (
@@ -1410,13 +1460,13 @@ BlackshardEvaluateOpenedObject (
     status = FltSendMessage(
         gBlackshardData.FilterHandle,
         &gBlackshardData.ClientPort,
-        &notification,
-        sizeof(notification),
+        notification,
+        sizeof(*notification),
         &reply,
         &replyLength,
         &timeout
         );
-
+    ExFreePoolWithTag(notification, BLACKSHARD_NOTIFICATION_TAG);
 
     if (status == STATUS_TIMEOUT) {
         return BlackshardFailureRequiresBlock(
@@ -2250,4 +2300,270 @@ BlackshardIsProtectedRegistryKey (
         }
     }
     return FALSE;
+}
+
+//
+// The notification is over 6 KB, too much for a kernel stack several filters deep, so it comes
+// from pool. The path must already fit; callers check its length.
+//
+PBLACKSHARD_NOTIFICATION
+BlackshardAllocateNotification (
+    _In_ ULONG Operation,
+    _In_ ULONG ProcessId,
+    _In_ PCUNICODE_STRING Path
+    )
+{
+    PBLACKSHARD_NOTIFICATION notification;
+    ULONG pathLength;
+
+    pathLength = Path->Length / sizeof(WCHAR);
+    if (pathLength == 0 || pathLength >= MAX_FILE_PATH_LENGTH) {
+        return NULL;
+    }
+    notification = (PBLACKSHARD_NOTIFICATION)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED,
+        sizeof(BLACKSHARD_NOTIFICATION),
+        BLACKSHARD_NOTIFICATION_TAG
+        );
+    if (notification == NULL) {
+        return NULL;
+    }
+    notification->Magic = BLACKSHARD_PROTOCOL_MAGIC;
+    notification->Version = BLACKSHARD_PROTOCOL_VERSION;
+    notification->Size = (USHORT)sizeof(BLACKSHARD_NOTIFICATION);
+    notification->ProcessId = ProcessId;
+    notification->Operation = Operation;
+    notification->PathLength = pathLength;
+    RtlCopyMemory(notification->FilePath, Path->Buffer, Path->Length);
+    return notification;
+}
+
+VOID
+BlackshardRegisterProcessNotifications (
+    VOID
+    )
+{
+    if (NT_SUCCESS(PsSetCreateProcessNotifyRoutineEx(BlackshardProcessNotify, FALSE))) {
+        gBlackshardData.Features |= BLACKSHARD_FEATURE_PROCESS_NOTIFY;
+    }
+    //
+    // Also reports images of the other architecture (the 64-bit system DLLs a 32-bit process
+    // maps), so nothing a process loads is left out.
+    //
+    if (NT_SUCCESS(PsSetLoadImageNotifyRoutineEx(
+            BlackshardLoadImageNotify,
+            PS_IMAGE_NOTIFY_CONFLICTING_ARCHITECTURE
+            ))) {
+        gBlackshardData.Features |= BLACKSHARD_FEATURE_IMAGE_NOTIFY;
+    }
+}
+
+VOID
+BlackshardUnregisterProcessNotifications (
+    VOID
+    )
+{
+    PAGED_CODE();
+
+    if (FlagOn(gBlackshardData.Features, BLACKSHARD_FEATURE_IMAGE_NOTIFY)) {
+        (VOID)PsRemoveLoadImageNotifyRoutine(BlackshardLoadImageNotify);
+        ClearFlag(gBlackshardData.Features, BLACKSHARD_FEATURE_IMAGE_NOTIFY);
+    }
+    if (FlagOn(gBlackshardData.Features, BLACKSHARD_FEATURE_PROCESS_NOTIFY)) {
+        (VOID)PsSetCreateProcessNotifyRoutineEx(BlackshardProcessNotify, TRUE);
+        ClearFlag(gBlackshardData.Features, BLACKSHARD_FEATURE_PROCESS_NOTIFY);
+    }
+}
+
+VOID
+BlackshardProcessNotify (
+    _Inout_ PEPROCESS Process,
+    _In_ HANDLE ProcessId,
+    _Inout_opt_ PPS_CREATE_NOTIFY_INFO CreateInfo
+    )
+{
+    PFLT_VOLUME volume;
+    PFLT_INSTANCE instance;
+    PFLT_FILE_NAME_INFORMATION nameInformation;
+    PBLACKSHARD_STREAM_CONTEXT streamContext;
+    PBLACKSHARD_NOTIFICATION notification;
+    BLACKSHARD_REPLY reply;
+    ULONG replyLength;
+    ULONG creatingProcessId;
+    ULONG commandLineLength;
+    LARGE_INTEGER timeout;
+    NTSTATUS status;
+
+    PAGED_CODE();
+
+    if (CreateInfo == NULL || gBlackshardData.ClientPort == NULL) {
+        return;
+    }
+    creatingProcessId = HandleToULong(CreateInfo->CreatingThreadId.UniqueProcess);
+    if (gBlackshardData.ClientProcessId != NULL &&
+        creatingProcessId == HandleToULong(gBlackshardData.ClientProcessId)) {
+        return;
+    }
+
+    //
+    // The section scan that just let this image map left its file ID and content generation in
+    // the stream context; sending them lets the service answer from its verdict cache.
+    //
+    volume = NULL;
+    instance = NULL;
+    nameInformation = NULL;
+    if (CreateInfo->FileObject != NULL &&
+        NT_SUCCESS(FltGetVolumeFromFileObject(
+            gBlackshardData.FilterHandle,
+            CreateInfo->FileObject,
+            &volume
+            ))) {
+        if (!NT_SUCCESS(FltGetVolumeInstanceFromName(
+                gBlackshardData.FilterHandle,
+                volume,
+                NULL,
+                &instance
+                ))) {
+            instance = NULL;
+        }
+        if (!NT_SUCCESS(FltGetFileNameInformationUnsafe(
+                CreateInfo->FileObject,
+                instance,
+                FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT,
+                &nameInformation
+                ))) {
+            nameInformation = NULL;
+        }
+    }
+
+    notification = NULL;
+    if (nameInformation != NULL) {
+        notification = BlackshardAllocateNotification(
+            BLACKSHARD_OPERATION_PROCESS_CREATE,
+            HandleToULong(ProcessId),
+            &nameInformation->Name
+            );
+        FltReleaseFileNameInformation(nameInformation);
+    } else if (CreateInfo->ImageFileName != NULL) {
+        notification = BlackshardAllocateNotification(
+            BLACKSHARD_OPERATION_PROCESS_CREATE,
+            HandleToULong(ProcessId),
+            CreateInfo->ImageFileName
+            );
+    }
+
+    if (notification != NULL && instance != NULL &&
+        NT_SUCCESS(FltGetStreamContext(instance, CreateInfo->FileObject, &streamContext))) {
+        if (InterlockedCompareExchange(&streamContext->IdentityValid, 0, 0) != 0) {
+            notification->FileId = (ULONGLONG)InterlockedCompareExchange64(
+                &streamContext->FileId, 0, 0);
+            notification->ContentGeneration = (ULONGLONG)InterlockedCompareExchange64(
+                &streamContext->ContentGeneration, 0, 0);
+        }
+        FltReleaseContext(streamContext);
+    }
+    if (instance != NULL) {
+        FltObjectDereference(instance);
+    }
+    if (volume != NULL) {
+        FltObjectDereference(volume);
+    }
+    if (notification == NULL) {
+        return;
+    }
+
+    notification->ProcessStartKey = PsGetProcessStartKey(Process);
+    notification->ParentProcessId = HandleToULong(CreateInfo->ParentProcessId);
+    notification->CreatingProcessId = creatingProcessId;
+    if (CreateInfo->CommandLine != NULL) {
+        commandLineLength = min(
+            (ULONG)(CreateInfo->CommandLine->Length / sizeof(WCHAR)),
+            MAX_COMMAND_LINE_LENGTH - 1UL
+            );
+        RtlCopyMemory(
+            notification->CommandLine,
+            CreateInfo->CommandLine->Buffer,
+            commandLineLength * sizeof(WCHAR)
+            );
+        notification->CommandLineLength = commandLineLength;
+    }
+
+    RtlZeroMemory(&reply, sizeof(reply));
+    replyLength = sizeof(reply);
+    timeout.QuadPart = -10000LL * BLACKSHARD_PROCESS_TIMEOUT_MS;
+    status = FltSendMessage(
+        gBlackshardData.FilterHandle,
+        &gBlackshardData.ClientPort,
+        notification,
+        sizeof(*notification),
+        &reply,
+        &replyLength,
+        &timeout
+        );
+    ExFreePoolWithTag(notification, BLACKSHARD_NOTIFICATION_TAG);
+
+    if (status == STATUS_SUCCESS &&
+        replyLength == sizeof(reply) &&
+        reply.Magic == BLACKSHARD_PROTOCOL_MAGIC &&
+        reply.Version == BLACKSHARD_PROTOCOL_VERSION &&
+        reply.Size == sizeof(reply) &&
+        reply.Verdict == VERDICT_BLOCK) {
+        CreateInfo->CreationStatus = STATUS_ACCESS_DENIED;
+        InterlockedIncrement64(&gBlackshardData.Blocks);
+    }
+}
+
+VOID
+BlackshardLoadImageNotify (
+    _In_opt_ PUNICODE_STRING FullImageName,
+    _In_ HANDLE ProcessId,
+    _In_ PIMAGE_INFO ImageInfo
+    )
+{
+    PBLACKSHARD_NOTIFICATION notification;
+    PEPROCESS process;
+    ULONGLONG processStartKey;
+    LARGE_INTEGER timeout;
+
+    //
+    // Telemetry only: this routine cannot refuse the load, and it can run with all kernel APCs
+    // disabled, so it neither waits for the service nor queries file names. A message the
+    // service is not ready to receive at once is dropped.
+    //
+    if (FullImageName == NULL ||
+        ImageInfo->SystemModeImage ||
+        ProcessId == NULL ||
+        gBlackshardData.ClientPort == NULL ||
+        ProcessId == gBlackshardData.ClientProcessId) {
+        return;
+    }
+    if (!NT_SUCCESS(PsLookupProcessByProcessId(ProcessId, &process))) {
+        return;
+    }
+    processStartKey = PsGetProcessStartKey(process);
+    ObDereferenceObject(process);
+    if (processStartKey == 0) {
+        return;
+    }
+
+    notification = BlackshardAllocateNotification(
+        BLACKSHARD_OPERATION_IMAGE_LOAD,
+        HandleToULong(ProcessId),
+        FullImageName
+        );
+    if (notification == NULL) {
+        return;
+    }
+    notification->ProcessStartKey = processStartKey;
+    timeout.QuadPart = 0;
+    (VOID)FltSendMessage(
+        gBlackshardData.FilterHandle,
+        &gBlackshardData.ClientPort,
+        notification,
+        sizeof(*notification),
+        NULL,
+        NULL,
+        &timeout
+        );
+    ExFreePoolWithTag(notification, BLACKSHARD_NOTIFICATION_TAG);
 }

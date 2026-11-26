@@ -7,6 +7,10 @@ changes are listed here, newest first.
 ## Unreleased
 
 ### Security
+- The driver now reports every process start (image, command line, parent and creating process)
+  and every DLL load to the service. A process whose image is detected is refused at creation,
+  process starts are logged with their command lines, and ransomware alerts name how the
+  offending program was started.
 - The driver protects itself and the service: `fltmc unload` and `sc stop blackshard` fail, other
   processes (administrators included) can no longer terminate, suspend or inject into the service,
   and the driver's and service's registry keys can only be changed after the service was stopped

@@ -28,14 +28,17 @@ use windows_sys::Win32::System::Threading::{
 };
 
 const BLACKSHARD_PROTOCOL_MAGIC: u32 = 0x3548_5342;
-const BLACKSHARD_PROTOCOL_VERSION: u16 = 7;
+const BLACKSHARD_PROTOCOL_VERSION: u16 = 8;
 const CONTROL_GET_HEALTH: u32 = 1;
 const CONTROL_SET_READY_GENERATION: u32 = 2;
 const CONTROL_SET_STOPPING: u32 = 3;
 const OPERATION_EXECUTE_SECTION: u32 = 2;
 const OPERATION_PROTECTED_WRITE: u32 = 3;
 const OPERATION_PROTECTED_METADATA: u32 = 4;
+const OPERATION_PROCESS_CREATE: u32 = 5;
+pub(crate) const OPERATION_IMAGE_LOAD: u32 = 6;
 const MAX_FILE_PATH_LENGTH: usize = 1024;
+const MAX_COMMAND_LINE_LENGTH: usize = 2048;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[link(name = "FltLib")]
@@ -164,6 +167,8 @@ pub struct DriverHealthCounters {
 const DRIVER_FEATURES: &[(u32, &str)] = &[
     (0x1, "service process protection"),
     (0x2, "service registry protection"),
+    (0x4, "process start notifications"),
+    (0x8, "image load notifications"),
 ];
 
 /// The protection parts a driver reporting `features` loaded without.
@@ -205,6 +210,11 @@ pub(crate) struct BlackshardNotification {
     pub process_start_key: u64,
     pub must_enforce: u32,
     pub reserved: u32,
+    pub parent_process_id: u32,
+    pub creating_process_id: u32,
+    pub command_line_length: u32,
+    pub reserved2: u32,
+    pub command_line: [u16; MAX_COMMAND_LINE_LENGTH],
 }
 
 #[repr(C)]
@@ -536,6 +546,9 @@ pub(crate) fn realtime_worker(
             continue;
         }
         let openable_path = device_path_to_openable_path(&kernel_path);
+        if notification.operation == OPERATION_PROCESS_CREATE {
+            record_process_start(&notification, &kernel_path, &ransomware_monitor);
+        }
         let enabled = settings
             .read()
             .map(|value| value.real_time_active() && !value.is_excluded(&openable_path))
@@ -651,6 +664,8 @@ pub(crate) fn realtime_worker(
                             scan_result
                         }
                     }
+                    // A process start the driver had no file identity for: scanned, uncached.
+                    Ok(_) if notification.file_id == 0 => active_engine.scan_open_file(&file),
                     Ok(identity) => DetectionReport::error(
                         format!(
                             "kernel/user file identity mismatch (expected {:016x}, opened {:016x})",
@@ -717,7 +732,7 @@ pub(crate) fn realtime_worker(
                         report.risk_score,
                         hash,
                         report.file_size,
-                        Some(notification.file_id),
+                        Some(notification.file_id).filter(|id| *id != 0),
                     ),
                     None => Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -798,8 +813,16 @@ pub(crate) fn realtime_worker(
             event.threat_name = report.threat_name.clone();
             event.risk_score = Some(report.risk_score);
             event.details = Some(format!(
-                "block_reply_accepted={reply_accepted}; pid={}",
-                item.message.notification.process_id
+                "block_reply_accepted={reply_accepted}; pid={}{}",
+                item.message.notification.process_id,
+                if notification.operation == OPERATION_PROCESS_CREATE {
+                    format!(
+                        "; command_line={}",
+                        notification_command_line(&notification)
+                    )
+                } else {
+                    String::new()
+                }
             ));
             let _ = history.append(&event);
         }
@@ -993,6 +1016,15 @@ fn handle_protected_modification(
         },
         decision.distinct_files
     ));
+    if let Some(command_line) = monitor.lock().ok().and_then(|monitor| {
+        monitor
+            .process_start(notification.process_id, notification.process_start_key)
+            .map(|start| start.command_line.clone())
+    }) {
+        if let Some(details) = event.details.as_mut() {
+            details.push_str(&format!("; command_line={command_line}"));
+        }
+    }
     let _ = history.append(&event);
     let _ = events.try_send(RealtimeEvent::Decision(Box::new(RealtimeDecision {
         process_id: notification.process_id,
@@ -1170,6 +1202,37 @@ pub(crate) fn reply(
     }
 }
 
+/// Logs a process start and hands it to the behaviour monitor, which keeps how each recent
+/// process was started for the decisions made about it later.
+fn record_process_start(
+    notification: &BlackshardNotification,
+    image: &Path,
+    monitor: &Mutex<RansomwareMonitor>,
+) {
+    let command_line = notification_command_line(notification);
+    log::info!(
+        "Process {} started by {} (parent {}): {image:?} {command_line}",
+        notification.process_id,
+        notification.creating_process_id,
+        notification.parent_process_id
+    );
+    if let Ok(mut monitor) = monitor.lock() {
+        monitor.process_started(crate::behavior::ProcessStart {
+            process_id: notification.process_id,
+            process_start_key: notification.process_start_key,
+            parent_process_id: notification.parent_process_id,
+            creating_process_id: notification.creating_process_id,
+            image: image.to_path_buf(),
+            command_line,
+        });
+    }
+}
+
+pub(crate) fn notification_command_line(notification: &BlackshardNotification) -> String {
+    let length = (notification.command_line_length as usize).min(MAX_COMMAND_LINE_LENGTH - 1);
+    String::from_utf16_lossy(&notification.command_line[..length])
+}
+
 pub(crate) fn notification_path(notification: &BlackshardNotification) -> PathBuf {
     let path_length = (notification.path_length as usize).min(MAX_FILE_PATH_LENGTH - 1);
     PathBuf::from(String::from_utf16_lossy(
@@ -1178,19 +1241,23 @@ pub(crate) fn notification_path(notification: &BlackshardNotification) -> PathBu
 }
 
 pub(crate) fn valid_notification(notification: &BlackshardNotification) -> bool {
+    // File operations always carry the file's identity. A process start carries it only when the
+    // section scan left it behind, and an image load never does.
+    let identity_required = matches!(notification.operation, 1..=4);
     notification.magic == BLACKSHARD_PROTOCOL_MAGIC
         && notification.version == BLACKSHARD_PROTOCOL_VERSION
         && notification.size as usize == mem::size_of::<BlackshardNotification>()
-        && matches!(notification.operation, 1..=4)
-        && notification.file_id != 0
-        && notification.content_generation != 0
+        && matches!(notification.operation, 1..=6)
+        && (!identity_required
+            || (notification.file_id != 0 && notification.content_generation != 0))
         && notification.process_start_key != 0
-        && ((notification.operation == 1 && notification.must_enforce == 0)
-            || (notification.operation == 2 && notification.must_enforce == 1)
-            || (matches!(notification.operation, 3..=4) && notification.must_enforce == 0))
+        && notification.must_enforce
+            == u32::from(notification.operation == OPERATION_EXECUTE_SECTION)
         && notification.reserved == 0
+        && notification.reserved2 == 0
         && notification.path_length > 0
         && notification.path_length < MAX_FILE_PATH_LENGTH as u32
+        && (notification.command_line_length as usize) < MAX_COMMAND_LINE_LENGTH
 }
 
 fn opened_final_path(file: &File) -> std::io::Result<PathBuf> {
@@ -2074,8 +2141,13 @@ mod tests {
         assert_eq!(mem::size_of::<DriverControlRequest>(), 24);
         assert_eq!(mem::size_of::<DriverHealthReply>(), 160);
         assert_eq!(mem::size_of::<FilterMessageHeader>(), 16);
-        assert_eq!(mem::size_of::<BlackshardNotification>(), 2104);
-        assert_eq!(mem::size_of::<BlackshardMessage>(), 2120);
+        assert_eq!(
+            mem::offset_of!(BlackshardNotification, parent_process_id),
+            2104
+        );
+        assert_eq!(mem::offset_of!(BlackshardNotification, command_line), 2120);
+        assert_eq!(mem::size_of::<BlackshardNotification>(), 6216);
+        assert_eq!(mem::size_of::<BlackshardMessage>(), 6232);
         assert_eq!(mem::size_of::<FilterReplyHeader>(), 16);
         assert_eq!(mem::size_of::<BlackshardReplyMessage>(), 32);
     }

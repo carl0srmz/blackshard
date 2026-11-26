@@ -6,7 +6,7 @@ use crate::realtime::{
     hresult_text, interruptible_wait, missing_driver_features, notification_path,
     query_driver_health, realtime_worker, reply, valid_notification, BlackshardMessage,
     DriverVerdict, FilterConnectCommunicationPort, FilterGetMessage, ProtectionConnection,
-    RealtimeCounters, RealtimeEvent, SharedDetectionEngine, WorkItem,
+    RealtimeCounters, RealtimeEvent, SharedDetectionEngine, WorkItem, OPERATION_IMAGE_LOAD,
 };
 use crate::verdict_cache::VerdictCache;
 use std::collections::HashMap;
@@ -246,6 +246,14 @@ pub fn connection_loop(
             }
 
             let path = notification_path(&message.notification);
+            // Telemetry the driver does not wait on; nothing to scan or reply to yet.
+            if message.notification.operation == OPERATION_IMAGE_LOAD {
+                log::debug!(
+                    "Process {} loaded {path:?}",
+                    message.notification.process_id
+                );
+                continue;
+            }
             let item = WorkItem {
                 port: port_handle,
                 message,
