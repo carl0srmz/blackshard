@@ -43,6 +43,34 @@ pub fn looks_like_loaded_image(bytes: &[u8]) -> bool {
     &header[..4] == b"PE\0\0" && matches!(machine, 0x014c | 0x8664 | 0xaa64)
 }
 
+/// The link time, entry point and image size from a PE header, which a loaded image shares with
+/// its file whatever address it was loaded at.
+pub fn image_identity(header: &[u8]) -> Option<(u32, u32, u32)> {
+    if !looks_like_loaded_image(header) {
+        return None;
+    }
+    let read = |offset: usize| {
+        header
+            .get(offset..offset + 4)
+            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+    };
+    let pe = read(0x3C)? as usize;
+    let optional = pe + 24;
+    Some((read(pe + 8)?, read(optional + 16)?, read(optional + 56)?))
+}
+
+/// Whether a process's image in memory is no longer the program its file holds: the header was
+/// overwritten or replaced. Process hollowing (FormBook, many loaders) starts a genuine program
+/// suspended and swaps its code for the malware's.
+pub fn hollowed(memory_header: &[u8], file_header: &[u8]) -> bool {
+    match (image_identity(memory_header), image_identity(file_header)) {
+        (Some(memory), Some(file)) => memory != file,
+        // The file is a program but what is mapped as it is not.
+        (None, Some(_)) => true,
+        _ => false,
+    }
+}
+
 /// What the hunt found in one process.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryFinding {
@@ -117,8 +145,26 @@ mod platform {
         fn TerminateThread(thread: HANDLE, exit_code: u32) -> i32;
     }
 
+    #[repr(C)]
+    #[derive(Default)]
+    struct ProcessBasicInformation {
+        exit_status: i32,
+        peb: usize,
+        affinity: usize,
+        base_priority: i32,
+        process_id: usize,
+        parent_process_id: usize,
+    }
+
     #[link(name = "ntdll")]
     extern "system" {
+        fn NtQueryInformationProcess(
+            process: HANDLE,
+            class: u32,
+            information: *mut c_void,
+            length: u32,
+            returned: *mut u32,
+        ) -> i32;
         fn NtQueryInformationThread(
             thread: HANDLE,
             class: u32,
@@ -170,6 +216,85 @@ mod platform {
         lines
     }
 
+    fn read_memory(process: &Handle, address: usize, length: usize) -> Option<Vec<u8>> {
+        let mut bytes = vec![0u8; length];
+        let mut read = 0usize;
+        let ok = unsafe {
+            ReadProcessMemory(
+                process.0,
+                address as *const c_void,
+                bytes.as_mut_ptr().cast(),
+                length,
+                &mut read,
+            )
+        };
+        (ok != 0 && read > 0).then(|| {
+            bytes.truncate(read);
+            bytes
+        })
+    }
+
+    /// The process's own image, where its PEB says it is: hollowed if that memory is not mapped
+    /// from a file, or its header no longer matches the program's file.
+    fn hollowed_image(process: &Handle, process_id: u32, image: &str) -> Option<MemoryFinding> {
+        use std::io::Read;
+        const MEM_IMAGE: u32 = 0x100_0000;
+        const PROCESS_BASIC_INFORMATION: u32 = 0;
+        /// `PEB::ImageBaseAddress` in the 64-bit PEB, which WOW64 processes have too.
+        const IMAGE_BASE_OFFSET: usize = 0x10;
+        let mut basic = ProcessBasicInformation::default();
+        let status = unsafe {
+            NtQueryInformationProcess(
+                process.0,
+                PROCESS_BASIC_INFORMATION,
+                (&mut basic as *mut ProcessBasicInformation).cast(),
+                std::mem::size_of::<ProcessBasicInformation>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        if status < 0 || basic.peb == 0 {
+            return None;
+        }
+        let base = read_memory(process, basic.peb + IMAGE_BASE_OFFSET, 8)?;
+        let base = usize::from_le_bytes(base.get(..8)?.try_into().ok()?);
+        let mut region = MemoryBasicInformation::default();
+        let queried = unsafe {
+            VirtualQueryEx(
+                process.0,
+                base as *const c_void,
+                &mut region,
+                std::mem::size_of::<MemoryBasicInformation>(),
+            )
+        };
+        if queried == 0 {
+            return None;
+        }
+        // A program updated on disk while it kept running (a browser, a file Windows serviced)
+        // differs from its file for an innocent reason; it cannot be judged this way.
+        let file_changed_since_start = std::fs::metadata(image)
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .zip(crate::realtime::process_start_time(process.0))
+            .is_none_or(|(modified, started)| modified > started);
+        if file_changed_since_start {
+            return None;
+        }
+        let memory_header = read_memory(process, base, 4096).unwrap_or_default();
+        let mut file_header = vec![0u8; 4096];
+        let read = std::fs::File::open(image)
+            .and_then(|mut file| file.read(&mut file_header))
+            .ok()?;
+        file_header.truncate(read);
+        let swapped_out = region.kind != MEM_IMAGE && super::image_identity(&file_header).is_some();
+        (swapped_out || super::hollowed(&memory_header, &file_header)).then(|| MemoryFinding {
+            process_id,
+            image: image.to_owned(),
+            base,
+            size: region.region_size,
+            threat: Some("Memory.Win.ProcessHollowing".to_owned()),
+        })
+    }
+
     fn scan_process(
         engine: &DetectionEngine,
         process: &Handle,
@@ -177,7 +302,9 @@ mod platform {
         image: &str,
         total: &mut usize,
     ) -> Vec<MemoryFinding> {
-        let mut findings = Vec::new();
+        let mut findings: Vec<MemoryFinding> = hollowed_image(process, process_id, image)
+            .into_iter()
+            .collect();
         let mut address = 0usize;
         let mut read_here = 0usize;
         loop {
@@ -373,6 +500,28 @@ mod tests {
         assert!(
             !looks_like_loaded_image(&[0x90; 0x200]),
             "shellcode without headers"
+        );
+    }
+
+    #[test]
+    fn a_hollowed_image_no_longer_matches_its_file() {
+        let mut file = image(0x8664);
+        // Link time, entry point and image size in the PE and optional headers.
+        file[0x80 + 8..0x80 + 12].copy_from_slice(&0x6000_0000u32.to_le_bytes());
+        file[0x80 + 24 + 16..0x80 + 24 + 20].copy_from_slice(&0x1234u32.to_le_bytes());
+        file[0x80 + 24 + 56..0x80 + 24 + 60].copy_from_slice(&0x9000u32.to_le_bytes());
+        let mut loaded = file.clone();
+        // Loading changes the image base field, not what identifies the program.
+        loaded[0x80 + 24 + 24..0x80 + 24 + 32].copy_from_slice(&0x7FF6_0000_0000u64.to_le_bytes());
+        assert!(!hollowed(&loaded, &file));
+
+        let mut swapped = file.clone();
+        swapped[0x80 + 24 + 16..0x80 + 24 + 20].copy_from_slice(&0x5678u32.to_le_bytes());
+        assert!(hollowed(&swapped, &file));
+        assert!(hollowed(&[0u8; 0x200], &file), "header wiped");
+        assert!(
+            !hollowed(&file, b"not a program"),
+            "nothing to compare against"
         );
     }
 

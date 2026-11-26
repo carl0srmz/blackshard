@@ -2009,6 +2009,11 @@ fn process_image(handle: HANDLE) -> Option<PathBuf> {
     Some(PathBuf::from(std::ffi::OsString::from_wide(&image)))
 }
 
+/// When the process behind `handle` started.
+pub(crate) fn process_start_time(handle: HANDLE) -> Option<std::time::SystemTime> {
+    process_created_at(handle)
+}
+
 fn process_created_at(handle: HANDLE) -> Option<std::time::SystemTime> {
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::System::Threading::GetProcessTimes;
