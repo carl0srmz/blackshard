@@ -28,9 +28,10 @@ use windows_sys::Win32::System::Threading::{
 };
 
 const BLACKSHARD_PROTOCOL_MAGIC: u32 = 0x3548_5342;
-const BLACKSHARD_PROTOCOL_VERSION: u16 = 6;
+const BLACKSHARD_PROTOCOL_VERSION: u16 = 7;
 const CONTROL_GET_HEALTH: u32 = 1;
 const CONTROL_SET_READY_GENERATION: u32 = 2;
+const CONTROL_SET_STOPPING: u32 = 3;
 const OPERATION_EXECUTE_SECTION: u32 = 2;
 const OPERATION_PROTECTED_WRITE: u32 = 3;
 const OPERATION_PROTECTED_METADATA: u32 = 4;
@@ -330,6 +331,15 @@ impl RealtimeProtection {
 
     pub fn stop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        // Tell the driver this is on purpose; a disconnect it is not told about is treated as a
+        // crash or a kill, and unjudged programs outside Windows and Program Files stay blocked.
+        let told = match self.port.load(Ordering::Acquire) {
+            0 => Ok(()),
+            _ => self.send_control(CONTROL_SET_STOPPING, 0),
+        };
+        if let Err(error) = told {
+            log::warn!("Could not tell the minifilter the service is stopping: {error}");
+        }
         let handle = self.port.swap(0, Ordering::AcqRel);
         if handle != 0 {
             unsafe { CloseHandle(handle) };
@@ -400,6 +410,10 @@ impl RealtimeProtection {
         if generation == 0 {
             return Err("driver readiness generation zero is reserved".to_owned());
         }
+        self.send_control(CONTROL_SET_READY_GENERATION, generation)
+    }
+
+    fn send_control(&self, command: u32, generation: u64) -> Result<(), String> {
         let port = self.port.load(Ordering::Acquire);
         if port == 0 {
             return Err("the kernel communication port is not connected".to_owned());
@@ -408,7 +422,7 @@ impl RealtimeProtection {
             magic: BLACKSHARD_PROTOCOL_MAGIC,
             version: BLACKSHARD_PROTOCOL_VERSION,
             size: mem::size_of::<DriverControlRequest>() as u16,
-            command: CONTROL_SET_READY_GENERATION,
+            command,
             generation,
         };
         let mut returned = 0u32;
@@ -426,7 +440,7 @@ impl RealtimeProtection {
             return Err(hresult_text(result));
         }
         if returned != 0 {
-            return Err("the minifilter returned unexpected readiness data".to_owned());
+            return Err("the minifilter returned unexpected control data".to_owned());
         }
         Ok(())
     }

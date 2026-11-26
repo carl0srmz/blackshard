@@ -7,6 +7,12 @@ changes are listed here, newest first.
 ## Unreleased
 
 ### Security
+- Once real-time protection has been ready, a program the service cannot judge in time (hung,
+  crashed or killed service, bad reply) is blocked instead of allowed, unless it lives in Windows'
+  own folders or Program Files. The driver waits up to 30 s for an execution verdict instead of
+  1.5 s. Stopping the service through the service manager still turns enforcement off.
+- A protected document write now waits up to 5 s for the service to copy the original to the
+  rollback vault, instead of 0.1 s, so the copy is no longer racing the write it should precede.
 - The CI auto-repair job no longer trusts branch names coming back from the job that ran the
   failed commit's code; it re-reads them from the run and only pushes to `autofix/` branches.
 - Turbo freezes and repairs only once per administrator-approved pause, from a baseline taken when
