@@ -103,6 +103,125 @@ pub fn boot_decision(saved: &[u8], current: &[u8]) -> BootDecision {
     }
 }
 
+/// A registry key and everything below it, as read at one moment. Key paths are relative to the
+/// tree's root ("" is the root itself) and compared ignoring case, as the registry does.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Tree {
+    /// Lower-case path to the path as written.
+    pub keys: std::collections::BTreeMap<String, String>,
+    /// (lower-case key, lower-case name) to the value as written.
+    pub values: std::collections::BTreeMap<(String, String), TreeValue>,
+    /// False when the walk stopped at a size bound: an incomplete tree is never undone.
+    pub complete: bool,
+}
+
+/// A value in a [`Tree`]: its key and name as written, its type and its data.
+pub type TreeValue = (String, String, u32, Vec<u8>);
+
+/// How much of a tree's change a hunt undoes.
+#[derive(Debug, Clone, Copy)]
+pub enum TreePolicy {
+    /// Everything: keys and values added are removed, changed and removed ones put back.
+    UndoAll,
+    /// Only values added since the baseline whose data the test condemns; firewall rules, where
+    /// legitimate programs add their own too.
+    RemoveAddedWhere(fn(&[u8]) -> bool),
+}
+
+/// One step of undoing a tree's change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TreeOp {
+    DeleteKey(String),
+    DeleteValue(String, String),
+    CreateKey(String),
+    SetValue(String, String, u32, Vec<u8>),
+}
+
+fn parent_of(key: &str) -> Option<&str> {
+    if key.is_empty() {
+        None
+    } else {
+        Some(key.rsplit_once('\\').map_or("", |(parent, _)| parent))
+    }
+}
+
+/// What it takes to turn `current` back into `baseline`. Added keys are removed from the top
+/// down, so a key added with children is one deletion; values are only touched in keys that
+/// existed before.
+pub fn tree_undo(baseline: &Tree, current: &Tree, policy: TreePolicy) -> Vec<TreeOp> {
+    if !baseline.complete || !current.complete {
+        return Vec::new();
+    }
+    let mut ops = Vec::new();
+    match policy {
+        TreePolicy::RemoveAddedWhere(condemns) => {
+            for (key, (key_written, name, _, data)) in &current.values {
+                if !baseline.values.contains_key(key) && condemns(data) {
+                    ops.push(TreeOp::DeleteValue(key_written.clone(), name.clone()));
+                }
+            }
+        }
+        TreePolicy::UndoAll => {
+            for (key, written) in &current.keys {
+                let added = !baseline.keys.contains_key(key);
+                let parent_existed =
+                    parent_of(key).is_none_or(|parent| baseline.keys.contains_key(parent));
+                if added && parent_existed {
+                    ops.push(TreeOp::DeleteKey(written.clone()));
+                }
+            }
+            for (key, (key_written, name, _, _)) in &current.values {
+                if baseline.keys.contains_key(&key.0) && !baseline.values.contains_key(key) {
+                    ops.push(TreeOp::DeleteValue(key_written.clone(), name.clone()));
+                }
+            }
+            for (key, written) in &baseline.keys {
+                if !current.keys.contains_key(key) {
+                    ops.push(TreeOp::CreateKey(written.clone()));
+                }
+            }
+            for (key, (key_written, name, kind, data)) in &baseline.values {
+                let unchanged =
+                    current
+                        .values
+                        .get(key)
+                        .is_some_and(|(_, _, current_kind, current_data)| {
+                            current_kind == kind && current_data == data
+                        });
+                if !unchanged {
+                    ops.push(TreeOp::SetValue(
+                        key_written.clone(),
+                        name.clone(),
+                        *kind,
+                        data.clone(),
+                    ));
+                }
+            }
+        }
+    }
+    ops
+}
+
+/// A firewall rule (`v2.x|Action=Allow|...|App=C:\Users\...|...`) that lets in a program kept
+/// somewhere a user or download can put one.
+fn firewall_rule_for_user_writable_program(data: &[u8]) -> bool {
+    let units: Vec<u16> = data
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
+        .collect();
+    let rule = String::from_utf16_lossy(&units).to_ascii_lowercase();
+    rule.contains("action=allow")
+        && rule.split('|').any(|field| {
+            field.strip_prefix("app=").is_some_and(|app| {
+                ["\\users\\", "\\programdata\\", "\\temp\\", "\\appdata\\"]
+                    .iter()
+                    .any(|place| app.contains(place))
+            })
+        })
+}
+
 /// Everything recorded about the machine at one moment.
 struct Baseline {
     /// The pause it was taken for, as `Settings::paused_at`.
@@ -293,6 +412,7 @@ mod boot_disk {
 
 #[cfg(windows)]
 mod registry {
+    use super::{tree_undo, Tree, TreeOp, TreePolicy};
     use crate::persistence::{open, subkeys, wide};
     use std::collections::BTreeMap;
     use windows_sys::Win32::System::Registry::{
@@ -300,58 +420,7 @@ mod registry {
         HKEY_LOCAL_MACHINE, HKEY_USERS, KEY_QUERY_VALUE, KEY_SET_VALUE, KEY_WOW64_64KEY,
     };
 
-    /// Values in both the machine hive and every user's.
-    const POLICY_VALUES: &[(&str, &str)] = &[
-        (
-            r"Software\Microsoft\Windows\CurrentVersion\Policies\System",
-            "DisableTaskMgr",
-        ),
-        (
-            r"Software\Microsoft\Windows\CurrentVersion\Policies\System",
-            "DisableRegistryTools",
-        ),
-        (
-            r"Software\Microsoft\Windows\CurrentVersion\Policies\System",
-            "DisableLockWorkstation",
-        ),
-        (
-            r"Software\Microsoft\Windows\CurrentVersion\Policies\System",
-            "DisableChangePassword",
-        ),
-        (
-            r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer",
-            "NoRun",
-        ),
-        (
-            r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer",
-            "NoDesktop",
-        ),
-        (
-            r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer",
-            "NoControlPanel",
-        ),
-        (
-            r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer",
-            "NoClose",
-        ),
-        (
-            r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer",
-            "NoLogoff",
-        ),
-        (
-            r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer",
-            "NoDrives",
-        ),
-        (
-            r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer",
-            "NoViewOnDrive",
-        ),
-        (
-            r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer",
-            "NoFolderOptions",
-        ),
-        (r"Software\Policies\Microsoft\Windows\System", "DisableCMD"),
-    ];
+    /// Single values in the machine hive.
     const MACHINE_VALUES: &[(&str, &str)] = &[
         (
             r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon",
@@ -369,6 +438,14 @@ mod registry {
             r"SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion\Winlogon",
             "Userinit",
         ),
+        (
+            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows",
+            "AppInit_DLLs",
+        ),
+        (
+            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows",
+            "LoadAppInit_DLLs",
+        ),
         // What opens a program, script or text file: hijacked so every launch runs the malware.
         (r"SOFTWARE\Classes\exefile\shell\open\command", ""),
         (r"SOFTWARE\Classes\comfile\shell\open\command", ""),
@@ -377,25 +454,141 @@ mod registry {
         (r"SOFTWARE\Classes\regfile\shell\open\command", ""),
         (r"SOFTWARE\Classes\txtfile\shell\open\command", ""),
         (r"SOFTWARE\Classes\.exe", ""),
+    ];
+    /// Single values in every user's hive: the wallpaper, and the proxy a banking trojan or
+    /// adware points the browser through.
+    const USER_VALUES: &[(&str, &str)] = &[
+        (r"Control Panel\Desktop", "Wallpaper"),
         (
-            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System",
-            "EnableLUA",
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+            "ProxyServer",
         ),
         (
-            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System",
-            "ConsentPromptBehaviorAdmin",
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+            "ProxyEnable",
         ),
         (
-            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System",
-            "legalnoticecaption",
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+            "ProxyOverride",
         ),
         (
-            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System",
-            "legalnoticetext",
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+            "AutoConfigURL",
         ),
     ];
-    const USER_VALUES: &[(&str, &str)] = &[(r"Control Panel\Desktop", "Wallpaper")];
+    /// Whole keys in the machine hive, put back as they were with everything below them.
+    const MACHINE_TREES: &[(&str, &str, TreePolicy)] = &[
+        (
+            "Defender policies",
+            r"SOFTWARE\Policies\Microsoft\Windows Defender",
+            TreePolicy::UndoAll,
+        ),
+        (
+            "Defender exclusions",
+            r"SOFTWARE\Microsoft\Windows Defender\Exclusions",
+            TreePolicy::UndoAll,
+        ),
+        (
+            "Chrome policies",
+            r"SOFTWARE\Policies\Google\Chrome",
+            TreePolicy::UndoAll,
+        ),
+        (
+            "Edge policies",
+            r"SOFTWARE\Policies\Microsoft\Edge",
+            TreePolicy::UndoAll,
+        ),
+        (
+            "Firefox policies",
+            r"SOFTWARE\Policies\Mozilla\Firefox",
+            TreePolicy::UndoAll,
+        ),
+        (
+            "trusted root certificates",
+            r"SOFTWARE\Microsoft\SystemCertificates\ROOT\Certificates",
+            TreePolicy::UndoAll,
+        ),
+        (
+            "trusted root certificates set by policy",
+            r"SOFTWARE\Policies\Microsoft\SystemCertificates\Root\Certificates",
+            TreePolicy::UndoAll,
+        ),
+        (
+            "Safe Mode start list",
+            r"SYSTEM\CurrentControlSet\Control\SafeBoot",
+            TreePolicy::UndoAll,
+        ),
+        ("program launch options (IFEO)", IFEO, TreePolicy::UndoAll),
+        (
+            "silent process exit monitors",
+            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\SilentProcessExit",
+            TreePolicy::UndoAll,
+        ),
+        (
+            "machine policies",
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies",
+            TreePolicy::UndoAll,
+        ),
+        (
+            "Windows system policies",
+            r"SOFTWARE\Policies\Microsoft\Windows\System",
+            TreePolicy::UndoAll,
+        ),
+        (
+            "LSA security packages",
+            r"SYSTEM\CurrentControlSet\Control\Lsa",
+            TreePolicy::UndoAll,
+        ),
+        (
+            "firewall rules",
+            r"SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\FirewallRules",
+            TreePolicy::RemoveAddedWhere(super::firewall_rule_for_user_writable_program),
+        ),
+    ];
+    /// Whole keys in every user's hive. The `Classes` commands are the registrations UAC
+    /// bypasses write (fodhelper, Event Viewer, sdclt) and a per-user program-association hijack.
+    const USER_TREES: &[(&str, &str, TreePolicy)] = &[
+        (
+            "policies",
+            r"Software\Microsoft\Windows\CurrentVersion\Policies",
+            TreePolicy::UndoAll,
+        ),
+        (
+            "Windows policies",
+            r"Software\Policies",
+            TreePolicy::UndoAll,
+        ),
+        (
+            "root certificates",
+            r"Software\Microsoft\SystemCertificates\Root\Certificates",
+            TreePolicy::UndoAll,
+        ),
+        (
+            "UAC bypass through Settings",
+            r"Software\Classes\ms-settings\Shell\Open\command",
+            TreePolicy::UndoAll,
+        ),
+        (
+            "UAC bypass through Event Viewer",
+            r"Software\Classes\mscfile\shell\open\command",
+            TreePolicy::UndoAll,
+        ),
+        (
+            "UAC bypass through folders",
+            r"Software\Classes\Folder\shell\open\command",
+            TreePolicy::UndoAll,
+        ),
+        (
+            "program file association",
+            r"Software\Classes\exefile\shell\open\command",
+            TreePolicy::UndoAll,
+        ),
+    ];
     const IFEO: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options";
+    /// Bounds on a tree walk; past them the tree is marked incomplete and left alone.
+    const MAX_TREE_DEPTH: usize = 8;
+    const MAX_TREE_KEYS: usize = 5_000;
+    const MAX_TREE_VALUES: usize = 20_000;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
     enum Root {
@@ -425,6 +618,8 @@ mod registry {
     pub struct Snapshot {
         users: Vec<String>,
         values: BTreeMap<Location, Value>,
+        /// Each watched tree: its root, full path, label, policy and contents.
+        trees: Vec<(Root, String, String, TreePolicy, Tree)>,
         /// Values that could not be read when the snapshot was taken: there is nothing to put
         /// back, so they are left alone.
         unreadable: Vec<Location>,
@@ -442,24 +637,187 @@ mod registry {
             .collect()
     }
 
-    fn locations(users: &[String], hijacked: &[String]) -> Vec<Location> {
+    fn locations(users: &[String]) -> Vec<Location> {
         let mut all = Vec::new();
-        for (path, name) in POLICY_VALUES.iter().chain(MACHINE_VALUES) {
+        for (path, name) in MACHINE_VALUES {
             all.push((Root::Machine, path.to_string(), name.to_string()));
         }
         for sid in users {
-            for (path, name) in POLICY_VALUES.iter().chain(USER_VALUES) {
+            for (path, name) in USER_VALUES {
                 all.push((Root::Users, format!(r"{sid}\{path}"), name.to_string()));
             }
         }
-        for program in hijacked {
-            all.push((
-                Root::Machine,
-                format!(r"{IFEO}\{program}"),
-                "Debugger".to_owned(),
-            ));
+        all
+    }
+
+    fn trees(users: &[String]) -> Vec<(Root, String, String, TreePolicy)> {
+        let mut all = Vec::new();
+        for (label, path, policy) in MACHINE_TREES {
+            all.push((Root::Machine, path.to_string(), label.to_string(), *policy));
+        }
+        for sid in users {
+            for (label, path, policy) in USER_TREES {
+                all.push((
+                    Root::Users,
+                    format!(r"{sid}\{path}"),
+                    format!("{label} of {sid}"),
+                    *policy,
+                ));
+            }
         }
         all
+    }
+
+    /// Every key and value under `path`, bounded.
+    fn read_tree(root: Root, path: &str) -> Tree {
+        use windows_sys::Win32::System::Registry::{RegEnumValueW, RegOpenKeyExW};
+        const ERROR_FILE_NOT_FOUND: u32 = 2;
+        let mut tree = Tree {
+            complete: true,
+            ..Tree::default()
+        };
+        let mut pending = vec![(String::new(), 0usize)];
+        while let Some((relative, depth)) = pending.pop() {
+            let full = if relative.is_empty() {
+                path.to_owned()
+            } else {
+                format!(r"{path}\{relative}")
+            };
+            let wide_full = wide(&full);
+            let mut key: HKEY = 0;
+            let opened = unsafe {
+                RegOpenKeyExW(
+                    root.handle(),
+                    wide_full.as_ptr(),
+                    0,
+                    KEY_QUERY_VALUE | KEY_WOW64_64KEY,
+                    &mut key,
+                )
+            };
+            match opened {
+                0 => {}
+                ERROR_FILE_NOT_FOUND if relative.is_empty() => return tree,
+                _ => {
+                    tree.complete = false;
+                    return tree;
+                }
+            }
+            tree.keys.insert(relative.to_lowercase(), relative.clone());
+            for index in 0.. {
+                let mut name = vec![0u16; 16_384];
+                let mut name_length = name.len() as u32;
+                let mut kind = 0u32;
+                let mut data = vec![0u8; 64 * 1024];
+                let mut data_length = data.len() as u32;
+                let status = unsafe {
+                    RegEnumValueW(
+                        key,
+                        index,
+                        name.as_mut_ptr(),
+                        &mut name_length,
+                        std::ptr::null(),
+                        &mut kind,
+                        data.as_mut_ptr(),
+                        &mut data_length,
+                    )
+                };
+                if status == 259 {
+                    break;
+                }
+                if status != 0 || tree.values.len() >= MAX_TREE_VALUES {
+                    // A value too large to read, or too many: this tree is not undone.
+                    tree.complete = false;
+                    break;
+                }
+                let name = String::from_utf16_lossy(&name[..name_length as usize]);
+                data.truncate(data_length as usize);
+                tree.values.insert(
+                    (relative.to_lowercase(), name.to_lowercase()),
+                    (relative.clone(), name, kind, data),
+                );
+            }
+            unsafe { RegCloseKey(key) };
+            if depth >= MAX_TREE_DEPTH {
+                if !subkeys(root.handle(), &full).is_empty() {
+                    tree.complete = false;
+                }
+                continue;
+            }
+            for child in subkeys(root.handle(), &full) {
+                if tree.keys.len() + pending.len() >= MAX_TREE_KEYS {
+                    tree.complete = false;
+                    return tree;
+                }
+                let child = if relative.is_empty() {
+                    child
+                } else {
+                    format!(r"{relative}\{child}")
+                };
+                pending.push((child, depth + 1));
+            }
+        }
+        tree
+    }
+
+    fn apply(root: Root, path: &str, op: &TreeOp) -> bool {
+        use windows_sys::Win32::System::Registry::RegDeleteTreeW;
+        let full = |relative: &str| {
+            if relative.is_empty() {
+                path.to_owned()
+            } else {
+                format!(r"{path}\{relative}")
+            }
+        };
+        match op {
+            TreeOp::DeleteKey(relative) => {
+                let target = wide(&full(relative));
+                let emptied = unsafe { RegDeleteTreeW(root.handle(), target.as_ptr()) } == 0;
+                if !emptied || !relative.is_empty() {
+                    return emptied;
+                }
+                // For the tree's own root, RegDeleteTreeW leaves the key, empty; remove it too.
+                let Some((parent, name)) = path.rsplit_once('\\') else {
+                    return true;
+                };
+                use windows_sys::Win32::System::Registry::RegDeleteKeyExW;
+                let Some(parent) = open(root.handle(), parent, KEY_QUERY_VALUE) else {
+                    return false;
+                };
+                let name = wide(name);
+                let deleted =
+                    unsafe { RegDeleteKeyExW(parent, name.as_ptr(), KEY_WOW64_64KEY, 0) } == 0;
+                unsafe { RegCloseKey(parent) };
+                deleted
+            }
+            TreeOp::DeleteValue(relative, name) => {
+                write(&(root, full(relative), name.clone()), &None)
+            }
+            TreeOp::CreateKey(relative) => {
+                let target = wide(&full(relative));
+                let mut key: HKEY = 0;
+                let created = unsafe {
+                    RegCreateKeyExW(
+                        root.handle(),
+                        target.as_ptr(),
+                        0,
+                        std::ptr::null(),
+                        0,
+                        KEY_SET_VALUE | KEY_WOW64_64KEY,
+                        std::ptr::null(),
+                        &mut key,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if created == 0 {
+                    unsafe { RegCloseKey(key) };
+                }
+                created == 0
+            }
+            TreeOp::SetValue(relative, name, kind, data) => write(
+                &(root, full(relative), name.clone()),
+                &Some((*kind, data.clone())),
+            ),
+        }
     }
 
     /// The value, `Ok(None)` when it does not exist, and `Err` for any other failure (access
@@ -571,7 +929,7 @@ mod registry {
         let users = user_sids();
         let mut values = BTreeMap::new();
         let mut unreadable = Vec::new();
-        for location in locations(&users, &subkeys(HKEY_LOCAL_MACHINE, IFEO)) {
+        for location in locations(&users) {
             match read(&location) {
                 Ok(value) => {
                     values.insert(location, value);
@@ -579,33 +937,50 @@ mod registry {
                 Err(_) => unreadable.push(location),
             }
         }
+        let trees = trees(&users)
+            .into_iter()
+            .map(|(root, path, label, policy)| {
+                let tree = read_tree(root, &path);
+                (root, path, label, policy, tree)
+            })
+            .collect();
         Snapshot {
             users,
             values,
+            trees,
             unreadable,
         }
     }
 
-    /// Puts every watched value back as the snapshot has it. Users who signed in after the
-    /// snapshot have no baseline and are left alone; a debugger hijack added since is removed.
+    /// Puts every watched value and tree back as the snapshot has it. Users who signed in after
+    /// the snapshot have no baseline and are left alone.
     pub fn restore(snapshot: &Snapshot) -> Vec<String> {
-        let mut programs = subkeys(HKEY_LOCAL_MACHINE, IFEO);
-        programs.extend(
-            snapshot
-                .values
-                .keys()
-                .filter_map(|(_, path, _)| path.strip_prefix(&format!(r"{IFEO}\")))
-                .map(str::to_owned),
-        );
-        programs.sort_by_key(|program| program.to_lowercase());
-        programs.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
-
         let mut repairs = Vec::new();
-        for location in locations(&snapshot.users, &programs) {
+        for (root, path, label, policy, baseline) in &snapshot.trees {
+            let current = read_tree(*root, path);
+            let ops = tree_undo(baseline, &current, *policy);
+            if ops.is_empty() {
+                continue;
+            }
+            let undone = ops.iter().filter(|op| apply(*root, path, op)).count();
+            if undone < ops.len() {
+                log::warn!(
+                    r"Undid {undone} of {} changes in {}\{path}",
+                    ops.len(),
+                    root.name()
+                );
+            }
+            if undone > 0 {
+                repairs.push(format!(
+                    r"{label}: {undone} change(s) undone ({}\{path})",
+                    root.name()
+                ));
+            }
+        }
+        for location in locations(&snapshot.users) {
             if snapshot.unreadable.contains(&location) {
                 continue;
             }
-            // A debugger entry for a program with no subkey at the time did not exist then.
             let saved = snapshot.values.get(&location).cloned().flatten();
             match read(&location) {
                 Ok(current) if current == saved => continue,
@@ -653,6 +1028,126 @@ mod tests {
         region[512..520].copy_from_slice(b"EFI PART");
         region[512 + 40..512 + 48].copy_from_slice(&34u64.to_le_bytes());
         region
+    }
+
+    fn tree(keys: &[&str], values: &[(&str, &str, &[u8])]) -> Tree {
+        Tree {
+            keys: keys
+                .iter()
+                .map(|key| (key.to_lowercase(), key.to_string()))
+                .collect(),
+            values: values
+                .iter()
+                .map(|(key, name, data)| {
+                    (
+                        (key.to_lowercase(), name.to_lowercase()),
+                        (key.to_string(), name.to_string(), 1, data.to_vec()),
+                    )
+                })
+                .collect(),
+            complete: true,
+        }
+    }
+
+    #[test]
+    fn a_tree_is_put_back_as_it_was() {
+        let baseline = tree(
+            &["", "Exclusions", "Exclusions\\Paths"],
+            &[
+                ("", "DisableAntiSpyware", b"0"),
+                ("Exclusions\\Paths", "C:\\Build", b"0"),
+            ],
+        );
+        let current = tree(
+            &[
+                "",
+                "Exclusions",
+                "Exclusions\\Paths",
+                "Real-Time Protection",
+                "Real-Time Protection\\x",
+            ],
+            &[
+                ("", "DisableAntiSpyware", b"1"),
+                ("Exclusions\\Paths", "C:\\Build", b"0"),
+                ("Exclusions\\Paths", "C:\\", b"0"),
+                ("Real-Time Protection", "DisableRealtimeMonitoring", b"1"),
+            ],
+        );
+        let ops = tree_undo(&baseline, &current, TreePolicy::UndoAll);
+        assert!(ops.contains(&TreeOp::DeleteKey("Real-Time Protection".to_owned())));
+        assert!(
+            !ops.contains(&TreeOp::DeleteKey("Real-Time Protection\\x".to_owned())),
+            "removed with its parent"
+        );
+        assert!(ops.contains(&TreeOp::DeleteValue(
+            "Exclusions\\Paths".to_owned(),
+            "C:\\".to_owned()
+        )));
+        assert!(ops.contains(&TreeOp::SetValue(
+            String::new(),
+            "DisableAntiSpyware".to_owned(),
+            1,
+            b"0".to_vec()
+        )));
+        assert!(!ops.iter().any(|op| matches!(op, TreeOp::DeleteValue(_, name) if name == "DisableRealtimeMonitoring")), "its key goes as a whole");
+        assert_eq!(ops.len(), 3);
+    }
+
+    #[test]
+    fn a_tree_created_from_nothing_is_removed_and_a_deleted_one_comes_back() {
+        let absent = Tree {
+            complete: true,
+            ..Tree::default()
+        };
+        let created = tree(
+            &["", "ExtensionInstallForcelist"],
+            &[("ExtensionInstallForcelist", "1", b"abc;https://x")],
+        );
+        assert_eq!(
+            tree_undo(&absent, &created, TreePolicy::UndoAll),
+            vec![TreeOp::DeleteKey(String::new())]
+        );
+        let ops = tree_undo(&created, &absent, TreePolicy::UndoAll);
+        assert!(ops.contains(&TreeOp::CreateKey("ExtensionInstallForcelist".to_owned())));
+        assert!(ops.contains(&TreeOp::SetValue(
+            "ExtensionInstallForcelist".to_owned(),
+            "1".to_owned(),
+            1,
+            b"abc;https://x".to_vec()
+        )));
+    }
+
+    #[test]
+    fn an_incomplete_tree_is_never_touched() {
+        let baseline = tree(&[""], &[]);
+        let mut current = tree(&["", "x"], &[]);
+        current.complete = false;
+        assert!(tree_undo(&baseline, &current, TreePolicy::UndoAll).is_empty());
+    }
+
+    #[test]
+    fn only_firewall_rules_for_user_writable_programs_added_since_are_removed() {
+        let wide =
+            |text: &str| -> Vec<u8> { text.encode_utf16().flat_map(u16::to_le_bytes).collect() };
+        let baseline = tree(&[""], &[]);
+        let mut current = baseline.clone();
+        for (name, rule) in [
+            ("rat", "v2.30|Action=Allow|Active=TRUE|Dir=In|App=C:\\Users\\x\\AppData\\Roaming\\svc.exe|"),
+            ("game", "v2.30|Action=Allow|Active=TRUE|Dir=In|App=C:\\Program Files\\Game\\game.exe|"),
+        ] {
+            current.values.insert(
+                (String::new(), name.to_owned()),
+                (String::new(), name.to_owned(), 1, wide(rule)),
+            );
+        }
+        assert_eq!(
+            tree_undo(
+                &baseline,
+                &current,
+                TreePolicy::RemoveAddedWhere(firewall_rule_for_user_writable_program)
+            ),
+            vec![TreeOp::DeleteValue(String::new(), "rat".to_owned())]
+        );
     }
 
     #[test]
