@@ -1570,10 +1570,19 @@ mod windows_transport {
                                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(programs);
                         });
                     }
+                    let memory_engine = Arc::clone(&engine);
                     finish = Box::new(move || {
-                        // Every hunt: autostarts the command-line rules condemn, which is all
-                        // there is on disk of fileless malware.
-                        let mut repairs = crate::persistence::sweep_autostarts();
+                        // Every hunt: code living only in memory, with what started during the
+                        // pause read first and still frozen, then autostarts the command-line
+                        // rules condemn, which is all there is on disk of fileless malware.
+                        let first = frozen
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .as_ref()
+                            .map(crate::realtime::Frozen::process_ids)
+                            .unwrap_or_default();
+                        let mut repairs = crate::memory_scan::hunt(&memory_engine, &first);
+                        repairs.extend(crate::persistence::sweep_autostarts());
                         // Only the hunt that ends an administrator's pause may put back what
                         // changed during it.
                         if let Some(pause) = pause {

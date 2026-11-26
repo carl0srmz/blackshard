@@ -1185,7 +1185,7 @@ fn cached_process_trust(
     resolved
 }
 
-fn process_image_path(process_id: u32) -> Option<PathBuf> {
+pub(crate) fn process_image_path(process_id: u32) -> Option<PathBuf> {
     let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
     if process == 0 {
         return None;
@@ -1816,7 +1816,7 @@ pub(crate) fn running_process_modules() -> Vec<PathBuf> {
     modules
 }
 
-fn running_process_ids() -> Vec<u32> {
+pub(crate) fn running_process_ids() -> Vec<u32> {
     #[link(name = "kernel32")]
     extern "system" {
         fn K32EnumProcesses(process_ids: *mut u32, size: u32, returned: *mut u32) -> i32;
@@ -2086,11 +2086,11 @@ fn terminate_all(targets: Vec<Target>) -> Vec<(u32, std::time::SystemTime, PathB
 
 /// Programs suspended at the start of a turbo hunt. Dropping this resumes the ones still running:
 /// whatever the hunt convicted has been terminated by then.
-pub(crate) struct Frozen(Vec<OwnedProcess>);
+pub(crate) struct Frozen(Vec<(u32, OwnedProcess)>);
 
 impl Drop for Frozen {
     fn drop(&mut self) {
-        for process in &self.0 {
+        for (_, process) in &self.0 {
             unsafe { NtResumeProcess(process.0) };
         }
     }
@@ -2100,6 +2100,26 @@ impl Frozen {
     pub(crate) fn len(&self) -> usize {
         self.0.len()
     }
+
+    pub(crate) fn process_ids(&self) -> Vec<u32> {
+        self.0.iter().map(|(process_id, _)| *process_id).collect()
+    }
+}
+
+/// Whether a program is one of Windows' own, sitting directly in the Windows folder, `System32`
+/// or `SysWOW64`: the hunt stops injected threads in these rather than the whole process.
+pub(crate) fn is_protected_system_image(image: &Path) -> bool {
+    in_protected_system_folder(image, &system_root())
+}
+
+/// Stops one process under the same policy as everything else here (never Windows' critical
+/// processes or the shell, all threads suspended first, a self-set critical flag cleared), and
+/// puts back the documents it changed. Returns its image when it was stopped.
+pub(crate) fn terminate_process(process_id: u32) -> Option<PathBuf> {
+    let target = open_target(process_id, std::time::SystemTime::now(), None)?;
+    let (process_id, created_at, image) = terminate_all(vec![target]).into_iter().next()?;
+    undo_documents_changed_by(process_id, created_at);
+    Some(image)
 }
 
 /// Suspends every program started since `since` that is not part of Windows, not blackshard and
@@ -2145,7 +2165,7 @@ pub(crate) fn freeze_programs_started_since(since: std::time::SystemTime) -> Fro
         }
         if unsafe { NtSuspendProcess(handle) } >= 0 {
             log::warn!("Froze PID {process_id} ({image:?}), started while protection was paused");
-            frozen.push(process);
+            frozen.push((process_id, process));
         }
     }
     Frozen(frozen)

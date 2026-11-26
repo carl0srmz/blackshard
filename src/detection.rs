@@ -370,6 +370,12 @@ impl DetectionEngine {
         self.scan_bytes_with(bytes, SystemAmsi::Consult)
     }
 
+    /// Scans a region of a running program's memory. The system AMSI is not asked: it judges
+    /// scripts, and handing it megabytes of machine code only costs time.
+    pub fn scan_memory(&self, bytes: &[u8]) -> DetectionReport {
+        self.scan_bytes_with(bytes, SystemAmsi::Skip)
+    }
+
     /// Scans content that reached the service *through* AMSI, from blackshard's own provider.
     ///
     /// Windows has already dispatched that content to every registered AMSI provider, so handing

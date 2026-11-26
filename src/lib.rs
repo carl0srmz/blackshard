@@ -16,6 +16,7 @@ pub mod engine;
 pub mod history;
 pub mod ipc;
 pub mod lnk;
+pub mod memory_scan;
 pub mod notification_agent;
 pub mod notifications;
 pub mod paths;
