@@ -65,6 +65,9 @@ changes are listed here, newest first.
 - Self-tests are administrator-only and rate-limited; clearing the history is recorded.
 
 ### Added
+- `lab/` sets up the isolated Hyper-V filming VM from FILMING.md with one command: a Gen 1 Windows 10
+  VM installed unattended, a private switch for running samples, internet-only NAT for setup
+  (host and LAN denied on the switch port), and read-only ways to move builds in and logs out.
 - Browser credential stores (Chromium's Login Data, Cookies, Web Data and Local State, Firefox's
   logins.json, key4.db and cookies.sqlite) can only be opened by the browser or a signed program;
   an infostealer is refused, stopped and removed.

@@ -1,0 +1,4 @@
+# Generated per machine: VM password, payload ISO, staging. Never commit.
+state/
+# Logs/reports copied out of the VM.
+exports/

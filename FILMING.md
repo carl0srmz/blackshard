@@ -20,6 +20,10 @@ cargo test --workspace --all-targets
 
 ### 2. The filming VM
 
+[`lab/`](lab/README.md) builds this VM on Hyper-V with one command (`lab\Setup-Lab.ps1`): the settings
+below, plus a private switch for samples and an internet-only NAT for setup that can reach neither
+the host nor the LAN.
+
 - **Windows 10, BIOS / "Generation 1".** On a UEFI/GPT VM, an MBR overwrite often doesn't stop
   Windows from booting, so the boot-record repair has nothing visible to show.
 - **Secure Boot off.** Turn off shared clipboard, drag and drop, and shared folders once the files
