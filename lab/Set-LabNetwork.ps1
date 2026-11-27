@@ -49,4 +49,7 @@ switch ($Mode) {
     'Online'   { Connect-VMNetworkAdapter -VMNetworkAdapter $nic -SwitchName $c.OnlineSwitch }
     'Off'      { Disconnect-VMNetworkAdapter -VMNetworkAdapter $nic }
 }
+# Every change re-applies the port ACLs, so a VM made by an older version of these scripts (or
+# with hand-edited ACLs) always ends up with the current set.
+Set-LabPortAcl -VMNetworkAdapter (Get-VMNetworkAdapter -VM $vm)
 Show-State

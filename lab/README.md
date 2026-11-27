@@ -9,8 +9,8 @@ run.
 | Layer | Isolated (samples) | Online (setup only) |
 |---|---|---|
 | Hyper-V switch | **Private**: no host adapter, no physical NIC. There's no route out. | Internal switch + WinNAT, internet only |
-| Switch-port ACLs (on the host, out of the guest's reach) | deny 10/8, 172.16/12, 192.168/16, 169.254/16, 100.64/10, multicast, IPv6 ULA/link-local | same |
-| Host firewall | n/a | blocks all inbound from the lab adapter and the 10.213.0.0/24 subnet |
+| Switch-port ACLs (on the host, out of the guest's reach) | deny 10/8, 172.16/12, 192.168/16, 169.254/16, 100.64/10, multicast, IPv6 ULA/link-local | same, except the NAT gateway `10.213.0.1` (these ACLs also filter ARP, so the VM couldn't find its gateway otherwise) |
+| Host firewall | n/a | blocks all inbound from the lab adapter and the 10.213.0.0/24 subnet, which covers the gateway address the ACLs let through |
 | Guest firewall, IPv6 off, LLMNR/NetBIOS off | backup layer | backup layer |
 | Host ↔ guest data paths | enhanced session (clipboard/drives) off, Guest Service Interface, KVP and VSS off, no shared folders | same |
 | Files in | read-only payload ISO only | same |
@@ -104,7 +104,8 @@ unloaded). Then retake `base` and `ready`.
 | `Start-LabSetup.ps1` | host | waits for the ISO, runs Setup-Lab, resumes itself after the restart |
 | `Enable-HyperV.ps1` | host | Hyper-V feature |
 | `New-BlackshardLab.ps1` | host | switches, NAT, firewall, ACLs, VM, unattend |
-| `Set-LabNetwork.ps1` | host | `Isolated` / `Online` / `Off` (no argument shows the current mode) |
+| `Set-LabNetwork.ps1` | host | `Isolated` / `Online` / `Off` (no argument shows the current mode); re-applies the port ACLs |
+| `Test-LabNetwork.ps1` | host | diagnoses the Online network from inside the VM; report in `state\network-report.txt` |
 | `Update-LabPayload.ps1` | host | repack a new `dist\` into the payload ISO |
 | `Export-LabOutbox.ps1` | host | read-only copy of text reports out of the VM |
 | `LabCommon.psm1` | host | shared settings: VM size, subnet, names |

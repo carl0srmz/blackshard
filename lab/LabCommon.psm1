@@ -43,6 +43,27 @@ function Get-LabStateDir {
     $script:StateDir
 }
 
+# (Re)applies the switch-port ACLs: deny every private/link-local/multicast range, except the NAT
+# gateway itself. Hyper-V port ACLs also filter ARP, so without that one /32 allow the 10/8 deny
+# stops the VM from resolving its gateway and nothing leaves at all. Traffic to the gateway
+# address is the host itself, which the host firewall rules block (all inbound on that adapter).
+# Idempotent: clears whatever ACLs the adapter had first.
+function Set-LabPortAcl {
+    param([Parameter(Mandatory)]$VMNetworkAdapter)
+    $c = Get-LabConfig
+    Get-VMNetworkAdapterAcl -VMNetworkAdapter $VMNetworkAdapter | ForEach-Object {
+        Remove-VMNetworkAdapterAcl -VMNetworkAdapter $VMNetworkAdapter -RemoteIPAddress $_.RemoteAddress -Direction $_.Direction -Action $_.Action
+    }
+    foreach ($range in $c.DeniedRemoteRanges) {
+        Add-VMNetworkAdapterAcl -VMNetworkAdapter $VMNetworkAdapter -RemoteIPAddress $range -Direction Both -Action Deny
+    }
+    foreach ($range in $c.DeniedRemoteRangesV6) {
+        try { Add-VMNetworkAdapterAcl -VMNetworkAdapter $VMNetworkAdapter -RemoteIPAddress $range -Direction Both -Action Deny }
+        catch { Write-Warning "IPv6 ACL $range not applied: $($_.Exception.Message) (guest IPv6 is disabled anyway)." }
+    }
+    Add-VMNetworkAdapterAcl -VMNetworkAdapter $VMNetworkAdapter -RemoteIPAddress "$($c.HostNatIp)/32" -Direction Both -Action Allow
+}
+
 function Assert-LabAdmin {
     $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
     if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -152,4 +173,4 @@ function New-LabPayload {
 }
 
 Export-ModuleMember -Function Get-LabConfig, Get-LabRoot, Get-LabStateDir, Assert-LabAdmin,
-    Assert-LabHyperV, New-LabIsoFile, New-LabPayload
+    Assert-LabHyperV, New-LabIsoFile, New-LabPayload, Set-LabPortAcl

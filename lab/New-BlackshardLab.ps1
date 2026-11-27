@@ -160,13 +160,7 @@ Get-VMIntegrationService -VM $vm | Where-Object {
 # destination. These live on the Hyper-V switch port, so nothing inside the guest can lift them.
 $nic = Get-VMNetworkAdapter -VM $vm
 Set-VMNetworkAdapter -VMNetworkAdapter $nic -DhcpGuard On -RouterGuard On -MacAddressSpoofing Off
-foreach ($range in $c.DeniedRemoteRanges) {
-    Add-VMNetworkAdapterAcl -VMNetworkAdapter $nic -RemoteIPAddress $range -Direction Both -Action Deny
-}
-foreach ($range in $c.DeniedRemoteRangesV6) {
-    try { Add-VMNetworkAdapterAcl -VMNetworkAdapter $nic -RemoteIPAddress $range -Direction Both -Action Deny }
-    catch { Write-Warning "IPv6 ACL $range not applied: $($_.Exception.Message) (guest IPv6 is disabled anyway)." }
-}
+Set-LabPortAcl -VMNetworkAdapter $nic
 
 # DVDs: Windows ISO on IDE 1:0, lab payload on IDE 1:1.
 $payloadIso = New-LabPayload -DistPath $DistPath -UnattendXml $unattend
