@@ -65,6 +65,9 @@ changes are listed here, newest first.
 - Self-tests are administrator-only and rate-limited; clearing the history is recorded.
 
 ### Added
+- `install.ps1` adds blackshard to the Start menu and the desktop, with the blackshard icon, like the
+  setup installer does; `-Uninstall` removes both shortcuts. `deploy.ps1` now ships the icon in
+  `dist\` (and so in the portable zip).
 - `lab/` sets up the isolated Hyper-V filming VM from FILMING.md with one command: a Gen 1 Windows 10
   VM installed unattended, a private switch for running samples, internet-only NAT for setup
   (host and LAN denied on the switch port), and read-only ways to move builds in and logs out.

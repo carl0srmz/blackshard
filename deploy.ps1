@@ -107,12 +107,18 @@ try {
     Copy-Item -LiteralPath $amsiX64Binary -Destination (Join-Path $distributionDirectory "blackshard-amsi-x64.dll")
     Copy-Item -LiteralPath $amsiX86Binary -Destination (Join-Path $distributionDirectory "blackshard-amsi-x86.dll")
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot "README.md") -Destination $distributionDirectory
+    # install.ps1 gives its Start menu and desktop shortcuts this icon, the same one the setup
+    # installer uses: blackshard-ui.exe carries no icon of its own.
+    & (Join-Path $PSScriptRoot "tools\New-BlackshardIcon.ps1") `
+        -LogoPath (Join-Path $PSScriptRoot "logo.png") `
+        -OutputPath (Join-Path $distributionDirectory "blackshard.ico")
     $requiredArtifacts = @(
         "blackshard-service.exe",
         "blackshard-ui.exe",
         "blackshard.sys",
         "blackshard-amsi-x64.dll",
-        "blackshard-amsi-x86.dll"
+        "blackshard-amsi-x86.dll",
+        "blackshard.ico"
     )
     foreach ($requiredArtifact in $requiredArtifacts) {
         if (-not (Test-Path -LiteralPath (Join-Path $distributionDirectory $requiredArtifact) -PathType Leaf)) {

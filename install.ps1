@@ -31,6 +31,18 @@ $destinationService = Join-Path $agentDirectory "blackshard-service.exe"
 $destinationUi = Join-Path $agentDirectory "blackshard-ui.exe"
 $destinationAmsiX64 = Join-Path $agentDirectory "blackshard-amsi-x64.dll"
 $destinationAmsiX86 = Join-Path $agentDirectory "blackshard-amsi-x86.dll"
+# deploy.ps1 makes the icon; an older dist\ without it still installs, with the shortcuts using
+# blackshard-ui.exe's (default) icon.
+$sourceIcon = Join-Path $PSScriptRoot "blackshard.ico"
+$destinationIcon = Join-Path $agentDirectory "blackshard.ico"
+# The same shortcuts, at the same paths, as the setup installer (installer\development\vm-setup.ps1),
+# so either one replaces the other's instead of adding a second.
+$startMenuShortcut = Join-Path $env:ProgramData "Microsoft\Windows\Start Menu\Programs\blackshard.lnk"
+$commonDesktopDirectory = [Environment]::GetFolderPath("CommonDesktopDirectory")
+if ([string]::IsNullOrWhiteSpace($commonDesktopDirectory)) {
+    $commonDesktopDirectory = Join-Path $env:PUBLIC "Desktop"
+}
+$desktopShortcut = Join-Path $commonDesktopDirectory "blackshard.lnk"
 $dataDirectory = Join-Path $env:ProgramData "blackshard"
 $amsiClsid = "{73A5A75D-BF05-4A2C-8C51-64C1EC8B5C92}"
 $serviceRegistryPath = "HKLM:\System\CurrentControlSet\Services\$driverName"
@@ -200,6 +212,17 @@ function Disable-SystemHardening([string]$ParametersKey) {
     }
 }
 
+function New-blackshardShortcut([string]$Path) {
+    New-Item -ItemType Directory -Path (Split-Path -Parent $Path) -Force | Out-Null
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut($Path)
+    $shortcut.TargetPath = $destinationUi
+    $shortcut.WorkingDirectory = $agentDirectory
+    $shortcut.Description = "blackshard antivirus"
+    $shortcut.IconLocation = if (Test-Path -LiteralPath $destinationIcon -PathType Leaf) { "$destinationIcon,0" } else { "$destinationUi,0" }
+    $shortcut.Save()
+}
+
 function Remove-blackshardInstallation {
     Write-Host "[*] Stopping blackshard protection service..." -ForegroundColor Cyan
     foreach ($serviceName in @($protectionServiceName, $legacyProtectionServiceName)) {
@@ -227,6 +250,8 @@ function Remove-blackshardInstallation {
     $driverStillLoaded = [bool](Test-blackshardFilterLoaded)
     & sc.exe delete $driverName 2>$null | Out-Host
     Start-Sleep -Seconds 1
+
+    Remove-Item -LiteralPath $startMenuShortcut, $desktopShortcut -Force -ErrorAction SilentlyContinue
 
     Remove-FileNowOrAtRestart $destinationDriver
     # Only blackshard writes here (the directory is administrator-only), so everything in it goes.
@@ -317,6 +342,9 @@ foreach ($component in @(
     # An upgrade finds the old AMSI provider loaded in running processes, and the UI may be open.
     Remove-FileNowOrAtRestart $component.Destination
     Copy-Item -LiteralPath $component.Source -Destination $component.Destination -Force
+}
+if (Test-Path -LiteralPath $sourceIcon -PathType Leaf) {
+    Copy-Item -LiteralPath $sourceIcon -Destination $destinationIcon -Force
 }
 
 & icacls.exe $agentDirectory "/inheritance:e" `
@@ -516,6 +544,10 @@ for ($attempt = 0; $attempt -lt 20; $attempt++) {
 if (-not $serviceRunning) {
     throw "The blackshard protection service did not reach RUNNING state."
 }
+
+New-blackshardShortcut -Path $startMenuShortcut
+New-blackshardShortcut -Path $desktopShortcut
+Write-Host "[+] blackshard is in the Start menu and on the desktop." -ForegroundColor Green
 
 if ($installDriver) {
     Write-Host "[+] blackshard minifilter and protection service are running." -ForegroundColor Green
