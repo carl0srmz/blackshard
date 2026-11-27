@@ -33,6 +33,11 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\Setup-Lab.ps1 -WindowsIso D:\iso\Win10_22H2_English_x64.iso -Build
 ```
 
+To walk away instead (for example while the ISO is still downloading), run
+`.\Start-LabSetup.ps1 -WindowsIso <iso> -RestartAutomatically`. It waits for the download to finish,
+runs Setup-Lab, restarts if Hyper-V needed enabling (after a 5-minute warning; `shutdown /a`
+cancels it), and continues by itself when you sign back in.
+
 On the first run it enables Hyper-V and asks for a restart. After that, run the same command again.
 `-Build` runs `deploy.ps1` in the checkout that holds this `lab\` (Rust plus the VS 2022 C++ build
 tools), and its `dist\` goes into the VM. Without `-Build`, an existing `dist\` is used. To use another
@@ -94,6 +99,7 @@ unloaded). Then retake `base` and `ready`.
 | Script | Runs on | Purpose |
 |---|---|---|
 | `Setup-Lab.ps1` | host | everything, idempotent |
+| `Start-LabSetup.ps1` | host | waits for the ISO, runs Setup-Lab, resumes itself after the restart |
 | `Enable-HyperV.ps1` | host | Hyper-V feature |
 | `New-BlackshardLab.ps1` | host | switches, NAT, firewall, ACLs, VM, unattend |
 | `Set-LabNetwork.ps1` | host | `Isolated` / `Online` / `Off` (no argument shows the current mode) |

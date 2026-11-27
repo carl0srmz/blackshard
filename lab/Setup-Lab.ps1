@@ -55,7 +55,11 @@ if ($RepoPath) {
         }
         finally { Pop-Location }
     }
-    if (-not $DistPath) { $DistPath = Join-Path $RepoPath 'dist' }
+    $repoDist = Join-Path $RepoPath 'dist'
+    if (-not $DistPath) {
+        if (Test-Path -LiteralPath $repoDist) { $DistPath = $repoDist }
+        else { Write-Host "    No dist\ in $RepoPath yet: the VM is set up without blackshard. Add it later with Update-LabPayload.ps1." }
+    }
 }
 if ($DistPath -and -not (Test-Path -LiteralPath $DistPath)) {
     throw "$DistPath does not exist. Build first (-Build) or leave dist out and add it later with Update-LabPayload.ps1."
