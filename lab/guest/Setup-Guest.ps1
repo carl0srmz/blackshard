@@ -65,7 +65,10 @@ if (Test-Path -LiteralPath $dist) {
     & C:\blackshard-dist\enable-test-signing.ps1
 }
 else {
-    Write-Host '    No dist\ on the payload yet. Add it from the host with Update-LabPayload.ps1.'
+    # No local build: take the testing build from the release (the VM is online and sample-free now).
+    Step 'No dist\ on the payload: downloading the testing build, then test-signing'
+    try { & C:\lab\Get-BlackshardRelease.ps1 }
+    catch { Write-Host "    Download failed ($($_.Exception.Message)). Run C:\lab\Get-BlackshardRelease.ps1 later." -ForegroundColor Yellow }
 }
 
 @'
@@ -74,8 +77,8 @@ blackshard filming VM: next steps (full runbook: lab\README.md on the host)
 1. Optional: turn off Tamper Protection in Windows Security, then run as admin:
      C:\lab\Disable-Defender.ps1
 2. As admin:  cd C:\blackshard-dist; .\install.ps1 -AllowUnsigned   then restart.
-   (If C:\blackshard-dist is missing: on the host run Update-LabPayload.ps1, then copy dist\ from
-    the BSLAB drive to C:\blackshard-dist and run enable-test-signing.ps1 + restart first.)
+   (If C:\blackshard-dist is missing: run C:\lab\Get-BlackshardRelease.ps1 as admin and restart
+    first. It downloads the testing build and test-signs the driver.)
 3. Open blackshard, wait for green + definitions.
 4. Run C:\lab\Test-Isolation.ps1  -> expect: internet OK, host/LAN BLOCKED.
 5. Host: Checkpoint-VM -Name blackshard-film -SnapshotName base

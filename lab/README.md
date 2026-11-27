@@ -41,7 +41,9 @@ cancels it), and continues by itself when you sign back in.
 On the first run it enables Hyper-V and asks for a restart. After that, run the same command again.
 `-Build` runs `deploy.ps1` in the checkout that holds this `lab\` (Rust plus the VS 2022 C++ build
 tools), and its `dist\` goes into the VM. Without `-Build`, an existing `dist\` is used. To use another
-build, pass `-DistPath <dist>`, or add one later with `Update-LabPayload.ps1`.
+build, pass `-DistPath <dist>`, or add one later with `Update-LabPayload.ps1`. With no build at all,
+the VM downloads the testing build from the `veryveryunstable` release on first boot, checks its
+SHA256, and test-signs it (`guest\Get-BlackshardRelease.ps1`).
 
 Windows installs unattended, signs in automatically, configures itself (`C:\lab\setup.log`),
 test-signs the driver and restarts. The VM's local password is in `state\vm-credentials.txt`
@@ -108,6 +110,7 @@ unloaded). Then retake `base` and `ready`.
 | `LabCommon.psm1` | host | shared settings: VM size, subnet, names |
 | `guest\Setup-Guest.ps1` | VM | first-logon configuration |
 | `guest\Test-Isolation.ps1` | VM | reachability check |
+| `guest\Get-BlackshardRelease.ps1` | VM | download + verify + test-sign the testing build |
 | `guest\Disable-Defender.ps1` | VM | Defender off, no sample upload |
 
 ## Removing the lab
