@@ -625,6 +625,9 @@ fn run_ui() -> Result<(), Box<dyn Error>> {
             ),
         renderer: eframe::Renderer::Wgpu,
         wgpu_options,
+        // Windows otherwise cascades new windows from the top left, and on a small screen this
+        // one opened partly off its right edge.
+        centered: true,
         ..Default::default()
     };
 

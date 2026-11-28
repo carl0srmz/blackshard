@@ -849,6 +849,7 @@ impl BlackshardApp {
         let show_name = ui.available_width() >= 780.0;
         ui.horizontal_centered(|ui| {
             ui.spacing_mut().button_padding = egui::vec2(8.0, 4.0);
+            ui.spacing_mut().item_spacing.x = 14.0;
             shard_mark(ui, 22.0, TEXT);
             if show_name {
                 ui.add_space(2.0);
@@ -1195,22 +1196,28 @@ impl BlackshardApp {
                     ScanRequestKind::Turbo,
                 ),
             ];
-            egui::Grid::new("scan_choices")
-                .spacing(egui::vec2(18.0, 10.0))
-                .show(ui, |ui| {
-                    for (label, detail, kind) in choices {
-                        let color = if kind == ScanRequestKind::Turbo {
-                            ALARM
-                        } else {
-                            TEXT
-                        };
-                        if action_button(ui, label, color, !running).clicked() {
-                            requested = Some(kind);
-                        }
-                        ui.add(egui::Label::new(RichText::new(detail).color(MUTED)).wrap());
-                        ui.end_row();
-                    }
+            // The buttons share one fixed column so the descriptions line up, and each
+            // description wraps in what is left. (A grid sizes its columns from the previous
+            // frame, and wrapping text squeezed this one to a few letters.)
+            for (label, detail, kind) in choices {
+                let color = if kind == ScanRequestKind::Turbo {
+                    ALARM
+                } else {
+                    TEXT
+                };
+                ui.horizontal(|ui| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(170.0, 0.0),
+                        Layout::left_to_right(Align::Center),
+                        |ui| {
+                            if action_button(ui, label, color, !running).clicked() {
+                                requested = Some(kind);
+                            }
+                        },
+                    );
+                    ui.add(egui::Label::new(RichText::new(detail).color(MUTED)).wrap());
                 });
+            }
             ui.add_space(18.0);
             ui.label("or one file or folder");
             ui.horizontal(|ui| {
@@ -1891,6 +1898,9 @@ impl eframe::App for BlackshardApp {
             .frame(egui::Frame::NONE.fill(BG))
             .show(ui, |ui| {
                 egui::ScrollArea::vertical()
+                    // Each page keeps its own scroll position, so a page opens at its top rather
+                    // than wherever the previous one was scrolled to.
+                    .id_salt(self.page.title())
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         // One left-aligned column centred in the window, with the same margin on
@@ -2184,7 +2194,8 @@ fn fact(ui: &mut egui::Ui, value: u64, words: &str, color: Color32) {
         9.0,
         egui::TextFormat::simple(FontId::new(14.0, FontFamily::Proportional), MUTED),
     );
-    ui.label(job);
+    // Never broken inside: a count that does not fit moves to the next line whole.
+    ui.add(egui::Label::new(job).extend());
 }
 
 fn metric(ui: &mut egui::Ui, label: &str, value: u64, color: Color32) {

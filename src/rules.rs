@@ -43,7 +43,11 @@ rule blackshard_powershell_amsi_bypass_sequence {
         $tamper2 = "GetProcAddress" ascii wide nocase
         $reflect = "GetField" ascii wide nocase
     condition:
-        2 of ($amsi*) and 1 of ($tamper*) and $reflect
+        // A script's words too. PowerShell's own engine (System.Management.Automation.dll)
+        // holds the AMSI code these name, so as an executable it always matched; scripts that
+        // tamper with AMSI are still seen as text, through AMSI itself.
+        not (uint16(0) == 0x5A4D)
+            and 2 of ($amsi*) and 1 of ($tamper*) and $reflect
 }
 
 rule blackshard_lolbin_remote_execution_command {
@@ -458,7 +462,8 @@ mod tests {
         let mut program = b"MZ".to_vec();
         program.extend_from_slice(
             b"\0powershell\0-encodedcommand\0frombase64string(\0downloadstring(\0\
-              invoke-expression\0iex(\0",
+              invoke-expression\0iex(\0AmsiScanBuffer\0amsiInitFailed\0\
+              System.Management.Automation.AmsiUtils\0GetProcAddress\0GetField\0",
         );
         assert!(engine.scan(&program).unwrap().is_empty());
     }

@@ -20,6 +20,8 @@ $sources = @(
     @{ Path = "$env:windir\System32\drivers"; Count = 200 },
     @{ Path = "${env:ProgramFiles}\Git"; Count = 300; Recurse = $true },
     @{ Path = "${env:ProgramFiles}\PowerShell"; Count = 100; Recurse = $true },
+    # Windows PowerShell's engine, which carries the AMSI code that script rules look for.
+    @{ Path = "$env:windir\Microsoft.NET\assembly\GAC_MSIL\System.Management.Automation"; Count = 5; Recurse = $true },
     @{ Path = "${env:ProgramFiles(x86)}\Microsoft Visual Studio"; Count = 400; Recurse = $true }
 )
 $extensions = '.exe', '.dll', '.sys', '.ps1', '.psm1', '.vbs', '.js', '.bat', '.cmd'

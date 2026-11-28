@@ -145,6 +145,9 @@ changes are listed here, newest first.
   The rules are now stored encoded, the PowerShell download-and-run rule judges scripts only (a
   program that runs one is judged by its command line), and CI scans blackshard's own files for
   false positives too.
+- Windows PowerShell's own engine, `System.Management.Automation.dll`, was flagged as
+  `Suspicious.PowerShell.AMSIBypass`: it holds the AMSI code the rule names. The rule now judges
+  scripts only, which AMSI still hands it, and CI's clean files include that DLL.
 - A suspicious file that was only observed, not blocked, was recorded as blocked, so it raised a
   "threat blocked" notification and counted as a blocked threat.
 - The UI fits a 1024 by 768 screen, keeps equal margins at every width instead of touching the
