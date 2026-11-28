@@ -1205,17 +1205,23 @@ impl BlackshardApp {
                 } else {
                     TEXT
                 };
-                ui.horizontal(|ui| {
+                ui.horizontal_top(|ui| {
                     ui.allocate_ui_with_layout(
                         egui::vec2(170.0, 0.0),
-                        Layout::left_to_right(Align::Center),
+                        Layout::left_to_right(Align::Min),
                         |ui| {
+                            // The column is as wide as the widest button, whatever this one is.
+                            ui.set_min_width(170.0);
                             if action_button(ui, label, color, !running).clicked() {
                                 requested = Some(kind);
                             }
                         },
                     );
-                    ui.add(egui::Label::new(RichText::new(detail).color(MUTED)).wrap());
+                    // Down to the button's text line, then wrapped in whatever width is left.
+                    ui.vertical(|ui| {
+                        ui.add_space(6.0);
+                        ui.add(egui::Label::new(RichText::new(detail).color(MUTED)).wrap());
+                    });
                 });
             }
             ui.add_space(18.0);
