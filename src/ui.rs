@@ -3,7 +3,7 @@ use crate::elevation::{self, QuarantineAdminAction};
 use crate::history::{EventKind, SecurityEvent};
 use crate::ipc::{
     DetectionVerdictView, IpcClient, QuarantineRecordView, RpcErrorCode, ScanFindingView,
-    ScanPhaseView, ScanRequestKind, ServiceScanJob,
+    ScanPhaseView, ScanRequestKind, ServiceScanJob, BLOCK_ACCEPTED_TOKEN,
 };
 use crate::quarantine::IsolationState;
 use chrono::{DateTime, Local, Utc};
@@ -20,6 +20,8 @@ const BG: Color32 = Color32::BLACK;
 /// The site's nav bar, one step up from black; also input wells and hover.
 const BAR: Color32 = Color32::from_rgb(17, 17, 17);
 const RULE: Color32 = Color32::from_rgb(46, 46, 46);
+/// A button's outline at rest: visible against black, quieter than any text.
+const QUIET_OUTLINE: Color32 = Color32::from_rgb(78, 78, 78);
 const TEXT: Color32 = Color32::WHITE;
 const MUTED: Color32 = Color32::from_rgb(140, 140, 140);
 /// The site's yellow: where to look and what to press.
@@ -35,6 +37,11 @@ const REGULAR_FONT: &str = "jetbrains-mono";
 const BOLD_FONT: &str = "jetbrains-mono-bold";
 /// The site tracks its type in by 0.089em; slightly less keeps small sizes legible on screen.
 const TRACKING: f32 = -0.06;
+
+/// The widest the page column gets, about 100 characters of body text.
+const MEASURE: f32 = 860.0;
+/// Room for "00:00:00" at the activity list's time size, plus a gap.
+const TIME_COLUMN: f32 = 72.0;
 
 const ACTIVITY_LIMIT: usize = 500;
 const REFRESH_INTERVAL: Duration = Duration::from_secs(15);
@@ -810,13 +817,15 @@ impl BlackshardApp {
         ctx.all_styles_mut(|style| {
             use egui::TextStyle;
             style.visuals = visuals.clone();
-            style.spacing.item_spacing = egui::vec2(10.0, 8.0);
-            style.spacing.button_padding = egui::vec2(14.0, 7.0);
-            style.spacing.interact_size.y = 32.0;
+            style.visuals.indent_has_left_vline = false;
+            style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+            style.spacing.button_padding = egui::vec2(12.0, 6.0);
+            style.spacing.interact_size.y = 30.0;
+            style.spacing.indent = 26.0;
             style.text_styles = [
                 (
                     TextStyle::Small,
-                    FontId::new(11.5, FontFamily::Proportional),
+                    FontId::new(12.0, FontFamily::Proportional),
                 ),
                 (TextStyle::Body, FontId::new(14.0, FontFamily::Proportional)),
                 (
@@ -827,7 +836,7 @@ impl BlackshardApp {
                     TextStyle::Monospace,
                     FontId::new(13.0, FontFamily::Monospace),
                 ),
-                (TextStyle::Heading, FontId::new(30.0, bold_family())),
+                (TextStyle::Heading, FontId::new(28.0, bold_family())),
             ]
             .into();
         });
@@ -836,11 +845,16 @@ impl BlackshardApp {
     /// The site's nav bar: the mark and name, then each page as a plain lowercase word, the
     /// current one in yellow.
     fn render_top_bar(&mut self, ui: &mut egui::Ui, runtime: &UiRuntimeState) {
+        // The name goes first when the window is narrow, so the pages and the status always fit.
+        let show_name = ui.available_width() >= 780.0;
         ui.horizontal_centered(|ui| {
-            shard_mark(ui, 26.0, TEXT);
-            ui.add_space(2.0);
-            ui.label(display("blackshard", 20.0));
-            ui.add_space(30.0);
+            ui.spacing_mut().button_padding = egui::vec2(8.0, 4.0);
+            shard_mark(ui, 22.0, TEXT);
+            if show_name {
+                ui.add_space(2.0);
+                ui.label(display("blackshard", 17.0));
+            }
+            ui.add_space(20.0);
             for page in [
                 Page::Dashboard,
                 Page::Scan,
@@ -853,8 +867,8 @@ impl BlackshardApp {
                     .add(
                         egui::Button::new(
                             RichText::new(page.title())
-                                .size(17.0)
-                                .extra_letter_spacing(17.0 * TRACKING)
+                                .size(15.0)
+                                .extra_letter_spacing(15.0 * TRACKING)
                                 .color(if selected { SIGNAL } else { TEXT }),
                         )
                         .frame(false),
@@ -870,7 +884,6 @@ impl BlackshardApp {
                 if response.clicked() {
                     self.page = page;
                 }
-                ui.add_space(8.0);
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let (label, color) = compact_health(runtime);
@@ -928,274 +941,236 @@ impl BlackshardApp {
             ProtectionTestStatus::Requested | ProtectionTestStatus::Running
         );
 
-        // blackshard.dev's opening spread: a statement on the left, the shard on the right, one
-        // white hairline between them. The shard takes the colour of the machine's state, so the
-        // answer to "am I protected?" is visible from across the room.
-        let (spread, _) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), 340.0),
-            egui::Sense::hover(),
-        );
-        let middle = spread.center().x.round() + 0.5;
-        ui.painter()
-            .vline(middle, spread.y_range(), Stroke::new(1.0_f32, TEXT));
-        let gutter = 36.0;
-        let mut left = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(egui::Rect::from_min_max(
-                    spread.min,
-                    egui::pos2(middle - gutter, spread.max.y),
-                ))
-                .layout(Layout::top_down(Align::Center)),
-        );
-        let mut right = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(egui::Rect::from_min_max(
-                    egui::pos2(middle + gutter, spread.min.y),
-                    spread.max,
-                ))
-                .layout(Layout::top_down(Align::Center)),
-        );
-
-        left.add_space(56.0);
-        left.label(display(&health, 34.0).color(color));
-        left.add_space(12.0);
-        left.add(
-            egui::Label::new(RichText::new(&detail).size(15.0).color(TEXT)).halign(Align::Center),
-        );
-        // The attention line often repeats the reason already in the detail.
-        if let Some(attention) = runtime
-            .attention
-            .as_ref()
-            .filter(|attention| !detail.contains(attention.as_str()))
-        {
-            left.add_space(6.0);
-            left.add(
-                egui::Label::new(RichText::new(attention).size(13.0).color(ATTENTION))
-                    .halign(Align::Center),
-            );
-        }
-        left.add_space(28.0);
-        // The site's yellow italic line, here the one thing worth doing from this page.
-        let test = left
-            .add_enabled(
-                test_available && !test_busy,
-                egui::Button::new(
-                    RichText::new("run the harmless protection test")
-                        .italics()
-                        .size(17.0)
-                        .color(SIGNAL),
-                )
-                .frame(false),
-            )
-            .on_hover_text("Checks detection and blocking end to end with a harmless file")
-            .on_hover_cursor(egui::CursorIcon::PointingHand);
-        if test.has_focus() {
-            left.painter().hline(
-                test.rect.x_range(),
-                test.rect.bottom(),
-                Stroke::new(1.0_f32, SIGNAL),
-            );
-        }
-        let (test_status, test_color) = match &runtime.protection_test {
-            ProtectionTestStatus::Idle if !test_available => {
-                ("available once protection is active".to_owned(), MUTED)
+        // The one loud thing on the page: the shard, in the colour of the machine's state, beside
+        // the answer to "am I protected?".
+        let mut turbo_requested = false;
+        ui.horizontal_top(|ui| {
+            // The secret turbo trigger: no cursor change, no tooltip.
+            if shard_mark(ui, 64.0, color).triple_clicked() {
+                turbo_requested = true;
             }
-            ProtectionTestStatus::Idle => ("not run yet".to_owned(), MUTED),
-            ProtectionTestStatus::Requested => ("queued".to_owned(), MUTED),
-            ProtectionTestStatus::Running => ("testing the protection path".to_owned(), MUTED),
-            ProtectionTestStatus::Passed(detail) => (format!("passed. {detail}"), OK),
-            ProtectionTestStatus::Failed(error) => (format!("failed. {error}"), ALARM),
-        };
-        left.horizontal(|ui| {
-            if test_busy {
-                ui.spinner();
-            }
-        });
-        left.add(
-            egui::Label::new(RichText::new(test_status).size(13.0).color(test_color))
-                .halign(Align::Center),
-        );
-        if test.clicked() {
-            if let Ok(mut state) = self.runtime.lock() {
-                state.protection_test = ProtectionTestStatus::Requested;
-            }
-        }
-
-        left.add_space(22.0);
-        let mut pause_minutes = None;
-        if let Some(until) = self
-            .settings
-            .paused_until
-            .filter(|_| self.settings.is_paused())
-        {
-            let seconds = (until - Utc::now()).num_seconds().max(0);
-            left.label(
-                RichText::new(format!(
-                    "paused. back on by itself in {}:{:02}",
-                    seconds / 60,
-                    seconds % 60
-                ))
-                .size(15.0)
-                .color(ATTENTION),
-            );
-            left.add_space(6.0);
-            if bracket_button(&mut left, "resume and hunt now", ALARM, hunt.is_none()).clicked() {
-                self.turbo();
-            }
-        } else if self.settings.real_time_protection && self.settings_loaded {
-            left.horizontal(|ui| {
-                ui.label(RichText::new("pause protection for").color(MUTED));
-                for minutes in [1, 5, 15] {
-                    if bracket_button(ui, &format!("{minutes} min"), TEXT, hunt.is_none()).clicked()
-                    {
-                        pause_minutes = Some(minutes);
-                    }
+            ui.add_space(18.0);
+            ui.vertical(|ui| {
+                ui.label(display(&health, 30.0).color(color));
+                ui.add_space(2.0);
+                ui.add(egui::Label::new(RichText::new(&detail).color(MUTED)).wrap());
+                // The attention line often repeats the reason already in the detail.
+                if let Some(attention) = runtime
+                    .attention
+                    .as_ref()
+                    .filter(|attention| !detail.contains(attention.as_str()))
+                {
+                    ui.add(egui::Label::new(RichText::new(attention).color(ATTENTION)).wrap());
                 }
             });
-        }
-        if let Some(minutes) = pause_minutes {
-            self.pause_protection(minutes);
-        }
-
-        right.add_space(40.0);
-        // The secret turbo trigger: no cursor change, no tooltip.
-        if shard_mark(&mut right, 150.0, color).triple_clicked() {
+        });
+        if turbo_requested {
             self.turbo();
         }
-        right.add_space(26.0);
-        fact(
-            &mut right,
-            runtime.realtime_scanned_files,
-            "files checked as they opened",
-            TEXT,
-        );
-        fact(
-            &mut right,
-            runtime.realtime_blocked_files,
-            "threats blocked",
-            if runtime.realtime_blocked_files > 0 {
-                ALARM
-            } else {
-                TEXT
-            },
-        );
-        fact(
-            &mut right,
-            self.quarantine_records.len() as u64,
-            "files in quarantine",
-            TEXT,
-        );
-        if runtime.realtime_bypassed_requests > 0 {
+
+        ui.add_space(22.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 30.0;
             fact(
-                &mut right,
-                runtime.realtime_bypassed_requests,
-                "checks skipped under load",
-                ATTENTION,
+                ui,
+                runtime.realtime_scanned_files,
+                "files checked as they opened",
+                TEXT,
             );
-        }
+            let blocked = runtime.realtime_blocked_files;
+            fact(
+                ui,
+                blocked,
+                if blocked == 1 {
+                    "threat blocked"
+                } else {
+                    "threats blocked"
+                },
+                if blocked > 0 { ALARM } else { TEXT },
+            );
+            fact(
+                ui,
+                self.quarantine_records.len() as u64,
+                "in quarantine",
+                TEXT,
+            );
+            if runtime.realtime_bypassed_requests > 0 {
+                fact(
+                    ui,
+                    runtime.realtime_bypassed_requests,
+                    "checks skipped under load",
+                    ATTENTION,
+                );
+            }
+        });
 
         let mut scan_request = None;
+        let mut open_scan_page = false;
         section(ui, |ui| {
-            section_title(
-                ui,
-                "scan now",
-                "scans run at low priority, so you can keep working.",
+            section_title(ui, "scan", "");
+            ui.horizontal_wrapped(|ui| {
+                if action_button(ui, "quick scan", TEXT, true).clicked() {
+                    scan_request = Some(ScanRequestKind::Quick);
+                }
+                if action_button(ui, "full scan", TEXT, true).clicked() {
+                    scan_request = Some(ScanRequestKind::Full);
+                }
+                if action_button(ui, "a file or folder", TEXT, true).clicked() {
+                    open_scan_page = true;
+                }
+            });
+            ui.add(
+                egui::Label::new(
+                    RichText::new(
+                        "quick checks where malware lands and every running program. full checks \
+                         every local drive. both run at low priority.",
+                    )
+                    .size(12.0)
+                    .color(MUTED),
+                )
+                .wrap(),
             );
-            let choices = [
-                (
-                    "quick scan",
-                    "where malware lands, and every program that is running",
-                    Some(ScanRequestKind::Quick),
-                ),
-                (
-                    "full scan",
-                    "every local drive. this one takes a while",
-                    Some(ScanRequestKind::Full),
-                ),
-                ("choose what to scan", "one file or folder", None),
-            ];
-            egui::Grid::new("dashboard_scans")
-                .spacing(egui::vec2(18.0, 8.0))
-                .show(ui, |ui| {
-                    for (label, detail, kind) in choices {
-                        if bracket_button(ui, label, TEXT, true).clicked() {
-                            match kind {
-                                Some(kind) => scan_request = Some(kind),
-                                None => self.page = Page::Scan,
-                            }
-                        }
-                        ui.label(RichText::new(detail).color(MUTED));
-                        ui.end_row();
-                    }
-                });
         });
         if let Some(kind) = scan_request {
             self.start_scan(kind);
         }
+        if open_scan_page {
+            self.page = Page::Scan;
+        }
 
-        ui.columns(2, |columns| {
-            section(&mut columns[0], |ui| {
-                section_title(ui, "protection", "what is actually running right now");
+        let mut pause_minutes = None;
+        let mut resume_requested = false;
+        section(ui, |ui| {
+            section_title(ui, "protection", "");
+            health_row(
+                ui,
+                "real-time engine",
+                protection_label(&runtime.protection),
+            );
+            health_row(ui, "kernel filter", driver_label(&runtime.driver));
+            if let (Some(version), Some(age)) =
+                (&runtime.freshclam_version, runtime.freshclam_age_hours)
+            {
                 health_row(
                     ui,
-                    "real-time engine",
-                    protection_label(&runtime.protection),
+                    "clamav signatures",
+                    (format!("version {version}, {age}h old"), OK),
                 );
-                health_row(ui, "kernel filter", driver_label(&runtime.driver));
-                if let (Some(version), Some(age)) =
-                    (&runtime.freshclam_version, runtime.freshclam_age_hours)
-                {
-                    health_row(
-                        ui,
-                        "clamav signatures",
-                        (format!("version {version}, {age}h old"), OK),
+            } else {
+                health_row(ui, "definitions", definition_label(&runtime.definitions));
+            }
+            ui.add_space(10.0);
+
+            if let Some(until) = self
+                .settings
+                .paused_until
+                .filter(|_| self.settings.is_paused())
+            {
+                let seconds = (until - Utc::now()).num_seconds().max(0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(format!(
+                            "paused. back on by itself in {}:{:02}",
+                            seconds / 60,
+                            seconds % 60
+                        ))
+                        .color(ATTENTION),
                     );
-                } else {
-                    health_row(ui, "definitions", definition_label(&runtime.definitions));
-                }
-            });
-            section(&mut columns[1], |ui| {
-                section_title(ui, "this build", "who made it, and who has checked it");
-                health_row(ui, "package", trust_label(&runtime.build_trust));
-                health_row(
-                    ui,
-                    "independent testing",
-                    certification_label(&runtime.certification),
-                );
-                ui.label(
-                    RichText::new(
-                        "a signature proves who built this copy. it says nothing about how well \
-                         it detects malware.",
+                    if action_button(ui, "resume and hunt now", ALARM, hunt.is_none()).clicked() {
+                        resume_requested = true;
+                    }
+                });
+            } else if self.settings.real_time_protection && self.settings_loaded {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("pause for").color(MUTED));
+                    for minutes in [1, 5, 15] {
+                        if action_button(ui, &format!("{minutes} min"), TEXT, hunt.is_none())
+                            .clicked()
+                        {
+                            pause_minutes = Some(minutes);
+                        }
+                    }
+                });
+            }
+
+            // The site's yellow italic line, here the one thing worth doing from this page.
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                let test = ui
+                    .add_enabled(
+                        test_available && !test_busy,
+                        egui::Button::new(
+                            RichText::new("run the harmless protection test")
+                                .italics()
+                                .color(SIGNAL),
+                        )
+                        .frame(false),
                     )
-                    .size(12.0)
-                    .color(MUTED),
+                    .on_hover_text("Checks detection and blocking end to end with a harmless file")
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                if test.has_focus() {
+                    ui.painter().hline(
+                        test.rect.x_range(),
+                        test.rect.bottom(),
+                        Stroke::new(1.0_f32, SIGNAL),
+                    );
+                }
+                if test.clicked() {
+                    if let Ok(mut state) = self.runtime.lock() {
+                        state.protection_test = ProtectionTestStatus::Requested;
+                    }
+                }
+                if test_busy {
+                    ui.spinner();
+                }
+                let (test_status, test_color) = match &runtime.protection_test {
+                    ProtectionTestStatus::Idle if !test_available => {
+                        ("available once protection is active".to_owned(), MUTED)
+                    }
+                    ProtectionTestStatus::Idle => ("not run yet".to_owned(), MUTED),
+                    ProtectionTestStatus::Requested => ("queued".to_owned(), MUTED),
+                    ProtectionTestStatus::Running => {
+                        ("testing the protection path".to_owned(), MUTED)
+                    }
+                    ProtectionTestStatus::Passed(detail) => (format!("passed. {detail}"), OK),
+                    ProtectionTestStatus::Failed(error) => (format!("failed. {error}"), ALARM),
+                };
+                ui.add(
+                    egui::Label::new(RichText::new(test_status).size(12.0).color(test_color))
+                        .wrap(),
                 );
             });
         });
+        if let Some(minutes) = pause_minutes {
+            self.pause_protection(minutes);
+        }
+        if resume_requested {
+            self.turbo();
+        }
 
+        let mut show_all_activity = false;
         section(ui, |ui| {
-            section_title(ui, "recent activity", "newest first");
+            section_title(ui, "recent activity", "");
             if self.activity.is_empty() {
-                empty_state(ui, "nothing has happened yet. blackshard writes every detection, scan and change here.");
+                empty_state(
+                    ui,
+                    "nothing has happened yet. detections, scans and changes appear here.",
+                );
             } else {
-                for event in self.activity.iter().take(5) {
-                    activity_row(ui, event);
-                }
-                if self.activity.len() > 5
-                    && bracket_button(ui, "all activity", TEXT, true).clicked()
-                {
-                    self.page = Page::Activity;
+                activity_list(ui, self.activity.iter().take(5));
+                if self.activity.len() > 5 {
+                    ui.add_space(4.0);
+                    show_all_activity = action_button(ui, "all activity", TEXT, true).clicked();
                 }
             }
         });
+        if show_all_activity {
+            self.page = Page::Activity;
+        }
     }
 
     fn render_scan(&mut self, ui: &mut egui::Ui) {
-        page_heading(
-            ui,
-            "scan",
-            "check where malware usually lands, every drive, or one exact file.",
-        );
+        page_heading(ui, "scan", "");
 
         let running = self
             .scan_job
@@ -1221,7 +1196,7 @@ impl BlackshardApp {
                 ),
             ];
             egui::Grid::new("scan_choices")
-                .spacing(egui::vec2(18.0, 8.0))
+                .spacing(egui::vec2(18.0, 10.0))
                 .show(ui, |ui| {
                     for (label, detail, kind) in choices {
                         let color = if kind == ScanRequestKind::Turbo {
@@ -1229,22 +1204,24 @@ impl BlackshardApp {
                         } else {
                             TEXT
                         };
-                        if bracket_button(ui, label, color, !running).clicked() {
+                        if action_button(ui, label, color, !running).clicked() {
                             requested = Some(kind);
                         }
-                        ui.label(RichText::new(detail).color(MUTED));
+                        ui.add(egui::Label::new(RichText::new(detail).color(MUTED)).wrap());
                         ui.end_row();
                     }
                 });
-            ui.add_space(14.0);
-            ui.label(RichText::new("or one file or folder").color(TEXT));
+            ui.add_space(18.0);
+            ui.label("or one file or folder");
             ui.horizontal(|ui| {
+                // Leaves room for the button however narrow the window gets.
                 ui.add_sized(
-                    [ui.available_width() - 120.0, 34.0],
+                    [(ui.available_width() - 100.0).max(160.0), 30.0],
                     egui::TextEdit::singleline(&mut self.custom_scan_path)
-                        .hint_text(r"C:\Users\you\Downloads\sample.exe"),
+                        .hint_text(r"C:\Users\you\Downloads\sample.exe")
+                        .vertical_align(Align::Center),
                 );
-                if bracket_button(ui, "scan it", TEXT, !running).clicked() {
+                if action_button(ui, "scan it", TEXT, !running).clicked() {
                     requested = Some(ScanRequestKind::Custom { roots: Vec::new() });
                 }
             });
@@ -1319,7 +1296,7 @@ impl BlackshardApp {
                 metric(ui, "unreadable", progress.errors, MUTED);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if !progress.is_finished()
-                        && bracket_button(ui, "stop scan", ALARM, true).clicked()
+                        && action_button(ui, "stop scan", ALARM, true).clicked()
                     {
                         cancel_requested = true;
                     }
@@ -1355,7 +1332,7 @@ impl BlackshardApp {
             "isolated files are encrypted here and cannot run. restore only what you trust.",
         );
         ui.horizontal(|ui| {
-            if bracket_button(ui, "refresh", TEXT, true).clicked() {
+            if action_button(ui, "refresh", TEXT, true).clicked() {
                 self.refresh_persistent_views();
             }
             ui.label(
@@ -1386,37 +1363,48 @@ impl BlackshardApp {
         for record in &self.quarantine_records {
             let busy = self.busy_quarantine.contains(&record.id);
             section(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
-                        ui.label(bold(&record.threat_name).size(16.0).color(ALARM));
-                        ui.label(RichText::new(&record.original_path).color(TEXT));
-                        ui.label(
-                            RichText::new(format!(
-                                "isolated {}, {}, risk {}",
-                                record
-                                    .quarantined_at
-                                    .with_timezone(&Local)
-                                    .format("%Y-%m-%d %H:%M"),
-                                format_bytes(record.size),
-                                record.risk_score
-                            ))
-                            .size(12.0)
-                            .color(MUTED),
-                        );
-                        if record.state == IsolationState::SourceStillPresent {
-                            status_mark(ui, "the original file is still on disk", ALARM);
-                        }
-                        ui.label(
-                            RichText::new(format!("sha-256 {}", record.sha256))
-                                .size(11.0)
+                ui.horizontal_top(|ui| {
+                    // The text gets a fixed share of the row, so a long path is cut short with
+                    // the whole of it on hover, and never runs under the buttons.
+                    let text_width = (ui.available_width() - 200.0).max(160.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(text_width, 0.0),
+                        Layout::top_down(Align::Min),
+                        |ui| {
+                            ui.label(bold(&record.threat_name).color(ALARM));
+                            ui.add(egui::Label::new(&record.original_path).truncate())
+                                .on_hover_text(&record.original_path);
+                            ui.label(
+                                RichText::new(format!(
+                                    "isolated {}, {}, risk {}",
+                                    record
+                                        .quarantined_at
+                                        .with_timezone(&Local)
+                                        .format("%Y-%m-%d %H:%M"),
+                                    format_bytes(record.size),
+                                    record.risk_score
+                                ))
+                                .size(12.0)
                                 .color(MUTED),
-                        );
-                    });
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if bracket_button(ui, "delete", ALARM, !busy).clicked() {
+                            );
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(format!("sha-256 {}", record.sha256))
+                                        .size(12.0)
+                                        .color(MUTED),
+                                )
+                                .truncate(),
+                            );
+                            if record.state == IsolationState::SourceStillPresent {
+                                status_mark(ui, "the original file is still on disk", ALARM);
+                            }
+                        },
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                        if action_button(ui, "delete", ALARM, !busy).clicked() {
                             confirmation = Some(Confirmation::Delete(record.clone()));
                         }
-                        if bracket_button(ui, "restore", TEXT, !busy).clicked() {
+                        if action_button(ui, "restore", TEXT, !busy).clicked() {
                             confirmation = Some(Confirmation::Restore(record.clone()));
                         }
                         if busy {
@@ -1438,14 +1426,22 @@ impl BlackshardApp {
             "everything blackshard did on this machine, newest first.",
         );
         ui.horizontal(|ui| {
-            if bracket_button(ui, "refresh", TEXT, true).clicked() {
+            if action_button(ui, "refresh", TEXT, true).clicked() {
                 self.refresh_persistent_views();
             }
-            if bracket_button(ui, "clear history", ALARM, !self.activity.is_empty()).clicked() {
+            if action_button(ui, "clear history", ALARM, !self.activity.is_empty()).clicked() {
                 self.confirmation = Some(Confirmation::ClearActivity);
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(RichText::new(format!("{} events", self.activity.len())).color(MUTED));
+                let count = self.activity.len();
+                ui.label(
+                    RichText::new(format!(
+                        "{} {}",
+                        group_digits(count as u64),
+                        if count == 1 { "event" } else { "events" }
+                    ))
+                    .color(MUTED),
+                );
             });
         });
         section(ui, |ui| {
@@ -1455,28 +1451,18 @@ impl BlackshardApp {
                     "nothing has happened yet. detections, scans and changes appear here.",
                 );
             } else {
-                for event in &self.activity {
-                    activity_row(ui, event);
-                }
+                activity_list(ui, &self.activity);
             }
         });
     }
 
     fn render_settings(&mut self, ui: &mut egui::Ui, runtime: &UiRuntimeState) {
-        page_heading(
-            ui,
-            "settings",
-            "how blackshard watches, responds and updates.",
-        );
+        page_heading(ui, "settings", "");
         let mut changed = false;
         let mut update_requested = false;
 
         section(ui, |ui| {
-            section_title(
-                ui,
-                "protection",
-                "what you choose here; the top bar shows what is running",
-            );
+            section_title(ui, "protection", "");
             changed |= ui
                 .checkbox(
                     &mut self.settings.real_time_protection,
@@ -1502,17 +1488,13 @@ impl BlackshardApp {
                 )
                 .changed();
             ui.add_enabled_ui(self.settings.ransomware_protection, |ui| {
-                ui.horizontal(|ui| {
-                    ui.add_space(24.0);
+                ui.indent("ransomware_options", |ui| {
                     changed |= ui
                         .checkbox(
                             &mut self.settings.ransomware_block_mode,
                             "stop them, and quarantine unsigned ones (needs the kernel filter)",
                         )
                         .changed();
-                });
-                ui.horizontal(|ui| {
-                    ui.add_space(24.0);
                     changed |= ui
                         .checkbox(
                             &mut self.settings.rollback_documents,
@@ -1542,7 +1524,7 @@ impl BlackshardApp {
         });
 
         section(ui, |ui| {
-            section_title(ui, "performance", "keep scans out of your way");
+            section_title(ui, "performance", "");
             changed |= ui
                 .checkbox(
                     &mut self.settings.low_resource_mode,
@@ -1586,7 +1568,7 @@ impl BlackshardApp {
                             .suffix(" hours"),
                     )
                     .changed();
-                if bracket_button(ui, "check now", TEXT, true).clicked() {
+                if action_button(ui, "check now", TEXT, true).clicked() {
                     update_requested = true;
                 }
             });
@@ -1614,11 +1596,12 @@ impl BlackshardApp {
             }
             ui.horizontal(|ui| {
                 ui.add_sized(
-                    [ui.available_width() - 90.0, 34.0],
+                    [(ui.available_width() - 80.0).max(160.0), 30.0],
                     egui::TextEdit::singleline(&mut self.exclusion_input)
-                        .hint_text(r"C:\trusted\path"),
+                        .hint_text(r"C:\trusted\path")
+                        .vertical_align(Align::Center),
                 );
-                if bracket_button(ui, "add", TEXT, true).clicked() {
+                if action_button(ui, "add", TEXT, true).clicked() {
                     let value = self.exclusion_input.trim().trim_matches('"');
                     if !value.is_empty() {
                         self.settings.add_exclusion(PathBuf::from(value));
@@ -1630,11 +1613,17 @@ impl BlackshardApp {
             let mut remove_index = None;
             for (index, exclusion) in self.settings.exclusions.iter().enumerate() {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new(exclusion.display().to_string()).size(13.0));
+                    // The button is laid out first, from the right, so a long path is cut
+                    // short instead of pushing it off the page.
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if bracket_button(ui, "remove", ALARM, true).clicked() {
+                        if action_button(ui, "remove", ALARM, true).clicked() {
                             remove_index = Some(index);
                         }
+                        let path = exclusion.display().to_string();
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            ui.add(egui::Label::new(&path).truncate())
+                                .on_hover_text(&path);
+                        });
                     });
                 });
             }
@@ -1660,12 +1649,6 @@ impl BlackshardApp {
                 )
                 .size(12.0)
                 .color(MUTED),
-            );
-            ui.add_space(6.0);
-            ui.label(
-                RichText::new("phase 1: the windows client. free, forever.")
-                    .italics()
-                    .color(SIGNAL),
             );
         });
 
@@ -1745,10 +1728,10 @@ impl BlackshardApp {
                 ui.label(message);
                 ui.add_space(18.0);
                 ui.horizontal(|ui| {
-                    if bracket_button(ui, confirm_label, confirm_color, true).clicked() {
+                    if action_button(ui, confirm_label, confirm_color, true).clicked() {
                         accepted = true;
                     }
-                    if bracket_button(ui, "cancel", TEXT, true).clicked()
+                    if action_button(ui, "cancel", TEXT, true).clicked()
                         || ui.input(|input| input.key_pressed(egui::Key::Escape))
                     {
                         cancelled = true;
@@ -1896,7 +1879,7 @@ impl eframe::App for BlackshardApp {
         }
 
         egui::Panel::top("blackshard_top")
-            .exact_size(64.0)
+            .exact_size(56.0)
             .frame(
                 egui::Frame::NONE
                     .fill(BAR)
@@ -1910,15 +1893,17 @@ impl eframe::App for BlackshardApp {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        // A centred measure, as the site's columns are; wide windows gain margin
-                        // rather than line length.
-                        let width = ui.available_width().min(980.0);
-                        let margin = ((ui.available_width() - width) / 2.0).max(0.0);
+                        // One left-aligned column centred in the window, with the same margin on
+                        // both sides at every width; wide windows gain margin, not line length.
+                        let available = ui.available_width();
+                        let gutter = if available < 760.0 { 20.0 } else { 32.0 };
+                        let width = (available - 2.0 * gutter).clamp(0.0, MEASURE);
+                        let margin = ((available - width) / 2.0).max(0.0);
                         ui.horizontal(|ui| {
                             ui.add_space(margin);
                             ui.vertical(|ui| {
-                                ui.set_width(width - 48.0);
-                                ui.add_space(24.0);
+                                ui.set_width(width);
+                                ui.add_space(28.0);
                                 self.render_notice(ui);
                                 // With the service down every read fails the same way, and the
                                 // status page already says so in plain words.
@@ -2059,9 +2044,9 @@ fn shard_mark(ui: &mut egui::Ui, height: f32, color: Color32) -> egui::Response 
     response
 }
 
-/// Text between two solid bars, after the roadmap boxes on blackshard.dev. Hover and keyboard
-/// focus fill it with the nav bar's grey; focus also underlines it in yellow.
-fn bracket_button(ui: &mut egui::Ui, label: &str, color: Color32, enabled: bool) -> egui::Response {
+/// A button drawn as a hairline box around its label. The box is quiet until hovered, when it
+/// takes the label's colour; keyboard focus turns it yellow, the colour of "you are here".
+fn action_button(ui: &mut egui::Ui, label: &str, color: Color32, enabled: bool) -> egui::Response {
     let text_color = if enabled { color } else { MUTED };
     let galley = egui::WidgetText::from(RichText::new(label).size(14.0).color(text_color))
         .into_galley(
@@ -2070,7 +2055,7 @@ fn bracket_button(ui: &mut egui::Ui, label: &str, color: Color32, enabled: bool)
             f32::INFINITY,
             egui::TextStyle::Button,
         );
-    let padding = egui::vec2(16.0, 7.0);
+    let padding = egui::vec2(12.0, 6.0);
     let (rect, response) = ui.allocate_exact_size(
         galley.size() + 2.0 * padding,
         if enabled {
@@ -2082,15 +2067,25 @@ fn bracket_button(ui: &mut egui::Ui, label: &str, color: Color32, enabled: bool)
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
-        if enabled && (response.hovered() || response.has_focus()) {
+        let hovered = enabled && response.hovered();
+        if hovered {
             painter.rect_filled(rect, 0.0, BAR);
         }
-        let bar = Stroke::new(2.0_f32, if enabled { color } else { RULE });
-        painter.vline(rect.left() + 1.0, rect.y_range(), bar);
-        painter.vline(rect.right() - 1.0, rect.y_range(), bar);
-        if response.has_focus() {
-            painter.hline(rect.x_range(), rect.bottom(), Stroke::new(1.0_f32, SIGNAL));
-        }
+        let outline = if !enabled {
+            RULE
+        } else if response.has_focus() {
+            SIGNAL
+        } else if hovered {
+            color
+        } else {
+            QUIET_OUTLINE
+        };
+        painter.rect_stroke(
+            rect,
+            0.0,
+            Stroke::new(1.0_f32, outline),
+            egui::StrokeKind::Inside,
+        );
         painter.galley(rect.min + padding, galley, text_color);
     }
     if enabled {
@@ -2141,22 +2136,24 @@ fn banner(ui: &mut egui::Ui, color: Color32, message: &str) {
 }
 
 fn page_heading(ui: &mut egui::Ui, title: &str, subtitle: &str) {
-    ui.label(display(title, 34.0));
-    ui.label(RichText::new(subtitle).size(15.0).color(MUTED));
-    ui.add_space(18.0);
+    ui.label(display(title, 28.0));
+    if !subtitle.is_empty() {
+        ui.add(egui::Label::new(RichText::new(subtitle).color(MUTED)).wrap());
+    }
+    ui.add_space(14.0);
 }
 
 fn section_title(ui: &mut egui::Ui, title: &str, subtitle: &str) {
-    ui.label(display(title, 18.0));
+    ui.label(display(title, 16.0));
     if !subtitle.is_empty() {
-        ui.label(RichText::new(subtitle).size(13.0).color(MUTED));
+        ui.add(egui::Label::new(RichText::new(subtitle).size(12.0).color(MUTED)).wrap());
     }
-    ui.add_space(6.0);
+    ui.add_space(4.0);
 }
 
 /// One block of a page. The site separates things with space and hairlines, never boxes.
 fn section<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    ui.add_space(10.0);
+    ui.add_space(18.0);
     let top = ui.cursor().top();
     ui.painter().hline(
         ui.available_rect_before_wrap().x_range(),
@@ -2180,12 +2177,12 @@ fn fact(ui: &mut egui::Ui, value: u64, words: &str, color: Color32) {
     job.append(
         &group_digits(value),
         0.0,
-        egui::TextFormat::simple(FontId::new(17.0, bold_family()), color),
+        egui::TextFormat::simple(FontId::new(16.0, bold_family()), color),
     );
     job.append(
         words,
-        10.0,
-        egui::TextFormat::simple(FontId::new(15.0, FontFamily::Proportional), MUTED),
+        9.0,
+        egui::TextFormat::simple(FontId::new(14.0, FontFamily::Proportional), MUTED),
     );
     ui.label(job);
 }
@@ -2208,42 +2205,91 @@ fn health_row(ui: &mut egui::Ui, label: &str, value: (String, Color32)) {
     });
 }
 
+/// Events under the day they happened on, in the order given.
+fn activity_list<'a>(ui: &mut egui::Ui, events: impl IntoIterator<Item = &'a SecurityEvent>) {
+    let today = Local::now().date_naive();
+    let mut shown_day = None;
+    for event in events {
+        let day = event.timestamp.with_timezone(&Local).date_naive();
+        if shown_day != Some(day) {
+            if shown_day.is_some() {
+                ui.add_space(10.0);
+            }
+            shown_day = Some(day);
+            let name = if day == today {
+                "today".to_owned()
+            } else if today.pred_opt() == Some(day) {
+                "yesterday".to_owned()
+            } else {
+                day.format("%-d %b %Y").to_string().to_lowercase()
+            };
+            ui.label(bold(name).size(12.0).color(MUTED));
+            ui.add_space(2.0);
+        }
+        activity_row(ui, event);
+    }
+}
+
+/// One event: the time in its own column, then what happened, and underneath, what it was
+/// about. The machine-readable details (process ids, command lines) are there on hover.
 fn activity_row(ui: &mut egui::Ui, event: &SecurityEvent) {
     let (kind, color) = event_kind_label(&event.kind);
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(
-                event
-                    .timestamp
-                    .with_timezone(&Local)
-                    .format("%Y-%m-%d %H:%M:%S")
-                    .to_string(),
-            )
-            .size(12.0)
-            .color(MUTED),
+    let blocked = event
+        .details
+        .as_deref()
+        .is_some_and(|details| details.contains(BLOCK_ACCEPTED_TOKEN));
+    let extra_details = event
+        .details
+        .as_deref()
+        .map(|details| {
+            details
+                .split("; ")
+                .filter(|part| !part.starts_with("block_reply_accepted="))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|details| !details.is_empty());
+
+    let row = ui.horizontal_top(|ui| {
+        let (time, _) = ui.allocate_exact_size(egui::vec2(TIME_COLUMN, 20.0), egui::Sense::hover());
+        ui.painter().text(
+            time.left_center(),
+            egui::Align2::LEFT_CENTER,
+            event.timestamp.with_timezone(&Local).format("%H:%M:%S"),
+            FontId::new(12.0, FontFamily::Proportional),
+            MUTED,
         );
-        status_mark(ui, kind, color);
-        ui.label(&event.summary);
-    });
-    if event.path.is_some() || event.threat_name.is_some() || event.details.is_some() {
-        ui.horizontal_wrapped(|ui| {
-            ui.add_space(156.0);
-            if let Some(threat) = &event.threat_name {
-                ui.label(bold(threat).color(ALARM));
-            }
-            if let Some(path) = &event.path {
-                ui.label(
-                    RichText::new(path.display().to_string())
-                        .size(12.0)
-                        .color(MUTED),
-                );
-            }
-            if let Some(details) = &event.details {
-                ui.label(RichText::new(details).size(12.0).color(MUTED));
+        ui.vertical(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                status_mark(ui, kind, color);
+                ui.label(&event.summary);
+            });
+            if event.threat_name.is_some() || event.path.is_some() || blocked {
+                ui.horizontal_wrapped(|ui| {
+                    if let Some(threat) = &event.threat_name {
+                        ui.label(bold(threat).size(13.0).color(ALARM));
+                    }
+                    if blocked {
+                        ui.label(RichText::new("blocked").size(12.0));
+                    }
+                    if let Some(path) = &event.path {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(path.display().to_string())
+                                    .size(12.0)
+                                    .color(MUTED),
+                            )
+                            .truncate(),
+                        );
+                    }
+                });
             }
         });
+    });
+    if let Some(details) = extra_details {
+        row.response.on_hover_text(details);
     }
-    ui.add_space(4.0);
+    ui.add_space(6.0);
 }
 
 fn finding_row(ui: &mut egui::Ui, finding: &ScanFindingView) {

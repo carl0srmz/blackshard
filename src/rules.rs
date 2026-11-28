@@ -4,6 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use yara_x::{Compiler, Rules, Scanner};
 
+/// The built-in rules as written. Only ever read at compile time, to build `BUILTIN_RULES_MASKED`:
+/// a program carrying this text in the clear carries every string the rules look for, side by
+/// side, and blackshard's own service and UI were convicted by their own rules.
 const BUILTIN_RULES: &str = r#"
 rule blackshard_harmless_self_test {
     strings:
@@ -24,7 +27,11 @@ rule blackshard_powershell_obfuscated_download_execute {
         $execute1 = "Invoke-Expression" ascii wide nocase
         $execute2 = "IEX(" ascii wide nocase
     condition:
-        1 of ($ps*) and 1 of ($encode*) and 1 of ($download*) and 1 of ($execute*)
+        // A script's words. Programs that handle PowerShell (blackshard's own command-line
+        // rules among them) carry all four as ordinary strings; a program that runs such a
+        // script is judged by its command line when it does.
+        not (uint16(0) == 0x5A4D)
+            and 1 of ($ps*) and 1 of ($encode*) and 1 of ($download*) and 1 of ($execute*)
 }
 
 rule blackshard_powershell_amsi_bypass_sequence {
@@ -74,6 +81,33 @@ rule blackshard_office_macro_autoexec_shell_chain {
             and 1 of ($auto*) and 1 of ($shell*) and 1 of ($payload*)
 }
 "#;
+
+/// `BUILTIN_RULES` as it is stored in the binary: each byte XORed with a mask that changes with
+/// its position, so no run of rule text, ASCII or UTF-16, survives in the file.
+const BUILTIN_RULES_MASKED: [u8; BUILTIN_RULES.len()] = mask_rules(BUILTIN_RULES.as_bytes());
+
+const fn rule_mask(index: usize) -> u8 {
+    (index as u8).wrapping_mul(29).wrapping_add(0xA7)
+}
+
+const fn mask_rules<const N: usize>(source: &[u8]) -> [u8; N] {
+    let mut masked = [0_u8; N];
+    let mut index = 0;
+    while index < N {
+        masked[index] = source[index] ^ rule_mask(index);
+        index += 1;
+    }
+    masked
+}
+
+fn builtin_rules_source() -> String {
+    let bytes: Vec<u8> = BUILTIN_RULES_MASKED
+        .iter()
+        .enumerate()
+        .map(|(index, byte)| byte ^ rule_mask(index))
+        .collect();
+    String::from_utf8(bytes).expect("the built-in rules are UTF-8")
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -139,7 +173,7 @@ impl RuleEngine {
         let mut compiler = Compiler::new();
         compiler.new_namespace("blackshard_builtin");
         compiler
-            .add_source(BUILTIN_RULES)
+            .add_source(builtin_rules_source().as_str())
             .map_err(|error| format!("built-in rule compilation failed: {error}"))?;
 
         let mut policies = builtin_policies();
@@ -347,6 +381,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn built_in_rules_are_stored_masked_and_read_back_whole() {
+        assert_eq!(builtin_rules_source(), BUILTIN_RULES);
+
+        // What the binary carries must not match the rules: neither the words they look for nor
+        // the rule text itself, in either of the encodings the rules search.
+        let stored = BUILTIN_RULES_MASKED.as_slice();
+        let folded = stored.to_ascii_lowercase();
+        for word in [
+            "AmsiScanBuffer",
+            "amsiInitFailed",
+            "AmsiUtils",
+            "VirtualProtect",
+            "GetProcAddress",
+            "GetField",
+            "DownloadString",
+            "Invoke-Expression",
+            "FromBase64String",
+            "WScript.Shell",
+            "powershell",
+            "rule blackshard",
+        ] {
+            let ascii = word.as_bytes().to_ascii_lowercase();
+            let wide: Vec<u8> = ascii.iter().flat_map(|byte| [*byte, 0]).collect();
+            for needle in [ascii, wide] {
+                assert!(
+                    !folded
+                        .windows(needle.len())
+                        .any(|window| window == needle.as_slice()),
+                    "{word} is stored in the clear"
+                );
+            }
+        }
+        assert!(RuleEngine::builtin()
+            .unwrap()
+            .scan(stored)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn harmless_self_test_rule_is_high_confidence_malicious() {
         let engine = RuleEngine::builtin().unwrap();
         let matches = engine.scan(crate::self_test::PAYLOAD).unwrap();
@@ -376,6 +450,17 @@ mod tests {
         assert!(!matches
             .iter()
             .any(|item| item.disposition == RuleDisposition::Malicious));
+    }
+
+    #[test]
+    fn script_rules_leave_programs_that_quote_powershell_alone() {
+        let engine = RuleEngine::builtin().unwrap();
+        let mut program = b"MZ".to_vec();
+        program.extend_from_slice(
+            b"\0powershell\0-encodedcommand\0frombase64string(\0downloadstring(\0\
+              invoke-expression\0iex(\0",
+        );
+        assert!(engine.scan(&program).unwrap().is_empty());
     }
 
     #[test]
