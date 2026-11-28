@@ -36,14 +36,30 @@ if (-not $expected -or $expected -ne $actual) {
 }
 Write-Host "    SHA256 OK: $actual"
 
-if (Test-Path -LiteralPath $Destination) { Remove-Item -LiteralPath $Destination -Recurse -Force }
-Expand-Archive -LiteralPath $zip -DestinationPath $Destination
-Remove-Item -LiteralPath $work -Recurse -Force
+# Unpack and check next to the download first, so the build already in $Destination is only
+# replaced by a complete one.
+$unpacked = Join-Path $work 'dist'
+Expand-Archive -LiteralPath $zip -DestinationPath $unpacked
 foreach ($required in 'blackshard.sys', 'blackshard-service.exe', 'install.ps1') {
-    if (-not (Test-Path -LiteralPath (Join-Path $Destination $required))) {
+    if (-not (Test-Path -LiteralPath (Join-Path $unpacked $required))) {
         throw "The release has no $required. Build on the host instead and use Update-LabPayload.ps1."
     }
 }
+
+# A shell sitting in $Destination (say, after running install.ps1 from it) holds the folder open,
+# and Windows won't delete it. Step out to its parent; the shell stays there afterwards.
+$Destination = [IO.Path]::GetFullPath($Destination)
+$here = [IO.Path]::GetFullPath((Get-Location -PSProvider FileSystem).ProviderPath)
+if ($here.TrimEnd('\') -eq $Destination.TrimEnd('\') -or $here.StartsWith($Destination.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {
+    Set-Location -LiteralPath (Split-Path -Parent $Destination)
+    [Environment]::CurrentDirectory = (Get-Location -PSProvider FileSystem).ProviderPath
+}
+if (Test-Path -LiteralPath $Destination) {
+    try { Remove-Item -LiteralPath $Destination -Recurse -Force }
+    catch { throw "Couldn't replace $Destination ($_). Close any window or program using a file in it, then run this again." }
+}
+Move-Item -LiteralPath $unpacked -Destination $Destination
+Remove-Item -LiteralPath $work -Recurse -Force
 $version = Join-Path $Destination 'VERSION.txt'
 if (Test-Path -LiteralPath $version) { Write-Host "    version: $((Get-Content -LiteralPath $version -Raw).Trim())" }
 
