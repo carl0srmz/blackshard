@@ -103,11 +103,16 @@ jobs:
           Set-Content -LiteralPath .\dist\VERSION.txt -Value $env:BLACKSHARD_VERSION -Encoding ascii
 
       # The runner's own Windows and developer tools are a clean corpus nobody here wrote. A
-      # detection on any of it is a false positive until proven otherwise.
+      # detection on any of it is a false positive until proven otherwise. blackshard's own files
+      # go in too: its service and UI once carried the built-in rules in the clear and were
+      # convicted by them the moment they opened.
       - name: Scan clean Windows files for false positives
         shell: pwsh
         run: |
           $corpus = .\tools\New-CleanCorpus.ps1 -OutputDirectory (Join-Path $env:RUNNER_TEMP 'clean-corpus')
+          Get-ChildItem -LiteralPath .\dist -File |
+              Where-Object { $_.Extension -in '.exe', '.dll', '.sys', '.ps1' } |
+              ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $corpus "blackshard-dist-$($_.Name)") }
           $report = Join-Path $env:RUNNER_TEMP 'clean-corpus-report.json'
           .\tools\Measure-DetectionCorpus.ps1 -CorpusDirectory $corpus -ReportPath $report -blackshardPath .\dist\blackshard-service.exe
           .\tools\Assert-CleanCorpus.ps1 -ReportPath $report

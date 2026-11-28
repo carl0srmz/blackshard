@@ -140,6 +140,18 @@ changes are listed here, newest first.
   ClamAV signatures, and fails on any detection; it also fails on driver analyzer findings.
 
 ### Fixed
+- blackshard's own UI and service were flagged as `Suspicious.PowerShell.AMSIBypass` the moment
+  they opened: they carried the built-in rules' text, and with it every word the rules look for.
+  The rules are now stored encoded, the PowerShell download-and-run rule judges scripts only (a
+  program that runs one is judged by its command line), and CI scans blackshard's own files for
+  false positives too.
+- Windows PowerShell's own engine, `System.Management.Automation.dll`, was flagged as
+  `Suspicious.PowerShell.AMSIBypass`: it holds the AMSI code the rule names. The rule now judges
+  scripts only, which AMSI still hands it, and CI's clean files include that DLL.
+- A suspicious file that was only observed, not blocked, was recorded as blocked, so it raised a
+  "threat blocked" notification and counted as a blocked threat.
+- The UI fits a 1024 by 768 screen, keeps equal margins at every width instead of touching the
+  left edge below about 1,030 pixels, and no longer cuts off the pause buttons on the status page.
 - Document rollback never saved anything: it was handed kernel device paths Win32 cannot open.
   The folder pin is now also held for the whole restore.
 - The boot-record backup covers the whole GPT partition-entry array.
@@ -157,6 +169,9 @@ changes are listed here, newest first.
 - The UI opens without a console window.
 
 ### Changed
+- A quieter UI: one column per page, plain outlined buttons, activity grouped by day with
+  process ids and command lines on hover, and no build details on the status page (they are in
+  settings).
 - The service logs to `State\logs\service.log`.
 - The update channel can use TLS 1.3.
 - Rust is pinned in `rust-toolchain.toml`; Dependabot proposes new releases.

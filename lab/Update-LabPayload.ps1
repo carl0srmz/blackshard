@@ -14,10 +14,11 @@ Assert-LabAdmin
 Assert-LabHyperV
 $c = Get-LabConfig
 
-$drive = Get-VMDvdDrive -VMName $c.VmName | Where-Object { $_.ControllerNumber -eq 1 -and $_.ControllerLocation -eq 1 }
-if (-not $drive) { throw 'The payload DVD drive (IDE 1:1) is missing from the VM.' }
-# Eject first so the old ISO file is no longer in use, then rebuild and reinsert.
-Set-VMDvdDrive -VMDvdDrive $drive -Path $null
+$slot = @{ VMName = $c.VmName; ControllerNumber = 1; ControllerLocation = 1 }
+if (-not (Get-VMDvdDrive @slot -ErrorAction SilentlyContinue)) { throw 'The payload DVD drive (IDE 1:1) is missing from the VM.' }
+# Eject first so the old ISO file is no longer in use, then rebuild and reinsert. The drive is
+# named by its slot each time: on a running VM, the object from before the eject is stale after it.
+Set-VMDvdDrive @slot -Path $null
 $iso = New-LabPayload -DistPath $DistPath
-Set-VMDvdDrive -VMDvdDrive $drive -Path $iso
+Set-VMDvdDrive @slot -Path $iso
 Write-Host "[+] New payload inserted: $iso" -ForegroundColor Green

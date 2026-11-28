@@ -131,8 +131,11 @@ function New-LabPayload {
     )
     $config = Get-LabConfig
     $state = Get-LabStateDir
-    $staging = Join-Path $state 'payload-staging'
-    if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Recurse -Force }
+    # A fresh folder each time: an antivirus on the host often still has a just-copied program
+    # open when the ISO is done, so an earlier staging folder may not have gone away yet.
+    Get-ChildItem -LiteralPath $state -Directory -Filter 'payload-staging*' -ErrorAction SilentlyContinue |
+        ForEach-Object { Remove-LabStagingFolder $_.FullName }
+    $staging = Join-Path $state "payload-staging-$(Get-Date -Format 'yyyyMMddHHmmss')"
     New-Item -ItemType Directory -Path $staging | Out-Null
 
     Set-Content -LiteralPath (Join-Path $staging 'blackshard-lab.marker') -Value 'blackshard lab payload' -Encoding ASCII
@@ -168,8 +171,21 @@ function New-LabPayload {
 
     $iso = Join-Path $state 'payload.iso'
     New-LabIsoFile -SourceDirectory $staging -Path $iso -VolumeName 'BSLAB' | Out-Null
-    Remove-Item -LiteralPath $staging -Recurse -Force
+    Remove-LabStagingFolder $staging
     $iso
+}
+
+# Best effort, with a few retries: the ISO is already built, and whatever is left is removed the
+# next time a payload is staged.
+function Remove-LabStagingFolder([string]$Path) {
+    foreach ($attempt in 1..5) {
+        try {
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+            return
+        }
+        catch { Start-Sleep -Seconds 2 }
+    }
+    Write-Warning "Left $Path behind (a file in it is still open, probably being scanned). It is removed next time."
 }
 
 Export-ModuleMember -Function Get-LabConfig, Get-LabRoot, Get-LabStateDir, Assert-LabAdmin,

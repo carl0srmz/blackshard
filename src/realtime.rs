@@ -838,6 +838,10 @@ pub(crate) fn realtime_worker(
             }
         }
 
+        // "Accepted" alone only means the driver received the reply. A suspicious verdict is an
+        // allow, and recording it as an accepted block raised "threat blocked" toasts for
+        // programs that ran.
+        let blocked = driver_verdict == DriverVerdict::Block && reply_accepted;
         if let Ok(mut value) = counters.lock() {
             value.scanned += 1;
             match report.verdict {
@@ -846,7 +850,7 @@ pub(crate) fn realtime_worker(
                 DetectionVerdict::Malicious => value.detected += 1,
                 DetectionVerdict::Error => value.scan_errors += 1,
             }
-            if driver_verdict == DriverVerdict::Block && reply_accepted {
+            if blocked {
                 value.blocked_replies += 1;
             }
         }
@@ -865,7 +869,7 @@ pub(crate) fn realtime_worker(
             event.threat_name = report.threat_name.clone();
             event.risk_score = Some(report.risk_score);
             event.details = Some(format!(
-                "block_reply_accepted={reply_accepted}; pid={}{}",
+                "block_reply_accepted={blocked}; pid={}{}",
                 item.message.notification.process_id,
                 if notification.operation == OPERATION_PROCESS_CREATE {
                     format!(
@@ -884,7 +888,7 @@ pub(crate) fn realtime_worker(
                 process_id: notification.process_id,
                 path,
                 report,
-                block_reply_accepted: driver_verdict == DriverVerdict::Block && reply_accepted,
+                block_reply_accepted: blocked,
                 quarantine: quarantine_record,
                 action_error,
             })));

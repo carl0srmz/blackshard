@@ -615,14 +615,19 @@ fn run_ui() -> Result<(), Box<dyn Error>> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1120.0, 720.0])
-            .with_min_inner_size([920.0, 600.0])
+            // Fits a 1024 by 768 screen with the taskbar and title bar, as on a small laptop or
+            // a test VM; the layout holds down to the minimum.
+            .with_inner_size([960.0, 660.0])
+            .with_min_inner_size([720.0, 480.0])
             .with_icon(
                 eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon-256.png"))
                     .unwrap_or_default(),
             ),
         renderer: eframe::Renderer::Wgpu,
         wgpu_options,
+        // Windows otherwise cascades new windows from the top left, and on a small screen this
+        // one opened partly off its right edge.
+        centered: true,
         ..Default::default()
     };
 
